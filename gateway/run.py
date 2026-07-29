@@ -3754,6 +3754,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Track background tasks to prevent garbage collection mid-execution
         self._background_tasks: set = set()
+        # Structured cron recovery may also run once during startup, before its
+        # long-lived watcher exists. Track the actual to_thread workers so stop
+        # can join every provider call before adapter teardown.
+        self._delivery_recovery_workers: set[asyncio.Task] = set()
+        self._delivery_recovery_quiescing = False
+        self._delivery_startup_recovery_task: Optional[asyncio.Task] = None
 
         # Event-loop liveness heartbeat (#66892): rewritten every 30s while
         # the loop is dispatching. External supervisors use the file mtime /
@@ -7689,12 +7695,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recovered-reply marker so a possible duplicate is labeled, never
         silent. Returns the number of redeliveries attempted.
         """
+        if getattr(self, "_delivery_recovery_quiescing", False):
+            return 0
         # A platform-level rate limit is shared by every obligation. Keep the
         # durable rows untouched while the circuit is open instead of walking
         # the backlog and spending one attempt per row in a burst.
         if time.monotonic() < getattr(
             self, "_delivery_redelivery_not_before", 0.0
         ):
+            return 0
+        cron_recovered = 0
+        try:
+            from cron.scheduler import _recover_one_structured_delivery
+
+            running_loop = asyncio.get_running_loop()
+            cron_worker = asyncio.create_task(
+                asyncio.to_thread(
+                    _recover_one_structured_delivery,
+                    self.adapters,
+                    running_loop,
+                )
+            )
+            workers = getattr(self, "_delivery_recovery_workers", None)
+            if workers is None:
+                workers = set()
+                self._delivery_recovery_workers = workers
+            workers.add(cron_worker)
+            try:
+                # Shield the worker so shutdown cancellation cannot let adapter
+                # teardown race a still-running provider call. On cancellation,
+                # await quiescence before propagating to the watcher owner.
+                cron_recovered = await asyncio.shield(cron_worker)
+            except asyncio.CancelledError:
+                await asyncio.gather(cron_worker, return_exceptions=True)
+                raise
+            finally:
+                workers.discard(cron_worker)
+            if cron_recovered:
+                self._delivery_redelivery_not_before = time.monotonic() + 60.0
+                return cron_recovered
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("structured cron delivery recovery failed", exc_info=True)
+            # The structured worker may already have claimed and crossed the
+            # provider ambiguity boundary. Consume this paced pass even when it
+            # raises; otherwise the legacy sweep can dispatch a second row now.
+            self._delivery_redelivery_not_before = time.monotonic() + 60.0
             return 0
         try:
             from gateway.delivery_ledger import (
@@ -7706,7 +7753,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
 
             if not ledger_enabled():
-                return 0
+                return cron_recovered
             # Only claim rows we can actually send this boot: self.adapters
             # holds a platform only after its connect() succeeded, and each
             # claim spends one of the row's three redelivery attempts.
@@ -7723,7 +7770,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             logger.debug("delivery ledger sweep failed", exc_info=True)
             return 0
         if not claimed:
-            return 0
+            return cron_recovered
 
         redelivered = 0
         for row in claimed:
@@ -7902,7 +7949,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         "clear_resume_pending failed for %s", session_key,
                         exc_info=True,
                     )
-        return redelivered
+        return cron_recovered + redelivered
 
     async def _delivery_obligation_redelivery_watcher(self) -> None:
         """Continuously recover final responses without restart-time bursts.
@@ -7930,6 +7977,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _quiesce_delivery_redelivery_watcher(self) -> None:
         """Stop and await durable redelivery before adapters are disconnected."""
+        self._delivery_recovery_quiescing = True
         task = getattr(self, "_delivery_redelivery_task", None)
         if task is not None and task is not asyncio.current_task():
             if not task.done():
@@ -7937,6 +7985,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             await asyncio.gather(task, return_exceptions=True)
             self._background_tasks.discard(task)
         self._delivery_redelivery_task = None
+        startup_task = getattr(self, "_delivery_startup_recovery_task", None)
+        if startup_task is not None and startup_task is not asyncio.current_task():
+            await asyncio.gather(startup_task, return_exceptions=True)
+            if self._delivery_startup_recovery_task is startup_task:
+                self._delivery_startup_recovery_task = None
+        # The one-shot startup recovery is not the watcher task. Join its
+        # shielded to_thread worker explicitly; cancelling an asyncio wrapper
+        # alone does not stop the provider call already executing in a thread.
+        while True:
+            workers = [
+                worker
+                for worker in getattr(self, "_delivery_recovery_workers", set())
+                if not worker.done()
+            ]
+            if not workers:
+                break
+            await asyncio.gather(*workers, return_exceptions=True)
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -8898,7 +8963,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # in the ledger — redelivering it (and clearing resume_pending for
         # that session) is strictly cheaper and more correct than re-running
         # the whole turn.
-        await self._redeliver_pending_obligations()
+        startup_recovery_task = asyncio.create_task(
+            self._redeliver_pending_obligations()
+        )
+        self._delivery_startup_recovery_task = startup_recovery_task
+        try:
+            await startup_recovery_task
+        finally:
+            if self._delivery_startup_recovery_task is startup_recovery_task:
+                self._delivery_startup_recovery_task = None
         self._schedule_resume_pending_sessions()
         await self._finish_startup_restore()
 

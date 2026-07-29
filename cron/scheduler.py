@@ -12,6 +12,7 @@ import asyncio
 import atexit
 import concurrent.futures
 import contextvars
+import hashlib
 import json
 import logging
 import os
@@ -1279,6 +1280,9 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     Duplicate (platform, chat_id, thread_id) tuples are collapsed by the
     existing dedup pass.
     """
+    forced_target = job.get("_durable_delivery_target")
+    if isinstance(forced_target, dict):
+        return [dict(forced_target)]
     deliver = _normalize_deliver_value(job.get("deliver", "local"))
     if deliver == "local":
         return []
@@ -1322,7 +1326,8 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+    caption: Optional[str] = None,
+) -> list[str]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -1335,39 +1340,73 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
+    errors: list[str] = []
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                coro = adapter.send_voice(
+                    chat_id=chat_id,
+                    audio_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(
+                    chat_id=chat_id,
+                    video_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(
+                    chat_id=chat_id,
+                    file_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
-                )
-                return
+                msg = f"cannot send media {media_path}, gateway loop unavailable"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
-                raise
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+                if job.get("_durable_delivery"):
+                    msg = (
+                        "ACK_UNKNOWN: media provider confirmation timed out for "
+                        f"{media_path}"
+                    )
+                else:
+                    msg = f"media provider confirmation timed out for {media_path}"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                continue
+            if not _confirm_adapter_delivery(result):
+                msg = (
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unconfirmed result')}"
                 )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            msg = f"failed to send media {media_path}: {e}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            errors.append(msg)
+    return errors
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1447,7 +1486,485 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _structured_outbox() -> "Any":
+    """Return the profile-scoped schema-v2 cron delivery outbox."""
+    from cron.durable_delivery import StructuredDeliveryOutbox
+
+    home = _get_hermes_home()
+    return StructuredDeliveryOutbox(
+        home / "state.db",
+        home / "cron" / "delivery-spool-v2",
+    )
+
+
+def _snapshot_delivery_wrapper(job: dict) -> dict[str, Any]:
+    """Freeze every value that can change cron's provider-visible wrapper."""
+    wrap_response = True
+    try:
+        config = load_config() or {}
+        wrap_response = bool(config.get("cron", {}).get("wrap_response", True))
+    except Exception:
+        pass
+    return {
+        "wrap_response": wrap_response,
+        "task_name": str(job.get("name", job["id"])),
+        "job_id": str(job.get("id", "")),
+    }
+
+
+def _render_delivery_wrapper(content: str, snapshot: dict[str, Any]) -> str:
+    """Render the exact bytes passed to media extraction/provider routing."""
+    if not snapshot["wrap_response"]:
+        return str(content)
+    task_name = str(snapshot["task_name"])
+    job_id = str(snapshot["job_id"])
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        f"To stop or manage this job, send me a new message "
+        f"(e.g. \"stop reminder {task_name}\")."
+    )
+
+
+def _canonical_cron_target(target: dict) -> str:
+    parts = [str(target["platform"]).lower(), str(target["chat_id"])]
+    if target.get("thread_id") is not None:
+        parts.append(str(target["thread_id"]))
+    return ":".join(parts)
+
+
+def _identity_jsonable(value: Any) -> Any:
+    """Return a stable in-memory projection used only to compute an identity hash."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(getattr(key, "value", key)): _identity_jsonable(item)
+            for key, item in sorted(
+                value.items(), key=lambda pair: str(getattr(pair[0], "value", pair[0]))
+            )
+        }
+    if isinstance(value, (list, tuple)):
+        return [_identity_jsonable(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        projected = [_identity_jsonable(item) for item in value]
+        return sorted(projected, key=lambda item: json.dumps(item, sort_keys=True))
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (bool, int, float, str)):
+        return enum_value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _identity_jsonable(to_dict())
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, dict):
+        return _identity_jsonable(
+            {key: item for key, item in attributes.items() if not key.startswith("_")}
+        )
+    return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _identity_sha256(value: Any) -> str:
+    """Hash routing identity without persisting or logging config/credential values."""
+    encoded = json.dumps(
+        _identity_jsonable(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _resolved_transport_identity_sha256(
+    target: dict,
+    *,
+    logical,
+    config,
+    transport,
+    transport_kind: str,
+) -> str:
+    logical_config = config.platforms.get(logical)
+    transport_config = transport.config if transport is not None else logical_config
+    adapter = transport.adapter if transport is not None else None
+    return _identity_sha256(
+        {
+            "logical_platform": logical.value,
+            "transport_kind": transport_kind,
+            "transport_platform": (
+                transport.transport_platform.value
+                if transport is not None
+                else logical.value
+            ),
+            "target": {
+                "chat_id": str(target["chat_id"]),
+                "thread_id": (
+                    str(target["thread_id"])
+                    if target.get("thread_id") is not None
+                    else None
+                ),
+            },
+            "logical_config_sha256": _identity_sha256(logical_config),
+            "transport_config_sha256": _identity_sha256(transport_config),
+            "adapter_type": (
+                f"{type(adapter).__module__}.{type(adapter).__qualname__}"
+                if adapter is not None
+                else "standalone"
+            ),
+        }
+    )
+
+
+def _resolve_structured_transport_identity(
+    target: dict, adapters
+) -> tuple[str, Optional[dict], str]:
+    """Freeze transport kind and all provider-visible routing/config identity."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+        from gateway.delivery import resolve_delivery_transport
+
+        logical = Platform(str(target["platform"]).lower())
+        config = load_gateway_config()
+        transport = resolve_delivery_transport(logical, config, adapters)
+        if transport is None:
+            kind = "standalone"
+            relay_identity = None
+        elif transport.is_relay:
+            kind = "relay"
+            relay_identity = {
+                "logical_platform": logical.value,
+                "transport_platform": "relay",
+            }
+        else:
+            kind = "native"
+            relay_identity = None
+        fingerprint = _resolved_transport_identity_sha256(
+            target,
+            logical=logical,
+            config=config,
+            transport=transport,
+            transport_kind=kind,
+        )
+        return kind, relay_identity, fingerprint
+    except Exception:
+        # The durable row remains explicit rather than pretending that an
+        # unresolved transport was native. Dispatch will fail closed if config
+        # is still unavailable.
+        return "unresolved", None, _identity_sha256(
+            {"transport_kind": "unresolved", "target": target}
+        )
+
+
+def _durable_owner_stamp() -> tuple[int, float]:
+    pid = os.getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        started = get_process_start_time(pid)
+        if started is not None:
+            return pid, float(started)
+    except Exception:
+        pass
+    return pid, float(time.time())
+
+
+def _structured_delivery_identity_mismatch(error: str) -> bool:
+    return str(error).startswith("DURABLE_IDENTITY_MISMATCH:")
+
+
+def _structured_delivery_ack_is_ambiguous(error: str) -> bool:
+    """Fail closed when an error cannot prove provider non-acceptance."""
+    normalized = str(error).strip().lower()
+    if not normalized:
+        return True
+    return str(error).startswith("ACK_UNKNOWN:") or any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connectionreset",
+            "broken pipe",
+            "unexpected eof",
+            "closed connection",
+            "connection closed",
+            "remote end closed",
+            "disconnect",
+            "cancelled",
+            "canceled",
+        )
+    )
+
+
+def _recover_one_structured_delivery(adapters=None, loop=None) -> int:
+    """Claim and dispatch at most one due schema-v2 cron obligation."""
+    from cron.durable_delivery import SpoolInvalid
+
+    outbox = _structured_outbox()
+    pid, started_at = _durable_owner_stamp()
+    try:
+        claim = outbox.claim_next(owner_pid=pid, owner_started_at=started_at)
+        if claim is None:
+            return 0
+        payload = claim.payload
+        try:
+            for ref in payload.get("media_refs") or []:
+                outbox.resolve_media(ref)
+        except SpoolInvalid as exc:
+            outbox.mark_failed(claim, error=str(exc), retryable=False)
+            return 1
+
+        job = dict(payload["job_snapshot"])
+        job["deliver"] = str(payload["canonical_target"])
+        job["_durable_delivery_target"] = dict(payload["target"])
+        job["_durable_delivery"] = True
+        job["_durable_transport_kind"] = payload["transport_kind"]
+        job["_durable_unit_kind"] = payload["kind"]
+        job["_durable_transport_identity_sha256"] = payload[
+            "transport_identity_sha256"
+        ]
+        job["_durable_relay_identity"] = payload.get("relay_identity")
+        job["_durable_provider_content"] = payload["provider_content"]
+        job["_durable_delivery_config_snapshot"] = payload[
+            "delivery_config_snapshot"
+        ]
+        job["attach_to_session"] = bool(
+            (payload.get("continuation") or {}).get("mirror_enabled", False)
+        )
+        try:
+            error = _deliver_result_legacy(
+                job,
+                str(payload["content"]),
+                adapters=adapters,
+                loop=loop,
+            )
+        except BaseException as exc:
+            outbox.mark_unknown(claim, error=f"recovery dispatch outcome unknown: {exc}")
+            raise
+        if error and _structured_delivery_ack_is_ambiguous(error):
+            outbox.mark_unknown(claim, error=error)
+        elif error:
+            from gateway.platforms.base import classify_send_error
+
+            if _structured_delivery_identity_mismatch(error):
+                kind = "identity_mismatch"
+                retryable = False
+            else:
+                kind = classify_send_error(None, error_text=error)
+                retryable = kind not in {"forbidden", "not_found", "bad_format"}
+            if kind == "rate_limited":
+                delay = 30.0 * (2 ** min(max(claim.attempts - 1, 0), 6))
+                outbox.record_platform_circuit(
+                    str(payload["logical_platform"]),
+                    blocked_until=time.time() + delay,
+                    reason=error,
+                )
+            outbox.mark_failed(claim, error=error, retryable=retryable)
+        else:
+            outbox.mark_delivered(claim, provider_message_id=None)
+        return 1
+    finally:
+        outbox.close()
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    execution_id: Optional[str] = None,
+) -> Optional[str]:
+    """Durably record and independently checkpoint every cron fan-out target.
+
+    The complete fan-out batch commits before the first provider call.  A live
+    scheduler and the recovery worker acquire the same global fenced lease, so
+    only the current claim token may send or publish an outcome.
+    """
+    targets = _resolve_delivery_targets(job)
+    if not targets:
+        return _deliver_result_legacy(job, content, adapters=adapters, loop=loop)
+    execution_id = str(execution_id or job.get("execution_id") or "")
+    if not execution_id:
+        # Backward-compatible direct helper calls (CLI/tests/extensions) have
+        # no execution-ledger identity and retain the legacy one-shot path.
+        # run_one_job, the production cron path, always supplies its claimed
+        # execution_id and therefore cannot silently bypass the outbox.
+        return _deliver_result_legacy(job, content, adapters=adapters, loop=loop)
+
+    from cron.durable_delivery import ClaimLost
+    import hashlib
+    outbox = _structured_outbox()
+    from gateway.platforms.base import BasePlatformAdapter
+
+    extracted_media, cleaned_content = BasePlatformAdapter.extract_media(content)
+    extracted_media = BasePlatformAdapter.filter_media_delivery_paths(extracted_media)
+    try:
+        media_refs = [
+            outbox.spool_media(path, is_voice=is_voice)
+            for path, is_voice in extracted_media
+        ]
+    except BaseException:
+        outbox.close()
+        raise
+
+    send_units: list[dict[str, Any]] = []
+    delivery_config_snapshot = _snapshot_delivery_wrapper(job)
+    cleaned_text = cleaned_content.strip()
+    if not media_refs:
+        send_units.append(
+            {
+                "kind": "cron_text",
+                "content": cleaned_text,
+                "media_ref": None,
+                "media_refs": [],
+            }
+        )
+    for media_index, ref in enumerate(media_refs):
+        parts = [cleaned_text] if media_index == 0 and cleaned_text else []
+        if ref["is_voice"]:
+            parts.append("[[audio_as_voice]]")
+        if "[[as_document]]" in content:
+            parts.append("[[as_document]]")
+        parts.append(f"MEDIA:{outbox.resolve_media(ref)}")
+        send_units.append(
+            {
+                "kind": "cron_media",
+                "content": "\n".join(parts),
+                "media_ref": ref,
+                "media_refs": [ref],
+            }
+        )
+    units = []
+    for index, target in enumerate(targets):
+        canonical = _canonical_cron_target(target)
+        transport_kind, relay_identity, transport_identity_sha256 = (
+            _resolve_structured_transport_identity(target, adapters)
+        )
+        for unit_index, send_unit in enumerate(send_units):
+            unit_content = str(send_unit["content"])
+            provider_content = _render_delivery_wrapper(
+                unit_content,
+                delivery_config_snapshot,
+            )
+            units.append({
+                "schema_version": 2,
+                "execution_id": execution_id,
+                "job_id": str(job["id"]),
+                "target_index": index,
+                "unit_index": unit_index,
+                "canonical_target": canonical,
+                "logical_platform": str(target["platform"]).lower(),
+                "chat_id": str(target["chat_id"]),
+                "thread_id": (
+                    str(target["thread_id"])
+                    if target.get("thread_id") is not None
+                    else None
+                ),
+                "transport_kind": transport_kind,
+                "transport_identity_sha256": transport_identity_sha256,
+                "relay_identity": relay_identity,
+                "kind": send_unit["kind"],
+                "content": unit_content,
+                "content_sha256": hashlib.sha256(
+                    unit_content.encode("utf-8")
+                ).hexdigest(),
+                "provider_content": provider_content,
+                "provider_content_sha256": hashlib.sha256(
+                    provider_content.encode("utf-8")
+                ).hexdigest(),
+                "delivery_config_snapshot": dict(delivery_config_snapshot),
+                "media_ref": send_unit["media_ref"],
+                "media_refs": send_unit["media_refs"],
+                "continuation": {
+                    "mirror_enabled": _cron_mirror_delivery_enabled(job),
+                    "origin": _resolve_origin(job),
+                },
+                "job_snapshot": dict(job),
+                "target": dict(target),
+            })
+
+    records = outbox.enqueue_batch(units)
+    errors: list[str] = []
+    owner_pid, owner_started_at = _durable_owner_stamp()
+    try:
+        for record in records:
+            claim = outbox.claim_next(
+                owner_pid=owner_pid,
+                owner_started_at=owner_started_at,
+                obligation_id=record.obligation_id,
+            )
+            if claim is None:
+                # A recovery worker won the claim. It owns completion; the
+                # scheduler must not race it with an untracked second send.
+                errors.append(
+                    f"durable delivery claim unavailable for {record.payload['canonical_target']}"
+                )
+                continue
+            target_job = dict(job)
+            target_job["deliver"] = str(record.payload["canonical_target"])
+            target_job["_durable_delivery_target"] = dict(record.payload["target"])
+            target_job["_durable_delivery"] = True
+            target_job["_durable_transport_kind"] = record.payload["transport_kind"]
+            target_job["_durable_unit_kind"] = record.payload["kind"]
+            target_job["_durable_transport_identity_sha256"] = record.payload[
+                "transport_identity_sha256"
+            ]
+            target_job["_durable_relay_identity"] = record.payload.get("relay_identity")
+            target_job["_durable_provider_content"] = record.payload[
+                "provider_content"
+            ]
+            target_job["_durable_delivery_config_snapshot"] = record.payload[
+                "delivery_config_snapshot"
+            ]
+            target_job["attach_to_session"] = bool(
+                (record.payload.get("continuation") or {}).get(
+                    "mirror_enabled", False
+                )
+            )
+            try:
+                error = _deliver_result_legacy(
+                    target_job,
+                    str(record.payload["content"]),
+                    adapters=adapters,
+                    loop=loop,
+                )
+            except BaseException as exc:
+                # The provider may have accepted before an unexpected exception.
+                # Do not silently replay an ACK-ambiguous side effect.
+                outbox.mark_unknown(claim, error=f"dispatch outcome unknown: {exc}")
+                raise
+            if error and _structured_delivery_ack_is_ambiguous(error):
+                outbox.mark_unknown(claim, error=error)
+                errors.append(error)
+            elif error:
+                from gateway.platforms.base import classify_send_error
+
+                if _structured_delivery_identity_mismatch(error):
+                    kind = "identity_mismatch"
+                    retryable = False
+                else:
+                    kind = classify_send_error(None, error_text=error)
+                    retryable = kind not in {"forbidden", "not_found", "bad_format"}
+                if kind == "rate_limited":
+                    delay = 30.0 * (2 ** min(max(claim.attempts - 1, 0), 6))
+                    outbox.record_platform_circuit(
+                        str(record.payload["logical_platform"]),
+                        blocked_until=time.time() + delay,
+                        reason=error,
+                    )
+                outbox.mark_failed(claim, error=error, retryable=retryable)
+                errors.append(error)
+            else:
+                outbox.mark_delivered(claim, provider_message_id=None)
+    except ClaimLost as exc:
+        errors.append(str(exc))
+    finally:
+        outbox.close()
+    return "; ".join(errors) if errors else None
+
+
+def _deliver_result_legacy(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1483,29 +2000,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
-    wrap_response = True
+    # Durable rows persist the exact provider-visible wrapper. Recovery must
+    # never re-render it from mutable config/job fields.
     user_cfg = None
-    try:
-        user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
-
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+    if job.get("_durable_delivery"):
+        delivery_content = str(job["_durable_provider_content"])
     else:
-        delivery_content = content
+        try:
+            user_cfg = load_config()
+        except Exception:
+            user_cfg = None
+        snapshot = _snapshot_delivery_wrapper(job)
+        if user_cfg is not None:
+            snapshot["wrap_response"] = bool(
+                user_cfg.get("cron", {}).get("wrap_response", True)
+            )
+        delivery_content = _render_delivery_wrapper(content, snapshot)
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -1574,9 +2084,54 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        durable_transport_kind = job.get("_durable_transport_kind")
+        if job.get("_durable_delivery") and durable_transport_kind == "unresolved":
+            msg = "durable delivery transport is unresolved; refusing route drift"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         from gateway.delivery import resolve_delivery_transport
 
         transport = resolve_delivery_transport(platform, config, adapters)
+        actual_transport_kind = (
+            "relay"
+            if transport is not None and transport.is_relay
+            else "native"
+            if transport is not None
+            else "standalone"
+        )
+        if job.get("_durable_delivery"):
+            frozen_identity = str(
+                job.get("_durable_transport_identity_sha256") or ""
+            )
+            current_identity = _resolved_transport_identity_sha256(
+                target,
+                logical=platform,
+                config=config,
+                transport=transport,
+                transport_kind=actual_transport_kind,
+            )
+            if frozen_identity != current_identity:
+                msg = (
+                    "DURABLE_IDENTITY_MISMATCH: durable delivery transport "
+                    "identity changed; refusing route drift"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+        if (
+            job.get("_durable_delivery")
+            and durable_transport_kind
+            and durable_transport_kind != actual_transport_kind
+        ):
+            msg = (
+                "durable delivery transport changed from "
+                f"{durable_transport_kind} to {actual_transport_kind}; refusing route drift"
+            )
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -1705,6 +2260,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
+            # A provider-created thread is a separate external side effect. The
+            # structured row has no frozen thread ID or thread-creation receipt,
+            # so creating one here would make retry identity crash-ambiguous.
+            and not job.get("_durable_delivery")
             and not thread_id  # never override an explicit origin thread/topic
         ):
             new_thread_id = _open_continuable_cron_thread(
@@ -1780,7 +2339,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                atomic_media_obligation = bool(
+                    job.get("_durable_delivery")
+                    and job.get("_durable_unit_kind") == "cron_media"
+                    and media_files
+                )
+                text_to_send = (
+                    ""
+                    if atomic_media_obligation
+                    else cleaned_delivery_content.strip()
+                )
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -1833,7 +2401,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #     message is silently dropped (worse than a
                             #     duplicate).
                             cancelled = future.cancel()
-                            if cancelled:
+                            if cancelled and job.get("_durable_delivery"):
+                                # Cancellation of the thread-safe wrapper is not
+                                # proof that the provider coroutine never crossed
+                                # its side-effect boundary. Durable delivery must
+                                # fail closed instead of issuing an unlabeled
+                                # standalone duplicate.
+                                adapter_ok = False
+                                target_errors.append(
+                                    "ACK_UNKNOWN: provider confirmation timed out "
+                                    f"for {platform_name}:{chat_id}; wrapper cancellation "
+                                    "does not prove dispatch was prevented"
+                                )
+                                timeout_handled = True
+                            elif cancelled:
                                 msg = (
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     "timed out before the coroutine was dispatched"
@@ -1848,6 +2429,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             else:
                                 timed_out = True
                                 timeout_handled = True
+                                if job.get("_durable_delivery"):
+                                    adapter_ok = False
+                                    target_errors.append(
+                                        "ACK_UNKNOWN: provider confirmation timed out "
+                                        f"for {platform_name}:{chat_id} after dispatch"
+                                    )
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
                                     "after 60s; already dispatched (in flight), "
@@ -1939,7 +2526,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_send_errors = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -1947,7 +2534,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        caption=(
+                            cleaned_delivery_content.strip()
+                            if atomic_media_obligation
+                            else None
+                        ),
                     )
+                    if media_send_errors:
+                        target_errors.extend(media_send_errors)
+                        adapter_ok = False
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -1997,6 +2592,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
+            if any(err.startswith("ACK_UNKNOWN:") for err in target_errors):
+                # The provider may have accepted the send. Structured durable
+                # delivery records this as unknown and never performs an
+                # unlabeled automatic fallback/replay.
+                delivery_errors.extend(target_errors)
+                continue
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
@@ -2005,6 +2606,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     target_errors.append(
                         f"relay delivery to {platform_name}:{chat_id} failed"
                     )
+                delivery_errors.extend(target_errors)
+                continue
+            if (
+                job.get("_durable_delivery")
+                and durable_transport_kind == "native"
+                and target_errors
+            ):
+                # A schema-v2 obligation is bound to its native transport.
+                # A confirmed native rejection is retryable through that same
+                # route; it is not permission to mutate the attempt into an
+                # untracked standalone send.
                 delivery_errors.extend(target_errors)
                 continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
@@ -4005,7 +4617,27 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    try:
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                            execution_id=execution_id,
+                        )
+                    except TypeError as compat_error:
+                        # Narrow compatibility for extensions/test fakes that
+                        # still implement the pre-outbox helper signature.
+                        if "unexpected keyword argument 'execution_id'" not in str(
+                            compat_error
+                        ):
+                            raise
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
