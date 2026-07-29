@@ -5715,6 +5715,7 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+                    _obligation_claim_token = None
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
@@ -5743,10 +5744,12 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                mark_attempting(
+                                _obligation_claim_token = mark_attempting(
                                     _obligation_id,
                                     generation=_obligation_generation,
                                 )
+                                if not _obligation_claim_token:
+                                    _obligation_id = None
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
@@ -5768,6 +5771,7 @@ class BasePlatformAdapter(ABC):
                                 mark_delivered(
                                     _obligation_id,
                                     generation=_obligation_generation,
+                                    claim_token=_obligation_claim_token,
                                 )
                             else:
                                 _error_text = str(
@@ -5783,6 +5787,7 @@ class BasePlatformAdapter(ABC):
                                     _error_text,
                                     retry_after_seconds=getattr(result, "retry_after", None),
                                     generation=_obligation_generation,
+                                    claim_token=_obligation_claim_token,
                                     retryable=_error_kind in {
                                         "rate_limited", "transient", "unknown"
                                     },

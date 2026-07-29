@@ -9,6 +9,7 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import asyncio
 import sqlite3
 import time
 from concurrent.futures import ThreadPoolExecutor
@@ -44,13 +45,13 @@ def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
             """SELECT state, attempts, owner_pid, content, next_attempt_at,
-                      generation
+                      generation, claim_token
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
     return None if r is None else {
         "state": r[0], "attempts": r[1], "owner_pid": r[2], "content": r[3],
-        "next_attempt_at": r[4], "generation": r[5],
+        "next_attempt_at": r[4], "generation": r[5], "claim_token": r[6],
     }
 
 
@@ -233,6 +234,74 @@ class TestSweep:
         )
         second = dl.sweep_recoverable(limit=1)
         assert [row["obligation_id"] for row in second] == ["ob-2"]
+
+    def test_claim_moves_pending_to_attempting_and_returns_fencing_token(self):
+        _record()
+        _orphan("ob-1")
+
+        claimed = dl.sweep_recoverable(limit=1)
+
+        assert len(claimed) == 1
+        assert claimed[0]["claim_token"]
+        row = _row("ob-1")
+        assert row["state"] == "attempting"
+        assert row["claim_token"] == claimed[0]["claim_token"]
+
+    def test_stale_claim_token_cannot_complete_reclaimed_same_generation(self):
+        _record()
+        _orphan("ob-1")
+        first = dl.sweep_recoverable(limit=1)[0]
+        with dl._transaction() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=999999999, "
+                "owner_started_at=1 WHERE obligation_id='ob-1'"
+            )
+            conn.execute(
+                "UPDATE delivery_recovery_lease SET owner_pid=999999999, "
+                "owner_started_at=1"
+            )
+
+        second = dl.sweep_recoverable(limit=1)[0]
+        assert second["generation"] == first["generation"]
+        assert second["claim_token"] != first["claim_token"]
+
+        dl.mark_delivered(
+            "ob-1",
+            generation=first["generation"],
+            claim_token=first["claim_token"],
+        )
+        row = _row("ob-1")
+        assert row["state"] == "attempting"
+        assert row["claim_token"] == second["claim_token"]
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM delivery_recovery_lease"
+            ).fetchone()[0] == 1
+
+        dl.mark_delivered(
+            "ob-1",
+            generation=second["generation"],
+            claim_token=second["claim_token"],
+        )
+        assert _row("ob-1")["state"] == "delivered"
+
+    def test_crash_after_first_recovery_claim_requires_visible_marker(self):
+        _record()
+        _orphan("ob-1")
+        first = dl.sweep_recoverable(limit=1)[0]
+        assert first["needs_marker"] is False
+        with dl._transaction() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET owner_pid=999999999, "
+                "owner_started_at=1 WHERE obligation_id='ob-1'"
+            )
+            conn.execute(
+                "UPDATE delivery_recovery_lease SET owner_pid=999999999, "
+                "owner_started_at=1"
+            )
+
+        second = dl.sweep_recoverable(limit=1)[0]
+        assert second["needs_marker"] is True
 
     def test_durable_platform_backoff_blocks_fresh_sweep(self):
         _record(platform="weixin")
@@ -430,6 +499,26 @@ class TestGatewayRedeliverySweep:
         assert n == 0
         assert _row("ob-1")["state"] == "failed"
         assert _row("ob-1")["owner_pid"] is None
+
+    @pytest.mark.asyncio
+    async def test_cancelled_send_releases_live_process_global_lease(self):
+        generation = _record()
+        _orphan("ob-1")
+        adapter = self._adapter(success=True)
+        adapter.send.side_effect = asyncio.CancelledError()
+        runner = self._runner(adapter)
+
+        with pytest.raises(asyncio.CancelledError):
+            await runner._redeliver_pending_obligations()
+
+        row = _row("ob-1")
+        assert row["generation"] == generation
+        assert row["state"] == "failed"
+        assert row["owner_pid"] is None
+        with dl._connect() as conn:
+            assert conn.execute(
+                "SELECT COUNT(*) FROM delivery_recovery_lease"
+            ).fetchone()[0] == 0
 
     @pytest.mark.asyncio
     async def test_each_pass_sends_only_one_oldest_obligation(self):

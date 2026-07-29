@@ -50,6 +50,7 @@ import os
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from typing import Any, Dict, Iterator, List, Optional
 
@@ -122,36 +123,42 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             owner_started_at INTEGER,
             last_error TEXT,
             next_attempt_at REAL NOT NULL DEFAULT 0,
-            generation INTEGER NOT NULL DEFAULT 1
+            generation INTEGER NOT NULL DEFAULT 1,
+            claim_token TEXT
         )"""
     )
     # Online migration for ledgers created before durable in-process retry.
     # ALTER with a constant DEFAULT is metadata-only in SQLite and preserves
     # every existing obligation.
-    def _ensure_column(name: str, ddl: str) -> None:
+    def _ensure_column(table: str, name: str, ddl: str) -> None:
         columns = {
             row[1]
-            for row in conn.execute("PRAGMA table_info(delivery_obligations)")
+            for row in conn.execute(f"PRAGMA table_info({table})")
         }
         if name in columns:
             return
         try:
-            conn.execute(f"ALTER TABLE delivery_obligations ADD COLUMN {ddl}")
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {ddl}")
         except sqlite3.OperationalError:
             # Another gateway thread/process may have completed the same
             # online migration after our PRAGMA snapshot. Suppress only that
             # verified race; every other DDL failure remains fatal.
             columns = {
                 row[1]
-                for row in conn.execute(
-                    "PRAGMA table_info(delivery_obligations)"
-                )
+                for row in conn.execute(f"PRAGMA table_info({table})")
             }
             if name not in columns:
                 raise
 
-    _ensure_column("next_attempt_at", "next_attempt_at REAL NOT NULL DEFAULT 0")
-    _ensure_column("generation", "generation INTEGER NOT NULL DEFAULT 1")
+    _ensure_column(
+        "delivery_obligations", "next_attempt_at",
+        "next_attempt_at REAL NOT NULL DEFAULT 0",
+    )
+    _ensure_column(
+        "delivery_obligations", "generation",
+        "generation INTEGER NOT NULL DEFAULT 1",
+    )
+    _ensure_column("delivery_obligations", "claim_token", "claim_token TEXT")
     conn.execute(
         """CREATE TABLE IF NOT EXISTS delivery_recovery_lease (
             lease_name TEXT PRIMARY KEY,
@@ -159,8 +166,13 @@ def _initialize_schema(conn: sqlite3.Connection) -> None:
             generation INTEGER NOT NULL,
             owner_pid INTEGER NOT NULL,
             owner_started_at INTEGER,
+            claim_token TEXT NOT NULL DEFAULT '',
             acquired_at REAL NOT NULL
         )"""
+    )
+    _ensure_column(
+        "delivery_recovery_lease", "claim_token",
+        "claim_token TEXT NOT NULL DEFAULT ''",
     )
     conn.execute(
         """CREATE TABLE IF NOT EXISTS delivery_platform_backoff (
@@ -254,11 +266,7 @@ def record_obligation(
     thread_id: Optional[str],
     content: str,
 ) -> int:
-    """Record a final response and return its monotonic row generation.
-
-    A generation makes completion fencing explicit: a late ACK from an older
-    send may not mark a same-id row that was re-recorded after restart.
-    """
+    """Record a final response and return its monotonic row generation."""
     now = time.time()
     pid, started = _owner_stamp()
     with _DB_LOCK, _transaction() as conn:
@@ -266,8 +274,9 @@ def record_obligation(
             """INSERT INTO delivery_obligations
                (obligation_id, session_key, platform, chat_id, thread_id,
                 content, state, attempts, created_at, updated_at,
-                owner_pid, owner_started_at, next_attempt_at, generation)
-               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, 0, 1)
+                owner_pid, owner_started_at, next_attempt_at, generation,
+                claim_token)
+               VALUES (?, ?, ?, ?, ?, ?, 'pending', 0, ?, ?, ?, ?, 0, 1, NULL)
                ON CONFLICT(obligation_id) DO UPDATE SET
                  session_key=excluded.session_key,
                  platform=excluded.platform,
@@ -279,7 +288,7 @@ def record_obligation(
                  updated_at=excluded.updated_at,
                  owner_pid=excluded.owner_pid,
                  owner_started_at=excluded.owner_started_at,
-                 last_error=NULL, next_attempt_at=0,
+                 last_error=NULL, next_attempt_at=0, claim_token=NULL,
                  generation=delivery_obligations.generation+1""",
             (obligation_id, session_key, platform, str(chat_id),
              str(thread_id) if thread_id else None, content, now, now,
@@ -293,12 +302,38 @@ def record_obligation(
     return generation
 
 
-def mark_attempting(obligation_id: str, *, generation: Optional[int] = None) -> None:
-    _update_state(obligation_id, "attempting", generation=generation)
+def mark_attempting(
+    obligation_id: str,
+    *,
+    generation: Optional[int] = None,
+) -> Optional[str]:
+    """Enter the ambiguous send window and return its unique fencing token."""
+    claim_token = uuid.uuid4().hex
+    pid, started = _owner_stamp()
+    with _DB_LOCK, _transaction() as conn:
+        cursor = conn.execute(
+            """UPDATE delivery_obligations
+               SET state='attempting', updated_at=?, owner_pid=?,
+                   owner_started_at=?, claim_token=?
+               WHERE obligation_id=? AND (? IS NULL OR generation=?)""",
+            (time.time(), pid, started, claim_token, obligation_id,
+             generation, generation),
+        )
+    return claim_token if cursor.rowcount else None
 
 
-def mark_delivered(obligation_id: str, *, generation: Optional[int] = None) -> None:
-    _update_state(obligation_id, "delivered", generation=generation)
+def mark_delivered(
+    obligation_id: str,
+    *,
+    generation: Optional[int] = None,
+    claim_token: Optional[str] = None,
+) -> None:
+    _update_state(
+        obligation_id,
+        "delivered",
+        generation=generation,
+        claim_token=claim_token,
+    )
 
 
 def mark_failed(
@@ -307,60 +342,65 @@ def mark_failed(
     *,
     retry_after_seconds: Optional[float] = None,
     generation: Optional[int] = None,
+    claim_token: Optional[str] = None,
     retryable: bool = True,
 ) -> None:
-    """Record a rejected send and release it for durable in-process retry.
-
-    ``attempts`` counts recovery sends (the original send is attempt zero).
-    Each failure therefore doubles the delay, while an adapter-provided
-    ``retry_after_seconds`` is treated as a lower bound.  Clearing ownership is
-    intentional: the still-running gateway's paced worker may reclaim the row
-    once it is due; recovery no longer depends on another process restart.
-    """
+    """Record a rejected send and release it for durable in-process retry."""
     now = time.time()
     with _DB_LOCK, _transaction() as conn:
         row = conn.execute(
-            "SELECT attempts, generation FROM delivery_obligations WHERE obligation_id=?",
+            """SELECT attempts, generation, claim_token
+               FROM delivery_obligations WHERE obligation_id=?""",
             (obligation_id,),
         ).fetchone()
-        if row is None or (generation is not None and int(row[1]) != int(generation)):
+        if row is None:
+            return
+        if generation is not None and int(row[1]) != int(generation):
+            return
+        if claim_token is not None and row[2] != claim_token:
             return
         attempts = max(0, int(row[0] or 0))
+        where = (
+            "obligation_id=? AND (? IS NULL OR generation=?) "
+            "AND (? IS NULL OR claim_token=?)"
+        )
         if not retryable:
-            conn.execute(
-                """UPDATE delivery_obligations
-                   SET state='abandoned', updated_at=?, last_error=?,
-                       owner_pid=NULL, owner_started_at=NULL, next_attempt_at=0
-                   WHERE obligation_id=? AND (? IS NULL OR generation=?)""",
+            cursor = conn.execute(
+                f"""UPDATE delivery_obligations
+                    SET state='abandoned', updated_at=?, last_error=?,
+                        owner_pid=NULL, owner_started_at=NULL,
+                        next_attempt_at=0, claim_token=NULL
+                    WHERE {where}""",
                 (now, error[:500] if error else None, obligation_id,
-                 generation, generation),
+                 generation, generation, claim_token, claim_token),
             )
+        else:
+            delay = RETRY_BASE_SECONDS * (2 ** attempts)
+            if retry_after_seconds is not None:
+                try:
+                    delay = max(delay, max(0.0, float(retry_after_seconds)))
+                except (TypeError, ValueError):
+                    pass
+            delay = min(delay, RETRY_MAX_SECONDS)
+            cursor = conn.execute(
+                f"""UPDATE delivery_obligations
+                    SET state='failed', updated_at=?, last_error=?,
+                        owner_pid=NULL, owner_started_at=NULL,
+                        next_attempt_at=?, claim_token=NULL
+                    WHERE {where}""",
+                (now, error[:500] if error else None, now + delay,
+                 obligation_id, generation, generation,
+                 claim_token, claim_token),
+            )
+        if cursor.rowcount:
             conn.execute(
-                "DELETE FROM delivery_recovery_lease WHERE lease_name=? "
-                "AND obligation_id=? AND (? IS NULL OR generation=?)",
-                (_RECOVERY_LEASE_NAME, obligation_id, generation, generation),
+                """DELETE FROM delivery_recovery_lease
+                   WHERE lease_name=? AND obligation_id=?
+                     AND (? IS NULL OR generation=?)
+                     AND (? IS NULL OR claim_token=?)""",
+                (_RECOVERY_LEASE_NAME, obligation_id,
+                 generation, generation, claim_token, claim_token),
             )
-            return
-        delay = RETRY_BASE_SECONDS * (2 ** attempts)
-        if retry_after_seconds is not None:
-            try:
-                delay = max(delay, max(0.0, float(retry_after_seconds)))
-            except (TypeError, ValueError):
-                pass
-        delay = min(delay, RETRY_MAX_SECONDS)
-        conn.execute(
-            """UPDATE delivery_obligations
-               SET state='failed', updated_at=?, last_error=?,
-                   owner_pid=NULL, owner_started_at=NULL, next_attempt_at=?
-               WHERE obligation_id=? AND (? IS NULL OR generation=?)""",
-            (now, error[:500] if error else None, now + delay, obligation_id,
-             generation, generation),
-        )
-        conn.execute(
-            "DELETE FROM delivery_recovery_lease WHERE lease_name=? "
-            "AND obligation_id=? AND (? IS NULL OR generation=?)",
-            (_RECOVERY_LEASE_NAME, obligation_id, generation, generation),
-        )
 
 
 def _update_state(
@@ -369,20 +409,30 @@ def _update_state(
     error: str = "",
     *,
     generation: Optional[int] = None,
+    claim_token: Optional[str] = None,
 ) -> None:
     with _DB_LOCK, _transaction() as conn:
-        conn.execute(
+        terminal = state in {"delivered", "failed", "abandoned"}
+        cursor = conn.execute(
             """UPDATE delivery_obligations
-               SET state=?, updated_at=?, last_error=?
-               WHERE obligation_id=? AND (? IS NULL OR generation=?)""",
-            (state, time.time(), error[:500] if error else None, obligation_id,
-             generation, generation),
+               SET state=?, updated_at=?, last_error=?,
+                   owner_pid=CASE WHEN ? THEN NULL ELSE owner_pid END,
+                   owner_started_at=CASE WHEN ? THEN NULL ELSE owner_started_at END,
+                   claim_token=CASE WHEN ? THEN NULL ELSE claim_token END
+               WHERE obligation_id=? AND (? IS NULL OR generation=?)
+                 AND (? IS NULL OR claim_token=?)""",
+            (state, time.time(), error[:500] if error else None,
+             terminal, terminal, terminal, obligation_id,
+             generation, generation, claim_token, claim_token),
         )
-        if state in {"delivered", "failed", "abandoned"}:
+        if cursor.rowcount and terminal:
             conn.execute(
-                "DELETE FROM delivery_recovery_lease WHERE lease_name=? "
-                "AND obligation_id=? AND (? IS NULL OR generation=?)",
-                (_RECOVERY_LEASE_NAME, obligation_id, generation, generation),
+                """DELETE FROM delivery_recovery_lease
+                   WHERE lease_name=? AND obligation_id=?
+                     AND (? IS NULL OR generation=?)
+                     AND (? IS NULL OR claim_token=?)""",
+                (_RECOVERY_LEASE_NAME, obligation_id,
+                 generation, generation, claim_token, claim_token),
             )
 
 
@@ -505,20 +555,22 @@ def sweep_recoverable(
             if limit is not None and len(claimed) >= max(0, int(limit)):
                 continue
             lease = conn.execute(
-                """SELECT obligation_id, generation, owner_pid, owner_started_at
+                """SELECT obligation_id, generation, owner_pid,
+                          owner_started_at, claim_token
                    FROM delivery_recovery_lease WHERE lease_name=?""",
                 (_RECOVERY_LEASE_NAME,),
             ).fetchone()
             if lease:
                 lease_row = conn.execute(
-                    "SELECT state, generation FROM delivery_obligations "
-                    "WHERE obligation_id=?",
+                    """SELECT state, generation, claim_token
+                       FROM delivery_obligations WHERE obligation_id=?""",
                     (lease[0],),
                 ).fetchone()
                 lease_is_current = (
                     lease_row is not None
                     and lease_row[0] in {"pending", "attempting", "failed"}
                     and int(lease_row[1]) == int(lease[1])
+                    and lease_row[2] == lease[4]
                     and _owner_alive(lease[2], lease[3])
                 )
                 if lease_is_current:
@@ -527,21 +579,24 @@ def sweep_recoverable(
                     "DELETE FROM delivery_recovery_lease WHERE lease_name=?",
                     (_RECOVERY_LEASE_NAME,),
                 )
+            claim_token = uuid.uuid4().hex
             cursor = conn.execute(
                 """UPDATE delivery_obligations
-                   SET owner_pid=?, owner_started_at=?, attempts=attempts+1,
-                       updated_at=?
+                   SET state='attempting', owner_pid=?, owner_started_at=?,
+                       claim_token=?, attempts=attempts+1, updated_at=?
                    WHERE obligation_id=? AND generation=?
-                     AND (owner_pid IS ? OR owner_pid=?)""",
-                (pid, started, now, oid, generation, owner_pid, owner_pid),
+                     AND owner_pid IS ? AND owner_started_at IS ?""",
+                (pid, started, claim_token, now, oid, generation,
+                 owner_pid, owner_started_at),
             )
             if cursor.rowcount:
                 conn.execute(
                     """INSERT OR REPLACE INTO delivery_recovery_lease
                        (lease_name, obligation_id, generation, owner_pid,
-                        owner_started_at, acquired_at)
-                       VALUES (?, ?, ?, ?, ?, ?)""",
-                    (_RECOVERY_LEASE_NAME, oid, generation, pid, started, now),
+                        owner_started_at, claim_token, acquired_at)
+                       VALUES (?, ?, ?, ?, ?, ?, ?)""",
+                    (_RECOVERY_LEASE_NAME, oid, generation, pid, started,
+                     claim_token, now),
                 )
                 claimed.append({
                     "obligation_id": oid,
@@ -555,6 +610,7 @@ def sweep_recoverable(
                     "needs_marker": state != "pending",
                     "attempts": attempts + 1,
                     "generation": generation,
+                    "claim_token": claim_token,
                 })
                 break
     return claimed

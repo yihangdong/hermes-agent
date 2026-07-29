@@ -7739,6 +7739,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     f"unknown platform: {row.get('platform')!r}",
                     retry_after_seconds=300.0,
                     generation=row.get("generation"),
+                    claim_token=row.get("claim_token"),
                 )
                 continue
             adapter = self.adapters.get(platform)
@@ -7751,6 +7752,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "platform adapter unavailable after claim",
                     retry_after_seconds=60.0,
                     generation=row.get("generation"),
+                    claim_token=row.get("claim_token"),
                 )
                 continue
             content = row["content"]
@@ -7765,6 +7767,28 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     content=content,
                     metadata=metadata,
                 )
+            except asyncio.CancelledError:
+                # Cancellation does not imply process death (tests, task-group
+                # rebalance, or a supervised watcher can cancel only this
+                # coroutine). Release the process-shared lease before
+                # propagating, otherwise a still-live owner PID poisons the
+                # entire recovery queue indefinitely.
+                try:
+                    mark_failed(
+                        row["obligation_id"],
+                        "redelivery send cancelled with outcome unknown",
+                        retry_after_seconds=30.0,
+                        generation=row.get("generation"),
+                        claim_token=row.get("claim_token"),
+                        retryable=True,
+                    )
+                except Exception:
+                    logger.warning(
+                        "obligation %s: failed to release lease on cancellation",
+                        row["obligation_id"],
+                        exc_info=True,
+                    )
+                raise
             except Exception as send_err:
                 logger.warning(
                     "obligation %s: redelivery send raised: %s",
@@ -7776,6 +7800,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     mark_delivered(
                         row["obligation_id"],
                         generation=row.get("generation"),
+                        claim_token=row.get("claim_token"),
                     )
                     try:
                         from gateway.delivery_ledger import clear_platform_backoff
@@ -7858,6 +7883,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         error,
                         retry_after_seconds=retry_after,
                         generation=row.get("generation"),
+                        claim_token=row.get("claim_token"),
                         retryable=error_kind in {
                             "rate_limited", "transient", "unknown"
                         },
