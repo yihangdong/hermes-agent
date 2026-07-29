@@ -5753,12 +5753,32 @@ class BasePlatformAdapter(ABC):
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    try:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                    except asyncio.CancelledError:
+                        if _obligation_id is not None:
+                            try:
+                                from gateway.delivery_ledger import mark_failed
+
+                                mark_failed(
+                                    _obligation_id,
+                                    "live delivery send cancelled with outcome unknown",
+                                    retry_after_seconds=30.0,
+                                    generation=_obligation_generation,
+                                    claim_token=_obligation_claim_token,
+                                    retryable=True,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "delivery ledger cancellation cleanup failed",
+                                    exc_info=True,
+                                )
+                        raise
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
