@@ -7911,7 +7911,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adds adaptive platform backoff, and each pass claims only one oldest
         row. Live interactive replies remain immediate and retain priority.
         """
-        while True:
+        while self._running:
             try:
                 await self._redeliver_pending_obligations()
             except asyncio.CancelledError:
@@ -7927,6 +7927,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 - time.monotonic(),
             )
             await asyncio.sleep(max(15.0, min(remaining, 300.0)))
+
+    async def _quiesce_delivery_redelivery_watcher(self) -> None:
+        """Stop and await durable redelivery before adapters are disconnected."""
+        task = getattr(self, "_delivery_redelivery_task", None)
+        if task is not None and task is not asyncio.current_task():
+            if not task.done():
+                task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            self._background_tasks.discard(task)
+        self._delivery_redelivery_task = None
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -8920,6 +8930,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         self._spawn_supervised(
             self._delivery_obligation_redelivery_watcher,
             "delivery_obligation_redelivery_watcher",
+            on_spawn=lambda task: setattr(
+                self, "_delivery_redelivery_task", task
+            ),
         )
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
@@ -10139,6 +10152,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     await self._cleanup_agent_resources_off_loop(
                         _agent, context="shutdown idle-cache"
                     )
+
+            # Redelivery can be blocked inside adapter.send(). Cancel and await
+            # it before transport teardown; disconnect must never race an
+            # in-flight recovery send.
+            await self._quiesce_delivery_redelivery_watcher()
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)

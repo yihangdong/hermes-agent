@@ -603,6 +603,100 @@ class TestGatewayRedeliverySweep:
         adapter.send.assert_not_awaited()
 
 
+class TestRedeliveryWatcherShutdown:
+    @pytest.mark.asyncio
+    async def test_watcher_exits_when_runner_is_quiescing(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._running = False
+        runner._redeliver_pending_obligations = AsyncMock()
+
+        await asyncio.wait_for(
+            runner._delivery_obligation_redelivery_watcher(),
+            timeout=0.05,
+        )
+        runner._redeliver_pending_obligations.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_quiesce_cancels_and_awaits_watcher_before_teardown(self):
+        from gateway.run import GatewayRunner
+
+        runner = object.__new__(GatewayRunner)
+        runner._background_tasks = set()
+        entered = asyncio.Event()
+        cancelled = asyncio.Event()
+
+        async def blocked_send():
+            entered.set()
+            try:
+                await asyncio.Future()
+            finally:
+                cancelled.set()
+
+        task = asyncio.create_task(blocked_send())
+        runner._delivery_redelivery_task = task
+        runner._background_tasks.add(task)
+        await entered.wait()
+
+        await runner._quiesce_delivery_redelivery_watcher()
+
+        assert task.cancelled()
+        assert cancelled.is_set()
+        assert runner._delivery_redelivery_task is None
+        assert task not in runner._background_tasks
+
+
+class TestTerminalAbandonmentFencing:
+    @pytest.mark.parametrize("terminal_reason", ["attempts", "stale"])
+    def test_terminal_abandonment_clears_owner_token_and_current_lease(
+        self, terminal_reason
+    ):
+        _record(platform="slack")
+        _orphan("ob-1")
+        claim = dl.sweep_recoverable(deliverable_platforms={"slack"})[0]
+        assert claim["claim_token"]
+
+        with dl._transaction() as conn:
+            if terminal_reason == "attempts":
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET attempts=?, owner_pid=999999999, owner_started_at=1
+                       WHERE obligation_id=?""",
+                    (dl.MAX_ATTEMPTS, "ob-1"),
+                )
+            else:
+                conn.execute(
+                    """UPDATE delivery_obligations
+                       SET created_at=?, owner_pid=999999999, owner_started_at=1
+                       WHERE obligation_id=?""",
+                    (time.time() - dl.STALE_AFTER_SECONDS - 10, "ob-1"),
+                )
+            conn.execute(
+                """UPDATE delivery_recovery_lease
+                   SET owner_pid=999999999, owner_started_at=1
+                   WHERE obligation_id=?""",
+                ("ob-1",),
+            )
+
+        assert dl.sweep_recoverable(
+            now=time.time(), deliverable_platforms={"slack"}
+        ) == []
+        with dl._connect() as conn:
+            row = conn.execute(
+                """SELECT state, owner_pid, owner_started_at, claim_token
+                   FROM delivery_obligations WHERE obligation_id=?""",
+                ("ob-1",),
+            ).fetchone()
+            leases = conn.execute(
+                """SELECT COUNT(*) FROM delivery_recovery_lease
+                   WHERE obligation_id=?""",
+                ("ob-1",),
+            ).fetchone()[0]
+        assert row == ("abandoned", None, None, None)
+        assert leases == 0
+
+
 class TestAttemptsOnlySpentOnRealSends:
     """``attempts`` is the redelivery budget — it must buy a send.
 

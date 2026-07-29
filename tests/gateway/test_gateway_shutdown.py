@@ -92,6 +92,40 @@ async def test_gateway_stop_interrupts_running_agents_and_cancels_adapter_tasks(
 
 
 @pytest.mark.asyncio
+async def test_gateway_stop_awaits_redelivery_before_adapter_disconnect():
+    runner, adapter = make_restart_runner()
+    order = []
+    entered = asyncio.Event()
+
+    async def blocked_redelivery():
+        entered.set()
+        try:
+            await asyncio.Future()
+        finally:
+            order.append("redelivery_cancelled")
+
+    watcher = asyncio.create_task(blocked_redelivery())
+    runner._delivery_redelivery_task = watcher
+    runner._background_tasks.add(watcher)
+    await entered.wait()
+
+    async def disconnect():
+        order.append("adapter_disconnected")
+
+    adapter.disconnect = AsyncMock(side_effect=disconnect)
+    with (
+        patch("gateway.status.remove_pid_file"),
+        patch("gateway.status.write_runtime_status"),
+        patch("agent.auxiliary_client.shutdown_cached_clients"),
+    ):
+        await runner.stop()
+
+    assert order.index("redelivery_cancelled") < order.index("adapter_disconnected")
+    assert watcher.cancelled()
+    assert runner._delivery_redelivery_task is None
+
+
+@pytest.mark.asyncio
 async def test_gateway_stop_drains_running_agents_before_disconnect():
     runner, adapter = make_restart_runner()
     # Opt into a grace window (the default is 0 = interrupt immediately).

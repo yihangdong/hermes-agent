@@ -520,22 +520,42 @@ def sweep_recoverable(
         rows = conn.execute(
             """SELECT obligation_id, session_key, platform, chat_id, thread_id,
                       content, state, attempts, created_at,
-                      owner_pid, owner_started_at, next_attempt_at, generation
+                      owner_pid, owner_started_at, next_attempt_at, generation,
+                      claim_token
                FROM delivery_obligations
                WHERE state IN ('pending', 'attempting', 'failed')
                ORDER BY created_at ASC, obligation_id ASC"""
         ).fetchall()
         for (oid, session_key, platform, chat_id, thread_id, content, state,
              attempts, created_at, owner_pid, owner_started_at,
-             next_attempt_at, generation) in rows:
+             next_attempt_at, generation, prior_claim_token) in rows:
             if _owner_alive(owner_pid, owner_started_at):
                 continue  # a live gateway still owns this row
             if attempts >= MAX_ATTEMPTS or (now - created_at) > STALE_AFTER_SECONDS:
-                conn.execute(
-                    """UPDATE delivery_obligations
-                       SET state='abandoned', updated_at=? WHERE obligation_id=?""",
-                    (now, oid),
+                reason = (
+                    "redelivery attempts exhausted"
+                    if attempts >= MAX_ATTEMPTS
+                    else "redelivery stale cutoff exceeded"
                 )
+                cursor = conn.execute(
+                    """UPDATE delivery_obligations
+                       SET state='abandoned', updated_at=?, last_error=?,
+                           owner_pid=NULL, owner_started_at=NULL,
+                           next_attempt_at=0, claim_token=NULL
+                       WHERE obligation_id=? AND generation=?
+                         AND owner_pid IS ? AND owner_started_at IS ?
+                         AND claim_token IS ?""",
+                    (now, reason, oid, generation, owner_pid,
+                     owner_started_at, prior_claim_token),
+                )
+                if cursor.rowcount:
+                    conn.execute(
+                        """DELETE FROM delivery_recovery_lease
+                           WHERE lease_name=? AND obligation_id=?
+                             AND generation=? AND claim_token IS ?""",
+                        (_RECOVERY_LEASE_NAME, oid, generation,
+                         prior_claim_token),
+                    )
                 continue
             if float(next_attempt_at or 0) > now:
                 continue
