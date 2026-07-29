@@ -10156,7 +10156,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Redelivery can be blocked inside adapter.send(). Cancel and await
             # it before transport teardown; disconnect must never race an
             # in-flight recovery send.
-            await self._quiesce_delivery_redelivery_watcher()
+            await GatewayRunner._quiesce_delivery_redelivery_watcher(self)
 
             for platform, adapter in list(self.adapters.items()):
                 await self._bounded_adapter_teardown(adapter, platform)
