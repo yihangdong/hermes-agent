@@ -9,7 +9,9 @@ id stability, and the startup redelivery sweep's contract:
 - poison rows abandon at the attempts cap / stale cutoff
 """
 
+import sqlite3
 import time
+from concurrent.futures import ThreadPoolExecutor
 from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
@@ -28,7 +30,7 @@ def _fresh_db(tmp_path, monkeypatch):
 
 
 def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
-    dl.record_obligation(
+    return dl.record_obligation(
         obligation_id=oid,
         session_key=session_key,
         platform=kw.get("platform", "slack"),
@@ -41,12 +43,14 @@ def _record(oid="ob-1", session_key="agent:main:slack:channel:C1", **kw):
 def _row(oid):
     with dl._connect() as conn:
         r = conn.execute(
-            """SELECT state, attempts, owner_pid, content
+            """SELECT state, attempts, owner_pid, content, next_attempt_at,
+                      generation
                FROM delivery_obligations WHERE obligation_id=?""",
             (oid,),
         ).fetchone()
     return None if r is None else {
         "state": r[0], "attempts": r[1], "owner_pid": r[2], "content": r[3],
+        "next_attempt_at": r[4], "generation": r[5],
     }
 
 
@@ -78,11 +82,57 @@ class TestStateMachine:
         dl.mark_failed("ob-1", "chat_not_found")
         assert _row("ob-1")["state"] == "failed"
 
-    def test_rerecord_same_id_is_idempotent(self):
+    def test_terminal_failure_is_abandoned_without_retry(self):
+        generation = _record()
+        dl.mark_attempting("ob-1", generation=generation)
+        dl.mark_failed(
+            "ob-1", "chat_not_found", generation=generation, retryable=False
+        )
+        row = _row("ob-1")
+        assert row["state"] == "abandoned"
+        assert row["next_attempt_at"] == 0
+        assert dl.sweep_recoverable() == []
+
+    def test_failed_row_is_released_for_same_process_retry_after_backoff(self):
         _record()
         dl.mark_attempting("ob-1")
-        _record()  # INSERT OR REPLACE resets to pending — same turn re-record
+        before = time.time()
+        dl.mark_failed("ob-1", "rate limited", retry_after_seconds=42)
+        row = _row("ob-1")
+        assert row["owner_pid"] is None
+        assert row["next_attempt_at"] >= before + 42
+        assert dl.sweep_recoverable(now=before + 41) == []
+        claimed = dl.sweep_recoverable(now=row["next_attempt_at"] + 0.01)
+        assert [item["obligation_id"] for item in claimed] == ["ob-1"]
+
+    def test_failed_row_uses_bounded_exponential_backoff(self):
+        _record()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET attempts=? WHERE obligation_id=?",
+                (2, "ob-1"),
+            )
+        before = time.time()
+        dl.mark_failed("ob-1", "transient")
+        delay = _row("ob-1")["next_attempt_at"] - before
+        assert dl.RETRY_BASE_SECONDS * 4 - 1 <= delay <= dl.RETRY_BASE_SECONDS * 4 + 1
+
+    def test_rerecord_same_id_is_idempotent(self):
+        first = _record()
+        dl.mark_attempting("ob-1", generation=first)
+        second = _record()  # same turn re-record creates a fenced generation
         assert _row("ob-1")["state"] == "pending"
+        assert second == first + 1
+
+    def test_stale_completion_cannot_mutate_rerecorded_generation(self):
+        first = _record()
+        second = _record()
+        dl.mark_delivered("ob-1", generation=first)
+        assert _row("ob-1")["state"] == "pending"
+        dl.mark_failed("ob-1", "stale", generation=first)
+        assert _row("ob-1")["state"] == "pending"
+        dl.mark_delivered("ob-1", generation=second)
+        assert _row("ob-1")["state"] == "delivered"
 
 
 class TestObligationId:
@@ -124,7 +174,9 @@ class TestSweep:
         _record()
         dl.mark_failed("ob-1", "boom")
         _orphan("ob-1")
-        claimed = dl.sweep_recoverable()
+        claimed = dl.sweep_recoverable(
+            now=_row("ob-1")["next_attempt_at"] + 0.01
+        )
         assert claimed[0]["needs_marker"] is True
 
     def test_delivered_rows_ignored(self):
@@ -150,6 +202,128 @@ class TestSweep:
         future = time.time() + dl.STALE_AFTER_SECONDS + 60
         assert dl.sweep_recoverable(now=future) == []
         assert _row("ob-1")["state"] == "abandoned"
+
+    def test_limit_claims_oldest_only(self):
+        _record("ob-1", content="first")
+        _record("ob-2", content="second")
+        now = time.time()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=?, owner_pid=NULL "
+                "WHERE obligation_id='ob-1'", (now - 2,)
+            )
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=?, owner_pid=NULL "
+                "WHERE obligation_id='ob-2'", (now - 1,)
+            )
+        claimed = dl.sweep_recoverable(limit=1)
+        assert [item["obligation_id"] for item in claimed] == ["ob-1"]
+        assert _row("ob-2")["attempts"] == 0
+
+    def test_global_lease_allows_only_one_in_flight_recovery(self):
+        _record("ob-1", content="first")
+        _record("ob-2", content="second")
+        _orphan("ob-1")
+        _orphan("ob-2")
+        first = dl.sweep_recoverable(limit=1)
+        assert [row["obligation_id"] for row in first] == ["ob-1"]
+        assert dl.sweep_recoverable(limit=1) == []
+        dl.mark_failed(
+            "ob-1", "retry later", generation=first[0]["generation"]
+        )
+        second = dl.sweep_recoverable(limit=1)
+        assert [row["obligation_id"] for row in second] == ["ob-2"]
+
+    def test_durable_platform_backoff_blocks_fresh_sweep(self):
+        _record(platform="weixin")
+        _orphan("ob-1")
+        duration = dl.record_platform_rate_limit(
+            "weixin", retry_after_seconds=90
+        )
+        assert duration >= 90
+        assert dl.sweep_recoverable(
+            deliverable_platforms={"weixin"}, limit=1
+        ) == []
+        dl.clear_platform_backoff("weixin")
+        assert len(dl.sweep_recoverable(
+            deliverable_platforms={"weixin"}, limit=1
+        )) == 1
+
+    def test_hard_cap_never_deletes_live_obligations(self, monkeypatch):
+        monkeypatch.setattr(dl, "_MAX_ROWS", 2)
+        _record("ob-1")
+        _record("ob-2")
+        _record("ob-3")
+        assert all(_row(oid) is not None for oid in ("ob-1", "ob-2", "ob-3"))
+        dl.mark_delivered("ob-1")
+        dl._prune()
+        assert _row("ob-1") is None
+        assert _row("ob-2") is not None
+        assert _row("ob-3") is not None
+
+
+class TestSchemaMigration:
+    def test_legacy_table_gets_next_attempt_column_without_data_loss(self):
+        path = dl._db_path()
+        conn = sqlite3.connect(path)
+        conn.execute("DROP TABLE IF EXISTS delivery_obligations")
+        conn.execute(
+            """CREATE TABLE delivery_obligations (
+                obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+                platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+                content TEXT NOT NULL, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL, owner_pid INTEGER,
+                owner_started_at INTEGER, last_error TEXT)"""
+        )
+        conn.execute(
+            "INSERT INTO delivery_obligations VALUES "
+            "('legacy','s','weixin','c',NULL,'body','failed',1,1,1,NULL,NULL,'x')"
+        )
+        conn.commit()
+        conn.close()
+
+        with dl._connect() as migrated:
+            columns = {row[1] for row in migrated.execute("PRAGMA table_info(delivery_obligations)")}
+            row = migrated.execute(
+                "SELECT content, next_attempt_at, generation FROM delivery_obligations "
+                "WHERE obligation_id='legacy'"
+            ).fetchone()
+        assert "next_attempt_at" in columns
+        assert "generation" in columns
+        assert row == ("body", 0.0, 1)
+
+    def test_concurrent_legacy_migration_is_idempotent(self):
+        path = dl._db_path()
+        conn = sqlite3.connect(path)
+        conn.execute("DROP TABLE IF EXISTS delivery_obligations")
+        conn.execute(
+            """CREATE TABLE delivery_obligations (
+                obligation_id TEXT PRIMARY KEY, session_key TEXT NOT NULL,
+                platform TEXT NOT NULL, chat_id TEXT NOT NULL, thread_id TEXT,
+                content TEXT NOT NULL, state TEXT NOT NULL,
+                attempts INTEGER NOT NULL DEFAULT 0, created_at REAL NOT NULL,
+                updated_at REAL NOT NULL, owner_pid INTEGER,
+                owner_started_at INTEGER, last_error TEXT)"""
+        )
+        conn.commit()
+        conn.close()
+
+        def open_and_read():
+            migrated = dl._connect()
+            try:
+                return {
+                    row[1]
+                    for row in migrated.execute(
+                        "PRAGMA table_info(delivery_obligations)"
+                    )
+                }
+            finally:
+                migrated.close()
+
+        with ThreadPoolExecutor(max_workers=16) as pool:
+            results = list(pool.map(lambda _: open_and_read(), range(32)))
+        assert all("next_attempt_at" in columns for columns in results)
 
 
 class TestPrune:
@@ -255,6 +429,63 @@ class TestGatewayRedeliverySweep:
 
         assert n == 0
         assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-1")["owner_pid"] is None
+
+    @pytest.mark.asyncio
+    async def test_each_pass_sends_only_one_oldest_obligation(self):
+        _record("ob-1", content="first")
+        _record("ob-2", content="second")
+        now = time.time()
+        with dl._connect() as conn:
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=?, owner_pid=NULL "
+                "WHERE obligation_id='ob-1'", (now - 2,)
+            )
+            conn.execute(
+                "UPDATE delivery_obligations SET created_at=?, owner_pid=NULL "
+                "WHERE obligation_id='ob-2'", (now - 1,)
+            )
+        adapter = self._adapter()
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 1
+
+        assert adapter.send.await_count == 1
+        assert adapter.send.call_args.kwargs["content"] == "first"
+        assert _row("ob-2")["attempts"] == 0
+
+    @pytest.mark.asyncio
+    async def test_rate_limit_globally_pauses_backlog_without_spending_next_row(self):
+        _record("ob-1", content="first")
+        _record("ob-2", content="second")
+        _orphan("ob-1")
+        _orphan("ob-2")
+        adapter = MagicMock()
+        adapter.send = AsyncMock(
+            return_value=MagicMock(
+                success=False,
+                error="rate limited",
+                error_kind="rate_limited",
+                retry_after=90,
+            )
+        )
+        runner = self._runner(adapter)
+
+        assert await runner._redeliver_pending_obligations() == 0
+        assert await runner._redeliver_pending_obligations() == 0
+
+        assert adapter.send.await_count == 1
+        assert _row("ob-1")["state"] == "failed"
+        assert _row("ob-2")["attempts"] == 0
+        assert runner._delivery_redelivery_rate_limit_streak == 1
+
+        # A brand-new runner (service restart) must observe the same durable
+        # platform circuit and leave the second row untouched.
+        fresh_adapter = self._adapter(success=True)
+        fresh_runner = self._runner(fresh_adapter)
+        assert await fresh_runner._redeliver_pending_obligations() == 0
+        fresh_adapter.send.assert_not_awaited()
+        assert _row("ob-2")["attempts"] == 0
 
     @pytest.mark.asyncio
     async def test_missing_adapter_leaves_row_recoverable(self):

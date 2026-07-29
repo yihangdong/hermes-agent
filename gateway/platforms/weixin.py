@@ -62,6 +62,7 @@ from gateway.platforms.base import (
     MessageEvent,
     MessageType,
     SendResult,
+    classify_send_error,
     cache_audio_from_bytes,
     cache_document_from_bytes,
     cache_image_from_bytes,
@@ -1219,8 +1220,13 @@ class WeixinAdapter(BasePlatformAdapter):
             extra.get("rate_limit_circuit_open_seconds")
             or os.getenv("WEIXIN_RATE_LIMIT_CIRCUIT_OPEN_SECONDS", "30.0")
         )
+        self._rate_limit_circuit_max_open_seconds = max(
+            self._rate_limit_circuit_open_seconds,
+            1800.0,
+        )
         self._rate_limit_circuit_until = 0.0
         self._rate_limit_events: List[float] = []
+        self._consecutive_rate_limit_periods = 0
         self._dm_policy = str(extra.get("dm_policy") or os.getenv("WEIXIN_DM_POLICY", "pairing")).strip().lower()
         self._group_policy = str(extra.get("group_policy") or os.getenv("WEIXIN_GROUP_POLICY", "disabled")).strip().lower()
         allow_from = extra.get("allow_from")
@@ -1721,7 +1727,14 @@ class WeixinAdapter(BasePlatformAdapter):
         )
 
     def _rate_limit_cooldown_remaining(self) -> float:
-        return max(0.0, self._rate_limit_circuit_until - time.monotonic())
+        in_memory = max(0.0, self._rate_limit_circuit_until - time.monotonic())
+        try:
+            from gateway.delivery_ledger import platform_backoff_remaining
+
+            durable = platform_backoff_remaining("weixin")
+        except Exception:
+            durable = 0.0
+        return max(in_memory, durable)
 
     def _rate_limit_error(self) -> RuntimeError:
         return RuntimeError(
@@ -1731,9 +1744,27 @@ class WeixinAdapter(BasePlatformAdapter):
     def _open_rate_limit_circuit(self) -> None:
         if self._rate_limit_circuit_open_seconds <= 0:
             return
+        self._consecutive_rate_limit_periods += 1
+        exponent = min(self._consecutive_rate_limit_periods - 1, 20)
+        open_seconds = min(
+            self._rate_limit_circuit_open_seconds * (2 ** exponent),
+            self._rate_limit_circuit_max_open_seconds,
+        )
+        try:
+            from gateway.delivery_ledger import record_platform_rate_limit
+
+            open_seconds = record_platform_rate_limit(
+                "weixin",
+                retry_after_seconds=open_seconds,
+                base_seconds=self._rate_limit_circuit_open_seconds,
+                max_seconds=self._rate_limit_circuit_max_open_seconds,
+            )
+        except Exception:
+            logger.debug("[%s] durable rate-limit state update failed", self.name,
+                         exc_info=True)
         self._rate_limit_circuit_until = max(
             self._rate_limit_circuit_until,
-            time.monotonic() + self._rate_limit_circuit_open_seconds,
+            time.monotonic() + open_seconds,
         )
 
     def _record_rate_limit_event(self) -> bool:
@@ -1750,6 +1781,14 @@ class WeixinAdapter(BasePlatformAdapter):
     def _reset_rate_limit_circuit(self) -> None:
         self._rate_limit_events.clear()
         self._rate_limit_circuit_until = 0.0
+        self._consecutive_rate_limit_periods = 0
+        try:
+            from gateway.delivery_ledger import clear_platform_backoff
+
+            clear_platform_backoff("weixin")
+        except Exception:
+            logger.debug("[%s] durable rate-limit reset failed", self.name,
+                         exc_info=True)
 
     async def _send_text_chunk(
         self,
@@ -1935,7 +1974,25 @@ class WeixinAdapter(BasePlatformAdapter):
             return SendResult(success=True, message_id=last_message_id)
         except Exception as exc:
             logger.error("[%s] send failed to=%s: %s", self.name, _safe_id(chat_id), exc)
-            return SendResult(success=False, error=str(exc))
+            error = str(exc)
+            error_kind = classify_send_error(None, error_text=error)
+            retry_after = None
+            if error_kind == "rate_limited":
+                retry_after = max(
+                    self._rate_limit_cooldown_remaining(),
+                    self._rate_limit_circuit_open_seconds,
+                )
+            return SendResult(
+                success=False,
+                error=error,
+                # Durable gateway redelivery owns the long retry.  Returning
+                # retryable=False avoids holding an interactive turn open for
+                # a platform cooldown while still exposing deterministic
+                # scheduling metadata to the ledger.
+                retryable=False,
+                retry_after=retry_after,
+                error_kind=error_kind,
+            )
 
     async def _ensure_typing_ticket(self, chat_id: str) -> Optional[str]:
         """Return a valid typing ticket, refreshing from getConfig if expired.

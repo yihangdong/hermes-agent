@@ -7689,6 +7689,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         recovered-reply marker so a possible duplicate is labeled, never
         silent. Returns the number of redeliveries attempted.
         """
+        # A platform-level rate limit is shared by every obligation. Keep the
+        # durable rows untouched while the circuit is open instead of walking
+        # the backlog and spending one attempt per row in a burst.
+        if time.monotonic() < getattr(
+            self, "_delivery_redelivery_not_before", 0.0
+        ):
+            return 0
         try:
             from gateway.delivery_ledger import (
                 RECOVERED_MARKER,
@@ -7707,7 +7714,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(p, "value", str(p)) for p in self.adapters
             }
             claimed = await asyncio.to_thread(
-                sweep_recoverable, None, deliverable_platforms=_deliverable
+                sweep_recoverable,
+                None,
+                deliverable_platforms=_deliverable,
+                limit=1,
             )
         except Exception:
             logger.debug("delivery ledger sweep failed", exc_info=True)
@@ -7724,11 +7734,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "obligation %s: unknown platform %r",
                     row["obligation_id"], row.get("platform"),
                 )
+                mark_failed(
+                    row["obligation_id"],
+                    f"unknown platform: {row.get('platform')!r}",
+                    retry_after_seconds=300.0,
+                    generation=row.get("generation"),
+                )
                 continue
             adapter = self.adapters.get(platform)
             if adapter is None:
-                # Platform not connected this boot — leave the row claimed;
-                # attempts cap + stale cutoff bound the retries on later boots.
+                # The adapter disappeared after the deliverable snapshot.
+                # Release both the row and the global recovery lease rather
+                # than stalling every platform until this process restarts.
+                mark_failed(
+                    row["obligation_id"],
+                    "platform adapter unavailable after claim",
+                    retry_after_seconds=60.0,
+                    generation=row.get("generation"),
+                )
                 continue
             content = row["content"]
             if row.get("needs_marker"):
@@ -7750,8 +7773,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 result = None
             try:
                 if result is not None and getattr(result, "success", False):
-                    mark_delivered(row["obligation_id"])
+                    mark_delivered(
+                        row["obligation_id"],
+                        generation=row.get("generation"),
+                    )
+                    try:
+                        from gateway.delivery_ledger import clear_platform_backoff
+
+                        clear_platform_backoff(row["platform"])
+                    except Exception:
+                        logger.debug("durable platform backoff reset failed",
+                                     exc_info=True)
                     redelivered += 1
+                    self._delivery_redelivery_rate_limit_streak = 0
+                    # One recovered reply per minute. Live interactive replies
+                    # remain immediate and therefore retain priority.
+                    self._delivery_redelivery_not_before = time.monotonic() + 60.0
                     logger.info(
                         "Redelivered recovered final response to %s:%s "
                         "(obligation %s, attempt %d)",
@@ -7759,9 +7796,71 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         row["obligation_id"], row["attempts"],
                     )
                 else:
+                    error = str(
+                        getattr(result, "error", "") or "send failed"
+                    )
+                    try:
+                        from gateway.platforms.base import (
+                            SEND_ERROR_KINDS,
+                            classify_send_error,
+                        )
+
+                        error_kind = getattr(result, "error_kind", None)
+                        if error_kind not in SEND_ERROR_KINDS:
+                            error_kind = classify_send_error(None, error_text=error)
+                    except Exception:
+                        error_kind = "unknown"
+                    retry_after = getattr(result, "retry_after", None)
+                    try:
+                        retry_after = max(0.0, float(retry_after or 0.0))
+                    except (TypeError, ValueError):
+                        retry_after = 0.0
+                    if error_kind == "rate_limited":
+                        streak = getattr(
+                            self, "_delivery_redelivery_rate_limit_streak", 0
+                        ) + 1
+                        self._delivery_redelivery_rate_limit_streak = streak
+                        retry_after = max(
+                            retry_after,
+                            min(30.0 * (2 ** min(streak - 1, 6)), 1800.0),
+                        )
+                        # Persist the shared circuit so a rapid service
+                        # restart or a second gateway process cannot bypass
+                        # it and consume another backlog row immediately.
+                        try:
+                            from gateway.delivery_ledger import (
+                                platform_backoff_remaining,
+                                record_platform_rate_limit,
+                            )
+
+                            durable_remaining = platform_backoff_remaining(
+                                row["platform"]
+                            )
+                            if durable_remaining <= 0:
+                                durable_remaining = record_platform_rate_limit(
+                                    row["platform"],
+                                    retry_after_seconds=retry_after,
+                                )
+                            retry_after = max(retry_after, durable_remaining)
+                        except Exception:
+                            logger.debug(
+                                "durable platform backoff update failed",
+                                exc_info=True,
+                            )
+                    else:
+                        self._delivery_redelivery_rate_limit_streak = 0
+                        retry_after = max(retry_after, 30.0)
+                    self._delivery_redelivery_not_before = (
+                        time.monotonic() + retry_after
+                    )
                     mark_failed(
                         row["obligation_id"],
-                        str(getattr(result, "error", "") or "send failed"),
+                        error,
+                        retry_after_seconds=retry_after,
+                        generation=row.get("generation"),
+                        retryable=error_kind in {
+                            "rate_limited", "transient", "unknown"
+                        },
                     )
             except Exception:
                 logger.debug("delivery ledger update failed", exc_info=True)
@@ -7778,6 +7877,30 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         exc_info=True,
                     )
         return redelivered
+
+    async def _delivery_obligation_redelivery_watcher(self) -> None:
+        """Continuously recover final responses without restart-time bursts.
+
+        Per-row due times live in the durable ledger. This process-wide gate
+        adds adaptive platform backoff, and each pass claims only one oldest
+        row. Live interactive replies remain immediate and retain priority.
+        """
+        while True:
+            try:
+                await self._redeliver_pending_obligations()
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                logger.warning(
+                    "delivery-obligation redelivery watcher failed",
+                    exc_info=True,
+                )
+            remaining = max(
+                0.0,
+                getattr(self, "_delivery_redelivery_not_before", 0.0)
+                - time.monotonic(),
+            )
+            await asyncio.sleep(max(15.0, min(remaining, 300.0)))
 
     def _schedule_resume_pending_sessions(self, platform=None) -> int:
         """Auto-continue fresh restart-interrupted sessions after startup.
@@ -8768,6 +8891,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         # Start background session expiry watcher to finalize expired sessions
         self._spawn_supervised(self._session_expiry_watcher, "session_expiry_watcher")
+        self._spawn_supervised(
+            self._delivery_obligation_redelivery_watcher,
+            "delivery_obligation_redelivery_watcher",
+        )
 
         # Start background kanban notifier — delivers `completed`, `blocked`,
         # `spawn_auto_blocked`, and `crashed` events to gateway subscribers

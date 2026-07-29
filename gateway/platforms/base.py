@@ -5732,7 +5732,7 @@ class BasePlatformAdapter(ABC):
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                record_obligation(
+                                _obligation_generation = record_obligation(
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
                                     platform=str(
@@ -5743,7 +5743,10 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                mark_attempting(_obligation_id)
+                                mark_attempting(
+                                    _obligation_id,
+                                    generation=_obligation_generation,
+                                )
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
@@ -5762,11 +5765,27 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                mark_delivered(
+                                    _obligation_id,
+                                    generation=_obligation_generation,
+                                )
                             else:
+                                _error_text = str(
+                                    getattr(result, "error", "") or ""
+                                )
+                                _error_kind = getattr(result, "error_kind", None)
+                                if _error_kind not in SEND_ERROR_KINDS:
+                                    _error_kind = classify_send_error(
+                                        None, error_text=_error_text
+                                    )
                                 mark_failed(
                                     _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
+                                    _error_text,
+                                    retry_after_seconds=getattr(result, "retry_after", None),
+                                    generation=_obligation_generation,
+                                    retryable=_error_kind in {
+                                        "rate_limited", "transient", "unknown"
+                                    },
                                 )
                         except Exception:
                             logger.debug(
