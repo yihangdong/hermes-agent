@@ -420,6 +420,86 @@ class TestWeixinChunkDelivery:
         assert send_message_mock.await_count == 3
         assert sleep_mock.await_count == 2
 
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_durable_atomic_chunk_is_one_exact_literal_provider_call(
+        self, send_message_mock, tmp_path
+    ):
+        adapter = self._connected_adapter()
+        local_file = tmp_path / "must-remain-literal.txt"
+        local_file.write_text("not an attachment", encoding="utf-8")
+        content = f"**already formatted**\n{local_file}"
+
+        result = asyncio.run(
+            adapter.send(
+                "wxid_test123",
+                content,
+                metadata={"durable_preformatted_atomic_text": True},
+            )
+        )
+
+        assert result.success is True
+        send_message_mock.assert_awaited_once()
+        assert send_message_mock.await_args.kwargs["text"] == content
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_durable_atomic_oversize_fails_before_provider_call(
+        self, send_message_mock
+    ):
+        adapter = self._connected_adapter()
+        content = "X" * (adapter.MAX_MESSAGE_LENGTH + 1)
+
+        result = asyncio.run(
+            adapter.send(
+                "wxid_test123",
+                content,
+                metadata={"durable_preformatted_atomic_text": True},
+            )
+        )
+
+        assert result.success is False
+        assert result.error_kind == "bad_format"
+        send_message_mock.assert_not_awaited()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_standalone_direct_preserves_provider_cooldown_metadata(
+        self, send_message_mock, tmp_path, monkeypatch
+    ):
+        monkeypatch.setenv("HERMES_HOME", str(tmp_path / "home"))
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        async def scenario():
+            adapter = self._connected_adapter()
+
+            class LiveSession:
+                closed = False
+
+                def __init__(self):
+                    self._loop = asyncio.get_running_loop()
+
+            adapter._send_session = LiveSession()
+            adapter._session = adapter._send_session
+            adapter._rate_limit_cooldown_remaining = (
+                lambda: 0.0 if send_message_mock.await_count == 0 else 1534.4
+            )
+            monkeypatch.setitem(weixin._LIVE_ADAPTERS, "test-token", adapter)
+            return await weixin.send_weixin_direct(
+                extra={"account_id": "test-account"},
+                token="test-token",
+                chat_id="wxid_test123",
+                message="atomic durable text",
+                metadata={"durable_preformatted_atomic_text": True},
+            )
+
+        result = asyncio.run(scenario())
+        assert result["error_kind"] == "rate_limited"
+        assert result["retry_after"] == pytest.approx(1534.4)
+        assert "rate limited" in result["error"]
+        assert send_message_mock.await_count == 1
+
     @patch("gateway.platforms.weixin.asyncio.sleep", new_callable=AsyncMock)
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_send_retries_failed_chunk_before_continuing(self, send_message_mock, sleep_mock):
@@ -488,6 +568,20 @@ class TestWeixinChunkDelivery:
         send_message_mock.assert_not_awaited()
 
     @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_rate_limit_circuit_survives_adapter_restart(self, send_message_mock):
+        first = self._connected_adapter()
+        first._rate_limit_circuit_open_seconds = 60
+        first._open_rate_limit_circuit()
+
+        fresh = self._connected_adapter()
+        result = asyncio.run(fresh.send("wxid_test123", "after restart"))
+
+        assert result.success is False
+        assert result.error_kind == "rate_limited"
+        assert result.retry_after is not None and result.retry_after > 0
+        send_message_mock.assert_not_awaited()
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
     def test_successful_send_after_cooldown_resets_rate_limit_state(self, send_message_mock):
         adapter = self._connected_adapter()
         adapter._rate_limit_circuit_until = weixin.time.monotonic() - 1
@@ -499,7 +593,44 @@ class TestWeixinChunkDelivery:
         assert result.success is True
         assert adapter._rate_limit_events == []
         assert adapter._rate_limit_circuit_until == 0.0
+        assert adapter._consecutive_rate_limit_periods == 0
         send_message_mock.assert_awaited_once()
+
+    def test_repeated_rate_limit_periods_exponentially_extend_circuit(self):
+        adapter = self._connected_adapter()
+        adapter._rate_limit_circuit_threshold = 1
+        adapter._rate_limit_circuit_open_seconds = 10
+        adapter._rate_limit_circuit_max_open_seconds = 40
+
+        durations = []
+        for _ in range(4):
+            before = weixin.time.monotonic()
+            assert adapter._record_rate_limit_event() is True
+            durations.append(adapter._rate_limit_circuit_until - before)
+            adapter._rate_limit_circuit_until = 0
+
+        assert durations[0] == pytest.approx(10, abs=0.1)
+        assert durations[1] == pytest.approx(20, abs=0.1)
+        assert durations[2] == pytest.approx(40, abs=0.1)
+        assert durations[3] == pytest.approx(40, abs=0.1)
+
+    @patch("gateway.platforms.weixin._send_message", new_callable=AsyncMock)
+    def test_rate_limit_send_result_exposes_retry_metadata(self, send_message_mock):
+        adapter = self._connected_adapter()
+        adapter._rate_limit_circuit_threshold = 1
+        adapter._rate_limit_circuit_open_seconds = 37
+        send_message_mock.return_value = {
+            "ret": weixin.RATE_LIMIT_ERRCODE,
+            "errcode": weixin.RATE_LIMIT_ERRCODE,
+            "errmsg": "frequency limit",
+        }
+
+        result = asyncio.run(adapter.send("wxid_test123", "limited"))
+
+        assert result.success is False
+        assert result.error_kind == "rate_limited"
+        assert result.retryable is False
+        assert result.retry_after == pytest.approx(37, abs=1)
 
     def test_concurrent_rate_limited_sends_are_serialized_by_gate(self):
         adapter = self._connected_adapter()

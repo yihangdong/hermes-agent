@@ -19,7 +19,9 @@ from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from plugins.platforms.slack.adapter import _standalone_send
+from gateway.config import Platform, PlatformConfig
+from plugins.platforms.slack.adapter import SlackAdapter, _standalone_send
+from tools.send_message_tool import _send_to_platform
 
 
 def _pconfig(token: str = "xoxb-test"):
@@ -58,6 +60,13 @@ def _mock_client(*, post_ok=True, upload_ok=True):
             return_value={"ok": False, "error": "not_in_channel"}
         )
     return client
+
+
+def _live_adapter(client):
+    adapter = SlackAdapter(PlatformConfig(enabled=True, token="xoxb-test"))
+    adapter._app = SimpleNamespace(client=client)
+    adapter._get_client = lambda _chat_id, team_id=None: client
+    return adapter
 
 
 @contextlib.contextmanager
@@ -173,6 +182,338 @@ def test_missing_media_file_warns_and_falls_back_caption():
     client.chat_postMessage.assert_awaited_once()
     assert client.chat_postMessage.await_args.kwargs["text"] == "still deliver this"
     client.files_upload_v2.assert_not_awaited()
+
+
+def test_durable_atomic_standalone_text_is_exactly_one_preformatted_call(monkeypatch):
+    import aiohttp
+
+    durable_config = _pconfig()
+    durable_config._durable_delivery = True
+    durable_config._durable_preformatted_atomic_text = True
+    literal = "**already-final Slack mrkdwn** & literal"
+    provider_payloads = []
+
+    class _Response:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def json(self):
+            return {"ok": True, "ts": "111.222"}
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def post(self, _url, *, json, **_kwargs):
+            provider_payloads.append(json)
+            return _Response()
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: _Session())
+
+    result = asyncio.run(
+        _standalone_send(
+            durable_config,
+            "C012AB3CD",
+            literal,
+            media_files=[],
+        )
+    )
+
+    assert result.get("success") is True, result
+    assert provider_payloads == [
+        {"channel": "C012AB3CD", "text": literal, "mrkdwn": True}
+    ]
+
+
+def test_durable_atomic_standalone_never_falls_back_to_second_token(monkeypatch):
+    import aiohttp
+
+    durable_config = _pconfig("token-a,token-b")
+    durable_config._durable_delivery = True
+    durable_config._durable_preformatted_atomic_text = True
+    provider_tokens = []
+
+    class _Response:
+        headers = {}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def json(self):
+            if len(provider_tokens) == 1:
+                return {"ok": False, "error": "channel_not_found"}
+            return {"ok": True, "ts": "must-not-happen"}
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def post(self, _url, *, headers, **_kwargs):
+            provider_tokens.append(headers["Authorization"])
+            return _Response()
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: _Session())
+
+    result = asyncio.run(
+        _standalone_send(
+            durable_config,
+            "C012AB3CD",
+            "frozen provider bytes",
+            media_files=[],
+        )
+    )
+
+    assert provider_tokens == ["Bearer token-a"]
+    assert result == {"error": "Slack API error: channel_not_found"}
+
+
+def test_durable_atomic_standalone_propagates_provider_retry_after(monkeypatch):
+    import aiohttp
+
+    durable_config = _pconfig("token-a")
+    durable_config._durable_delivery = True
+    durable_config._durable_preformatted_atomic_text = True
+    provider_calls = []
+
+    class _Response:
+        headers = {"Retry-After": "1534.4"}
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        async def json(self):
+            return {"ok": False, "error": "ratelimited"}
+
+    class _Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return False
+
+        def post(self, *_args, **_kwargs):
+            provider_calls.append(1)
+            return _Response()
+
+    monkeypatch.setattr(aiohttp, "ClientSession", lambda **_kwargs: _Session())
+
+    result = asyncio.run(
+        _standalone_send(
+            durable_config,
+            "C012AB3CD",
+            "frozen provider bytes",
+            media_files=[],
+        )
+    )
+
+    assert provider_calls == [1]
+    assert result == {
+        "error": "Slack API error: ratelimited",
+        "error_kind": "rate_limited",
+        "retry_after": 1534.4,
+    }
+
+
+def test_durable_atomic_send_tool_does_not_resplit_provider_chunk(monkeypatch):
+    from gateway.platform_registry import platform_registry
+
+    durable_config = _pconfig()
+    durable_config._durable_delivery = True
+    durable_config._durable_preformatted_atomic_text = True
+    literal = "*final* Slack mrkdwn"
+    entry = SimpleNamespace(max_message_length=SlackAdapter.MAX_MESSAGE_LENGTH)
+    monkeypatch.setattr(
+        platform_registry,
+        "get",
+        lambda name: entry if name == "slack" else None,
+    )
+    send_once = AsyncMock(return_value={"success": True, "message_id": "m-1"})
+    monkeypatch.setattr("tools.send_message_tool._send_via_adapter", send_once)
+
+    result = asyncio.run(
+        _send_to_platform(
+            Platform.SLACK,
+            durable_config,
+            "C012AB3CD",
+            literal,
+            media_files=[],
+        )
+    )
+
+    assert result.get("success") is True, result
+    send_once.assert_awaited_once_with(
+        Platform.SLACK,
+        durable_config,
+        "C012AB3CD",
+        literal,
+        thread_id=None,
+        media_files=[],
+        force_document=False,
+    )
+
+
+def test_upload_exception_after_provider_call_is_ack_unknown():
+    pdf = _tmpfile(".pdf")
+    client = _mock_client()
+    client.files_upload_v2 = AsyncMock(
+        side_effect=RuntimeError("provider response lost after upload")
+    )
+    durable_config = _pconfig()
+    durable_config._durable_delivery = True
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(
+                _standalone_send(
+                    durable_config,
+                    "C012AB3CD",
+                    "",
+                    media_files=[(pdf, False)],
+                    caption="durable caption",
+                )
+            )
+        assert result["error"].startswith("ACK_UNKNOWN:")
+        assert "provider response lost after upload" in result["error"]
+        client.files_upload_v2.assert_awaited_once()
+    finally:
+        os.unlink(pdf)
+
+
+def test_receiptless_upload_is_ack_unknown():
+    pdf = _tmpfile(".pdf")
+    client = _mock_client()
+    client.files_upload_v2 = AsyncMock(return_value={"ok": True, "file": {}})
+    durable_config = _pconfig()
+    durable_config._durable_delivery = True
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(
+                _standalone_send(
+                    durable_config,
+                    "C012AB3CD",
+                    "",
+                    media_files=[(pdf, False)],
+                    caption="durable caption",
+                )
+            )
+        assert result["error"].startswith("ACK_UNKNOWN:")
+        assert "receipt" in result["error"].lower()
+        client.files_upload_v2.assert_awaited_once()
+    finally:
+        os.unlink(pdf)
+
+
+def test_files_array_id_preserves_nondurable_upload_success_contract():
+    pdf = _tmpfile(".pdf")
+    client = _mock_client()
+    client.files_upload_v2 = AsyncMock(
+        return_value={"ok": True, "files": [{"id": "F-files-array-123"}]}
+    )
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    "C012AB3CD",
+                    "",
+                    media_files=[(pdf, False)],
+                    caption="exact caption",
+                )
+            )
+        assert result["success"] is True
+        assert result["message_id"] == "F-files-array-123"
+        client.chat_postMessage.assert_not_awaited()
+        assert client.files_upload_v2.await_args.kwargs["initial_comment"] == "exact caption"
+    finally:
+        os.unlink(pdf)
+
+
+def test_receiptless_upload_preserves_nondurable_success_contract():
+    pdf = _tmpfile(".pdf")
+    client = _mock_client()
+    client.files_upload_v2 = AsyncMock(return_value={"ok": True, "file": {}})
+    try:
+        with _fake_slack_sdk(client):
+            result = asyncio.run(
+                _standalone_send(
+                    _pconfig(),
+                    "C012AB3CD",
+                    "",
+                    media_files=[(pdf, False)],
+                    caption="exact caption",
+                )
+            )
+        assert result["success"] is True
+        assert result["message_id"] is None
+        client.chat_postMessage.assert_not_awaited()
+        assert client.files_upload_v2.await_args.kwargs["initial_comment"] == "exact caption"
+    finally:
+        os.unlink(pdf)
+
+
+def test_live_text_post_dispatch_exception_is_ack_unknown_for_durable_send():
+    client = _mock_client()
+    client.chat_postMessage = AsyncMock(
+        side_effect=RuntimeError("provider response lost after send")
+    )
+    adapter = _live_adapter(client)
+
+    result = asyncio.run(
+        adapter.send(
+            "C012AB3CD",
+            "durable text",
+            metadata={"_durable_delivery": True},
+        )
+    )
+
+    assert result.success is False
+    assert result.error.startswith("ACK_UNKNOWN:")
+    client.chat_postMessage.assert_awaited_once()
+
+
+def test_live_text_receiptless_success_is_ack_unknown_for_durable_send():
+    client = _mock_client()
+    client.chat_postMessage = AsyncMock(return_value={"ok": True})
+    adapter = _live_adapter(client)
+
+    result = asyncio.run(
+        adapter.send(
+            "C012AB3CD",
+            "durable text",
+            metadata={"_durable_delivery": True},
+        )
+    )
+
+    assert result.success is False
+    assert result.error.startswith("ACK_UNKNOWN:")
+    assert "receipt" in result.error.lower()
+    client.chat_postMessage.assert_awaited_once()
+
+
+def test_live_text_receiptless_success_preserves_nondurable_adapter_contract():
+    client = _mock_client()
+    client.chat_postMessage = AsyncMock(return_value={"ok": True})
+    adapter = _live_adapter(client)
+
+    result = asyncio.run(adapter.send("C012AB3CD", "interactive text"))
+
+    assert result.success is True
+    assert result.message_id is None
+    client.chat_postMessage.assert_awaited_once()
 
 
 def test_missing_token_errors(monkeypatch):

@@ -10,10 +10,14 @@ runs at a time if multiple processes overlap.
 
 import asyncio
 import atexit
+import copy
 import concurrent.futures
 import contextvars
+import hashlib
+import inspect
 import json
 import logging
+import math
 import os
 import re
 import shutil
@@ -1279,6 +1283,9 @@ def _resolve_delivery_targets(job: dict) -> List[dict]:
     Duplicate (platform, chat_id, thread_id) tuples are collapsed by the
     existing dedup pass.
     """
+    forced_target = job.get("_durable_delivery_target")
+    if isinstance(forced_target, dict):
+        return [dict(forced_target)]
     deliver = _normalize_deliver_value(job.get("deliver", "local"))
     if deliver == "local":
         return []
@@ -1312,6 +1319,188 @@ def _resolve_delivery_target(job: dict) -> Optional[dict]:
 # via should_send_media_as_audio() so Telegram-specific rules stay in one place.
 _VIDEO_EXTS = frozenset({'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'})
 _IMAGE_EXTS = frozenset({'.jpg', '.jpeg', '.png', '.webp', '.gif'})
+_TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
+_TELEGRAM_AUDIO_EXTS = frozenset({'.mp3', '.m4a'})
+
+
+async def _send_atomic_telegram_media_standalone(
+    pconfig,
+    chat_id: str,
+    media_file: tuple[str, bool],
+    *,
+    caption: str,
+    thread_id: Optional[str],
+) -> dict:
+    """Send one durable Telegram media row through one Bot API operation."""
+    from gateway.platforms.base import utf16_len
+
+    if caption and utf16_len(caption) > 1024:
+        return {
+            "error": (
+                "ACK_UNKNOWN: persisted Telegram media caption exceeds the atomic "
+                "provider limit; refusing a composite text-plus-media send"
+            )
+        }
+
+    media_path, is_voice = media_file
+    if not os.path.exists(media_path):
+        return {"error": f"Media file not found: {media_path}"}
+
+    provider_call_started = False
+    try:
+        from telegram import Bot
+        from plugins.platforms.telegram.telegram_ids import normalize_telegram_chat_id
+        from gateway.platforms.base import resolve_proxy_url
+
+        bot_kwargs: dict[str, Any] = {"token": pconfig.token}
+        proxy_url = resolve_proxy_url(
+            "TELEGRAM_PROXY", target_hosts=["api.telegram.org"]
+        )
+        if proxy_url:
+            from telegram.request import HTTPXRequest
+
+            bot_kwargs.update(
+                request=HTTPXRequest(proxy=proxy_url),
+                get_updates_request=HTTPXRequest(proxy=proxy_url),
+            )
+        bot = Bot(**bot_kwargs)
+        provider_chat_id = normalize_telegram_chat_id(chat_id)
+        media_kwargs: dict[str, Any] = {}
+        if caption:
+            media_kwargs["caption"] = caption
+        if thread_id is not None and str(thread_id) != "1":
+            media_kwargs["message_thread_id"] = int(thread_id)
+
+        ext = Path(media_path).suffix.lower()
+        with open(media_path, "rb") as media_handle:
+            if ext in _IMAGE_EXTS:
+                provider_call_started = True
+                message = await bot.send_photo(
+                    chat_id=provider_chat_id, photo=media_handle, **media_kwargs
+                )
+            elif ext in _VIDEO_EXTS:
+                provider_call_started = True
+                message = await bot.send_video(
+                    chat_id=provider_chat_id, video=media_handle, **media_kwargs
+                )
+            elif ext in _TELEGRAM_VOICE_EXTS and is_voice:
+                provider_call_started = True
+                message = await bot.send_voice(
+                    chat_id=provider_chat_id, voice=media_handle, **media_kwargs
+                )
+            elif ext in _TELEGRAM_AUDIO_EXTS:
+                provider_call_started = True
+                message = await bot.send_audio(
+                    chat_id=provider_chat_id, audio=media_handle, **media_kwargs
+                )
+            else:
+                provider_call_started = True
+                message = await bot.send_document(
+                    chat_id=provider_chat_id, document=media_handle, **media_kwargs
+                )
+        message_id = getattr(message, "message_id", None)
+        if message_id is None:
+            return {
+                "error": (
+                    "ACK_UNKNOWN: Telegram atomic media provider operation "
+                    "returned no provider receipt"
+                )
+            }
+        return {
+            "success": True,
+            "platform": "telegram",
+            "chat_id": chat_id,
+            "message_id": str(message_id),
+        }
+    except Exception as exc:
+        from tools.send_message_tool import _sanitize_error_text
+
+        detail = _sanitize_error_text(exc)
+        definitive_provider_rejections = {
+            "BadRequest",
+            "Forbidden",
+            "InvalidToken",
+            "RetryAfter",
+            "ChatMigrated",
+            "Conflict",
+        }
+        if (
+            provider_call_started
+            and type(exc).__name__ not in definitive_provider_rejections
+        ):
+            return {
+                "error": (
+                    "ACK_UNKNOWN: Telegram atomic media provider outcome is "
+                    f"ambiguous: {detail}"
+                )
+            }
+        return {"error": f"Telegram atomic media send failed: {detail}"}
+
+
+async def _send_atomic_media_standalone(
+    platform,
+    pconfig,
+    chat_id: str,
+    caption: str,
+    *,
+    thread_id: Optional[str],
+    media_files: list[tuple[str, bool]],
+) -> dict:
+    """Dispatch a durable media row without expanding it into text + media."""
+    from gateway.config import Platform
+    from tools.send_message_tool import (
+        _DEFAULT_CAPTION_LIMIT,
+        _media_caption_split,
+        _send_to_platform,
+    )
+
+    if len(media_files) != 1:
+        return {
+            "error": (
+                "ACK_UNKNOWN: durable media row must contain exactly one provider "
+                "side-effect boundary"
+            )
+        }
+    if platform == Platform.TELEGRAM:
+        return await _send_atomic_telegram_media_standalone(
+            pconfig,
+            chat_id,
+            media_files[0],
+            caption=caption,
+            thread_id=thread_id,
+        )
+
+    if not caption.strip():
+        return await _send_to_platform(
+            platform,
+            pconfig,
+            chat_id,
+            "",
+            thread_id=thread_id,
+            media_files=media_files,
+        )
+
+    captionable_platforms = {Platform.DISCORD, Platform.SLACK, Platform.WHATSAPP}
+    provider_caption, body_text = _media_caption_split(
+        caption,
+        media_files,
+        max_caption_len=_DEFAULT_CAPTION_LIMIT,
+    )
+    if platform in captionable_platforms and provider_caption is not None and not body_text:
+        return await _send_to_platform(
+            platform,
+            pconfig,
+            chat_id,
+            caption,
+            thread_id=thread_id,
+            media_files=media_files,
+        )
+    return {
+        "error": (
+            "ACK_UNKNOWN: standalone provider cannot atomically carry the persisted "
+            "caption with this media; refusing a composite send"
+        )
+    }
 
 
 def _send_media_via_adapter(
@@ -1322,7 +1511,8 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
-) -> None:
+    caption: Optional[str] = None,
+) -> list[str]:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
     Routes each file to the appropriate adapter method (send_voice, send_image_file,
@@ -1335,39 +1525,100 @@ def _send_media_via_adapter(
 
     media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
 
+    errors: list[str] = []
     for media_path, _is_voice in media_files:
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                coro = adapter.send_voice(
+                    chat_id=chat_id,
+                    audio_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(
+                    chat_id=chat_id,
+                    video_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(
+                    chat_id=chat_id,
+                    file_path=media_path,
+                    caption=caption,
+                    metadata=metadata,
+                )
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
             if future is None:
-                logger.warning(
-                    "Job '%s': cannot send media %s, gateway loop unavailable",
-                    job.get("id", "?"), media_path,
-                )
-                return
+                msg = f"cannot send media {media_path}, gateway loop unavailable"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                continue
             try:
                 result = future.result(timeout=30)
             except TimeoutError:
                 future.cancel()
+                if job.get("_durable_delivery"):
+                    msg = (
+                        "ACK_UNKNOWN: media provider confirmation timed out for "
+                        f"{media_path}"
+                    )
+                else:
+                    msg = f"media provider confirmation timed out for {media_path}"
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+                continue
+            except Exception as exc:
+                if job.get("_durable_delivery"):
+                    detail = str(exc).strip() or type(exc).__name__
+                    raise _PostDispatchDeliveryOutcomeUnknown(
+                        "media provider confirmation unavailable after dispatch for "
+                        f"{media_path}: {detail}"
+                    ) from exc
                 raise
-            if result and not getattr(result, "success", True):
-                logger.warning(
-                    "Job '%s': media send failed for %s: %s",
-                    job.get("id", "?"), media_path, getattr(result, "error", "unknown"),
+            if not _confirm_adapter_delivery(result):
+                msg = (
+                    f"media send failed for {media_path}: "
+                    f"{getattr(result, 'error', 'unconfirmed result')}"
                 )
+                logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                errors.append(msg)
+            elif job.get("_durable_delivery"):
+                receipt = (
+                    result.get("message_id")
+                    if isinstance(result, dict)
+                    else getattr(result, "message_id", None)
+                )
+                if receipt:
+                    job["_durable_provider_message_id"] = str(receipt)
+                else:
+                    msg = (
+                        "ACK_UNKNOWN: media provider operation returned no receipt "
+                        f"for {media_path}"
+                    )
+                    logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+                    errors.append(msg)
+        except _PostDispatchDeliveryOutcomeUnknown as e:
+            msg = f"ACK_UNKNOWN: {e}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            errors.append(msg)
         except Exception as e:
-            logger.warning("Job '%s': failed to send media %s: %s", job.get("id", "?"), media_path, e)
+            msg = f"failed to send media {media_path}: {e}"
+            logger.warning("Job '%s': %s", job.get("id", "?"), msg)
+            errors.append(msg)
+    return errors
 
 
 def _confirm_adapter_delivery(send_result) -> bool:
@@ -1389,6 +1640,36 @@ def _confirm_adapter_delivery(send_result) -> bool:
     if not hasattr(send_result, "success"):
         return False
     return bool(getattr(send_result, "success"))
+
+
+def _record_durable_send_metadata(job: dict, send_result: Any) -> None:
+    """Carry provider retry metadata across the legacy delivery boundary."""
+    if not job.get("_durable_delivery") or send_result is None:
+        return
+    if isinstance(send_result, dict):
+        retry_after = send_result.get("retry_after")
+        error_kind = send_result.get("error_kind")
+    else:
+        retry_after = getattr(send_result, "retry_after", None)
+        error_kind = getattr(send_result, "error_kind", None)
+    if retry_after is not None:
+        try:
+            parsed = float(retry_after)
+        except (TypeError, ValueError):
+            parsed = 0.0
+        if math.isfinite(parsed) and parsed > 0:
+            job["_durable_retry_after"] = parsed
+    if error_kind:
+        job["_durable_error_kind"] = str(error_kind)
+
+
+def _durable_retry_after(job: dict) -> Optional[float]:
+    """Return a validated provider retry delay persisted on the attempt."""
+    try:
+        value = float(job.get("_durable_retry_after") or 0)
+    except (TypeError, ValueError):
+        return None
+    return value if math.isfinite(value) and value > 0 else None
 
 
 def _is_channel_dm_topic(
@@ -1447,7 +1728,704 @@ def _is_channel_dm_topic(
     return is_channel
 
 
-def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
+def _structured_outbox() -> "Any":
+    """Return the profile-scoped schema-v2 cron delivery outbox."""
+    from cron.durable_delivery import StructuredDeliveryOutbox
+
+    home = _get_hermes_home()
+    return StructuredDeliveryOutbox(
+        home / "state.db",
+        home / "cron" / "delivery-spool-v2",
+    )
+
+
+def _snapshot_delivery_wrapper(job: dict) -> dict[str, Any]:
+    """Freeze every value that can change cron's provider-visible wrapper."""
+    wrap_response = True
+    try:
+        config = load_config() or {}
+        wrap_response = bool(config.get("cron", {}).get("wrap_response", True))
+    except Exception:
+        pass
+    return {
+        "wrap_response": wrap_response,
+        "task_name": str(job.get("name", job["id"])),
+        "job_id": str(job.get("id", "")),
+    }
+
+
+def _render_delivery_wrapper(content: str, snapshot: dict[str, Any]) -> str:
+    """Render the exact bytes passed to media extraction/provider routing."""
+    if not snapshot["wrap_response"]:
+        return str(content)
+    task_name = str(snapshot["task_name"])
+    job_id = str(snapshot["job_id"])
+    return (
+        f"Cronjob Response: {task_name}\n"
+        f"(job_id: {job_id})\n"
+        f"-------------\n\n"
+        f"{content}\n\n"
+        f"To stop or manage this job, send me a new message "
+        f"(e.g. \"stop reminder {task_name}\")."
+    )
+
+
+def _canonical_cron_target(target: dict) -> str:
+    parts = [str(target["platform"]).lower(), str(target["chat_id"])]
+    if target.get("thread_id") is not None:
+        parts.append(str(target["thread_id"]))
+    return ":".join(parts)
+
+
+def _identity_jsonable(value: Any) -> Any:
+    """Return a stable in-memory projection used only to compute an identity hash."""
+    if value is None or isinstance(value, (bool, int, float, str)):
+        return value
+    if isinstance(value, dict):
+        return {
+            str(getattr(key, "value", key)): _identity_jsonable(item)
+            for key, item in sorted(
+                value.items(), key=lambda pair: str(getattr(pair[0], "value", pair[0]))
+            )
+        }
+    if isinstance(value, (list, tuple)):
+        return [_identity_jsonable(item) for item in value]
+    if isinstance(value, (set, frozenset)):
+        projected = [_identity_jsonable(item) for item in value]
+        return sorted(projected, key=lambda item: json.dumps(item, sort_keys=True))
+    enum_value = getattr(value, "value", None)
+    if isinstance(enum_value, (bool, int, float, str)):
+        return enum_value
+    to_dict = getattr(value, "to_dict", None)
+    if callable(to_dict):
+        return _identity_jsonable(to_dict())
+    attributes = getattr(value, "__dict__", None)
+    if isinstance(attributes, dict):
+        return _identity_jsonable(
+            {key: item for key, item in attributes.items() if not key.startswith("_")}
+        )
+    return f"{type(value).__module__}.{type(value).__qualname__}"
+
+
+def _identity_sha256(value: Any) -> str:
+    """Hash routing identity without persisting or logging config/credential values."""
+    encoded = json.dumps(
+        _identity_jsonable(value),
+        sort_keys=True,
+        separators=(",", ":"),
+        ensure_ascii=False,
+    )
+    return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+
+def _resolved_transport_identity_sha256(
+    target: dict,
+    *,
+    logical,
+    config,
+    transport,
+    transport_kind: str,
+) -> str:
+    logical_config = config.platforms.get(logical)
+    transport_config = transport.config if transport is not None else logical_config
+    adapter = transport.adapter if transport is not None else None
+    selected_provider_account_sha256 = None
+    if transport_kind == "standalone" and logical.value == "slack":
+        from plugins.platforms.slack.adapter import _standalone_token_identity_sha256
+
+        selected_provider_account_sha256 = _standalone_token_identity_sha256(
+            logical_config
+        )
+    return _identity_sha256(
+        {
+            "logical_platform": logical.value,
+            "transport_kind": transport_kind,
+            "transport_platform": (
+                transport.transport_platform.value
+                if transport is not None
+                else logical.value
+            ),
+            "target": {
+                "chat_id": str(target["chat_id"]),
+                "thread_id": (
+                    str(target["thread_id"])
+                    if target.get("thread_id") is not None
+                    else None
+                ),
+            },
+            "logical_config_sha256": _identity_sha256(logical_config),
+            "transport_config_sha256": _identity_sha256(transport_config),
+            "selected_provider_account_sha256": selected_provider_account_sha256,
+            "adapter_type": (
+                f"{type(adapter).__module__}.{type(adapter).__qualname__}"
+                if adapter is not None
+                else "standalone"
+            ),
+        }
+    )
+
+
+def _resolve_structured_transport_identity(
+    target: dict, adapters
+) -> tuple[str, Optional[dict], str]:
+    """Freeze transport kind and all provider-visible routing/config identity."""
+    try:
+        from gateway.config import Platform, load_gateway_config
+        from gateway.delivery import resolve_delivery_transport
+
+        logical = Platform(str(target["platform"]).lower())
+        config = load_gateway_config()
+        transport = resolve_delivery_transport(logical, config, adapters)
+        if transport is None:
+            kind = "standalone"
+            relay_identity = None
+        elif transport.is_relay:
+            kind = "relay"
+            relay_identity = {
+                "logical_platform": logical.value,
+                "transport_platform": "relay",
+            }
+        else:
+            kind = "native"
+            relay_identity = None
+        fingerprint = _resolved_transport_identity_sha256(
+            target,
+            logical=logical,
+            config=config,
+            transport=transport,
+            transport_kind=kind,
+        )
+        return kind, relay_identity, fingerprint
+    except Exception:
+        # The durable row remains explicit rather than pretending that an
+        # unresolved transport was native. Dispatch will fail closed if config
+        # is still unavailable.
+        return "unresolved", None, _identity_sha256(
+            {"transport_kind": "unresolved", "target": target}
+        )
+
+
+def _durable_owner_stamp() -> tuple[int, float]:
+    pid = os.getpid()
+    try:
+        from gateway.status import get_process_start_time
+
+        started = get_process_start_time(pid)
+        if started is not None:
+            return pid, float(started)
+    except Exception:
+        pass
+    return pid, float(time.time())
+
+
+def _structured_delivery_identity_mismatch(error: str) -> bool:
+    return str(error).startswith("DURABLE_IDENTITY_MISMATCH:")
+
+
+class _PostDispatchDeliveryOutcomeUnknown(RuntimeError):
+    """An orchestration wait failed after provider dispatch was scheduled."""
+
+
+class _DispatchNeverBegan(RuntimeError):
+    """Executor rejection while the submitted coroutine was still unstarted."""
+
+
+def _structured_delivery_ack_is_ambiguous(error: str) -> bool:
+    """Fail closed when an error cannot prove provider non-acceptance."""
+    normalized = str(error).strip().lower()
+    if not normalized:
+        return True
+    return "ack_unknown:" in normalized or any(
+        marker in normalized
+        for marker in (
+            "timed out",
+            "timeout",
+            "connection reset",
+            "connectionreset",
+            "broken pipe",
+            "unexpected eof",
+            "closed connection",
+            "connection closed",
+            "remote end closed",
+            "disconnect",
+            "cancelled",
+            "canceled",
+        )
+    )
+
+
+def _reconcile_structured_job_delivery_status(outbox) -> int:
+    """Replay durable jobs.json success markers with execution-id fencing."""
+    try:
+        markers = outbox.pending_job_status_syncs()
+    except Exception:
+        logger.warning("Failed to read cron delivery status-sync markers", exc_info=True)
+        return 0
+
+    reconciled = 0
+    from cron.jobs import reconcile_job_delivery_success
+
+    for execution_id, job_id in markers:
+        try:
+            outcome = reconcile_job_delivery_success(job_id, execution_id)
+            # ``pending`` is the narrow crash window where provider acceptance
+            # committed before run bookkeeping. Retain the marker for replay.
+            if outcome == "pending":
+                continue
+            outbox.mark_job_status_synced(execution_id, job_id)
+            reconciled += 1
+        except Exception:
+            logger.warning(
+                "Failed to reconcile durable delivery status for job %s execution %s",
+                job_id,
+                execution_id,
+                exc_info=True,
+            )
+    return reconciled
+
+
+def _recover_one_structured_delivery(adapters=None, loop=None) -> int:
+    """Claim and dispatch at most one due schema-v2 cron obligation."""
+    from cron.durable_delivery import SpoolInvalid
+
+    outbox = _structured_outbox()
+    _reconcile_structured_job_delivery_status(outbox)
+    pid, started_at = _durable_owner_stamp()
+    try:
+        claim = outbox.claim_next(owner_pid=pid, owner_started_at=started_at)
+        if claim is None:
+            return 0
+        payload = claim.payload
+        try:
+            for ref in payload.get("media_refs") or []:
+                outbox.resolve_media(ref)
+        except SpoolInvalid as exc:
+            outbox.mark_failed(claim, error=str(exc), retryable=False)
+            return 1
+
+        job = dict(payload["job_snapshot"])
+        job["deliver"] = str(payload["canonical_target"])
+        job["_durable_delivery_target"] = dict(payload["target"])
+        job["_durable_delivery"] = True
+        job["_durable_transport_kind"] = payload["transport_kind"]
+        job["_durable_unit_kind"] = payload["kind"]
+        job["_durable_transport_identity_sha256"] = payload[
+            "transport_identity_sha256"
+        ]
+        job["_durable_relay_identity"] = payload.get("relay_identity")
+        job["_durable_provider_content"] = payload["provider_content"]
+        job["_durable_provider_preformatted_atomic"] = bool(
+            payload.get("provider_preformatted_atomic", False)
+        )
+        job["_durable_chunk_index"] = payload.get("chunk_index")
+        job["_durable_chunk_total"] = payload.get("chunk_total")
+        job["_durable_delivery_config_snapshot"] = payload[
+            "delivery_config_snapshot"
+        ]
+        job["attach_to_session"] = bool(
+            (payload.get("continuation") or {}).get("mirror_enabled", False)
+        )
+        try:
+            error = _deliver_result_legacy(
+                job,
+                str(payload["content"]),
+                adapters=adapters,
+                loop=loop,
+            )
+        except _DispatchNeverBegan as exc:
+            error = exc
+        except BaseException as exc:
+            outbox.mark_unknown(claim, error=f"recovery dispatch outcome unknown: {exc}")
+            raise
+        if isinstance(error, _DispatchNeverBegan):
+            outbox.mark_failed(claim, error=str(error), retryable=True)
+        elif error and _structured_delivery_ack_is_ambiguous(error):
+            outbox.mark_unknown(claim, error=error)
+        elif error:
+            from gateway.platforms.base import classify_send_error
+
+            if _structured_delivery_identity_mismatch(error):
+                kind = "identity_mismatch"
+                retryable = False
+            else:
+                kind = str(job.get("_durable_error_kind") or "") or classify_send_error(
+                    None, error_text=error
+                )
+                retryable = kind not in {"forbidden", "not_found", "bad_format"}
+            retry_after = _durable_retry_after(job)
+            if kind == "rate_limited":
+                fallback_delay = 30.0 * (2 ** min(max(claim.attempts - 1, 0), 6))
+                delay = max(fallback_delay, retry_after or 0.0)
+                outbox.record_platform_circuit(
+                    str(payload["logical_platform"]),
+                    blocked_until=time.time() + delay,
+                    reason=error,
+                )
+            outbox.mark_failed(
+                claim,
+                error=error,
+                retryable=retryable,
+                retry_after=retry_after,
+            )
+        else:
+            provider_message_id = job.get("_durable_provider_message_id")
+            if provider_message_id:
+                outbox.mark_delivered(
+                    claim, provider_message_id=str(provider_message_id)
+                )
+                _reconcile_structured_job_delivery_status(outbox)
+            else:
+                outbox.mark_unknown(
+                    claim,
+                    error="ACK_UNKNOWN: provider reported success without a durable receipt",
+                )
+        return 1
+    finally:
+        outbox.close()
+
+
+def _weixin_atomic_provider_chunks(provider_content: str, adapters=None) -> list[str]:
+    """Freeze the exact provider-visible Weixin chunks before enqueue.
+
+    Every returned chunk is one external provider side effect and therefore one
+    durable obligation.  Failure to resolve the real splitter fails before any
+    provider call rather than falling back to an unsafe whole-message replay.
+    """
+    from gateway.config import Platform, load_gateway_config
+    from gateway.delivery import resolve_delivery_transport
+    from gateway.platforms.weixin import WeixinAdapter
+
+    config = load_gateway_config()
+    transport = resolve_delivery_transport(Platform.WEIXIN, config, adapters)
+    if transport is not None and transport.is_relay:
+        raise RuntimeError("relay-backed Weixin cannot freeze native provider chunks")
+    adapter = transport.adapter if transport is not None else None
+    if adapter is None:
+        pconfig = config.platforms.get(Platform.WEIXIN)
+        if pconfig is None or not pconfig.enabled:
+            raise RuntimeError("Weixin transport is not configured")
+        adapter = WeixinAdapter(pconfig)
+    if not isinstance(adapter, WeixinAdapter):
+        raise RuntimeError("resolved Weixin transport has an incompatible adapter")
+
+    formatted = adapter.format_message(provider_content)
+    chunks = [chunk for chunk in adapter._split_text(formatted) if chunk and chunk.strip()]
+    if not chunks:
+        return []
+    if any(len(chunk) > adapter.MAX_MESSAGE_LENGTH for chunk in chunks):
+        raise RuntimeError("Weixin splitter emitted an oversized provider chunk")
+    return chunks
+
+
+def _slack_atomic_provider_chunks(provider_content: str, adapters=None) -> list[str]:
+    """Freeze exact Slack mrkdwn chunks before any provider operation."""
+    from gateway.config import Platform, load_gateway_config
+    from gateway.delivery import resolve_delivery_transport
+    from plugins.platforms.slack.adapter import SlackAdapter
+
+    config = load_gateway_config()
+    transport = resolve_delivery_transport(Platform.SLACK, config, adapters)
+    if transport is not None and transport.is_relay:
+        raise RuntimeError("relay-backed Slack cannot freeze native provider chunks")
+    adapter = transport.adapter if transport is not None else None
+    if adapter is None:
+        pconfig = config.platforms.get(Platform.SLACK)
+        if pconfig is None or not pconfig.enabled:
+            raise RuntimeError("Slack transport is not configured")
+        adapter = SlackAdapter(pconfig)
+    if not isinstance(adapter, SlackAdapter):
+        raise RuntimeError("resolved Slack transport has an incompatible adapter")
+
+    formatted = adapter.format_message(provider_content)
+    chunks = [
+        chunk
+        for chunk in adapter.truncate_message(formatted, adapter.MAX_MESSAGE_LENGTH)
+        if chunk and chunk.strip()
+    ]
+    if any(len(chunk) > adapter.MAX_MESSAGE_LENGTH for chunk in chunks):
+        raise RuntimeError("Slack splitter emitted an oversized provider chunk")
+    return chunks
+
+
+def _deliver_result(
+    job: dict,
+    content: str,
+    adapters=None,
+    loop=None,
+    *,
+    execution_id: Optional[str] = None,
+) -> Optional[str]:
+    """Durably record and independently checkpoint every cron fan-out target.
+
+    The complete fan-out batch commits before the first provider call.  A live
+    scheduler and the recovery worker acquire the same global fenced lease, so
+    only the current claim token may send or publish an outcome.
+    """
+    targets = _resolve_delivery_targets(job)
+    if not targets:
+        return _deliver_result_legacy(job, content, adapters=adapters, loop=loop)
+    execution_id = str(execution_id or job.get("execution_id") or "")
+    if not execution_id:
+        # Backward-compatible direct helper calls (CLI/tests/extensions) have
+        # no execution-ledger identity and retain the legacy one-shot path.
+        # run_one_job, the production cron path, always supplies its claimed
+        # execution_id and therefore cannot silently bypass the outbox.
+        return _deliver_result_legacy(job, content, adapters=adapters, loop=loop)
+
+    from cron.durable_delivery import ClaimLost
+    import hashlib
+    outbox = _structured_outbox()
+    from gateway.platforms.base import BasePlatformAdapter
+
+    extracted_media, cleaned_content = BasePlatformAdapter.extract_media(content)
+    extracted_media = BasePlatformAdapter.filter_media_delivery_paths(extracted_media)
+    try:
+        media_refs = [
+            outbox.spool_media(path, is_voice=is_voice)
+            for path, is_voice in extracted_media
+        ]
+    except BaseException:
+        outbox.close()
+        raise
+
+    send_units: list[dict[str, Any]] = []
+    delivery_config_snapshot = _snapshot_delivery_wrapper(job)
+    cleaned_text = cleaned_content.strip()
+    if not media_refs:
+        send_units.append(
+            {
+                "kind": "cron_text",
+                "content": cleaned_text,
+                "media_ref": None,
+                "media_refs": [],
+            }
+        )
+    for media_index, ref in enumerate(media_refs):
+        parts = [cleaned_text] if media_index == 0 and cleaned_text else []
+        if ref["is_voice"]:
+            parts.append("[[audio_as_voice]]")
+        if "[[as_document]]" in content:
+            parts.append("[[as_document]]")
+        parts.append(f"MEDIA:{outbox.resolve_media(ref)}")
+        send_units.append(
+            {
+                "kind": "cron_media",
+                "content": "\n".join(parts),
+                "media_ref": ref,
+                "media_refs": [ref],
+            }
+        )
+    units = []
+    for index, target in enumerate(targets):
+        canonical = _canonical_cron_target(target)
+        transport_kind, relay_identity, transport_identity_sha256 = (
+            _resolve_structured_transport_identity(target, adapters)
+        )
+        target_send_units: list[dict[str, Any]] = []
+        for send_unit in send_units:
+            unit_content = str(send_unit["content"])
+            provider_content = _render_delivery_wrapper(
+                unit_content,
+                delivery_config_snapshot,
+            )
+            platform_name = str(target["platform"]).lower()
+            if platform_name in {"weixin", "slack"} and send_unit["kind"] == "cron_text":
+                try:
+                    planner = (
+                        _weixin_atomic_provider_chunks
+                        if platform_name == "weixin"
+                        else _slack_atomic_provider_chunks
+                    )
+                    provider_chunks = planner(provider_content, adapters)
+                    if not provider_chunks:
+                        raise RuntimeError(
+                            f"{platform_name} provider chunk plan is empty"
+                        )
+                except Exception as exc:
+                    outbox.close()
+                    return (
+                        f"durable {platform_name} chunk planning failed before "
+                        f"provider dispatch: {exc}"
+                    )
+                for chunk_index, chunk in enumerate(provider_chunks):
+                    target_send_units.append(
+                        {
+                            **send_unit,
+                            "content": chunk,
+                            "provider_content": chunk,
+                            "provider_preformatted_atomic": True,
+                            "chunk_index": chunk_index,
+                            "chunk_total": len(provider_chunks),
+                        }
+                    )
+            else:
+                target_send_units.append(
+                    {
+                        **send_unit,
+                        "provider_content": provider_content,
+                        "provider_preformatted_atomic": False,
+                        "chunk_index": None,
+                        "chunk_total": None,
+                    }
+                )
+
+        for unit_index, send_unit in enumerate(target_send_units):
+            unit_content = str(send_unit["content"])
+            provider_content = str(send_unit["provider_content"])
+            units.append({
+                "schema_version": 2,
+                "execution_id": execution_id,
+                "job_id": str(job["id"]),
+                "target_index": index,
+                "unit_index": unit_index,
+                "canonical_target": canonical,
+                "logical_platform": str(target["platform"]).lower(),
+                "chat_id": str(target["chat_id"]),
+                "thread_id": (
+                    str(target["thread_id"])
+                    if target.get("thread_id") is not None
+                    else None
+                ),
+                "transport_kind": transport_kind,
+                "transport_identity_sha256": transport_identity_sha256,
+                "relay_identity": relay_identity,
+                "kind": send_unit["kind"],
+                "content": unit_content,
+                "content_sha256": hashlib.sha256(
+                    unit_content.encode("utf-8")
+                ).hexdigest(),
+                "provider_content": provider_content,
+                "provider_content_sha256": hashlib.sha256(
+                    provider_content.encode("utf-8")
+                ).hexdigest(),
+                "provider_preformatted_atomic": bool(
+                    send_unit["provider_preformatted_atomic"]
+                ),
+                "chunk_index": send_unit["chunk_index"],
+                "chunk_total": send_unit["chunk_total"],
+                "delivery_config_snapshot": dict(delivery_config_snapshot),
+                "media_ref": send_unit["media_ref"],
+                "media_refs": send_unit["media_refs"],
+                "continuation": {
+                    "mirror_enabled": _cron_mirror_delivery_enabled(job),
+                    "origin": _resolve_origin(job),
+                },
+                "job_snapshot": dict(job),
+                "target": dict(target),
+            })
+
+    records = outbox.enqueue_batch(units)
+    errors: list[str] = []
+    owner_pid, owner_started_at = _durable_owner_stamp()
+    try:
+        for record in records:
+            claim = outbox.claim_next(
+                owner_pid=owner_pid,
+                owner_started_at=owner_started_at,
+                obligation_id=record.obligation_id,
+            )
+            if claim is None:
+                # A recovery worker won the claim. It owns completion; the
+                # scheduler must not race it with an untracked second send.
+                errors.append(
+                    f"durable delivery claim unavailable for {record.payload['canonical_target']}"
+                )
+                continue
+            target_job = dict(job)
+            target_job["deliver"] = str(record.payload["canonical_target"])
+            target_job["_durable_delivery_target"] = dict(record.payload["target"])
+            target_job["_durable_delivery"] = True
+            target_job["_durable_transport_kind"] = record.payload["transport_kind"]
+            target_job["_durable_unit_kind"] = record.payload["kind"]
+            target_job["_durable_transport_identity_sha256"] = record.payload[
+                "transport_identity_sha256"
+            ]
+            target_job["_durable_relay_identity"] = record.payload.get("relay_identity")
+            target_job["_durable_provider_content"] = record.payload[
+                "provider_content"
+            ]
+            target_job["_durable_provider_preformatted_atomic"] = bool(
+                record.payload.get("provider_preformatted_atomic", False)
+            )
+            target_job["_durable_chunk_index"] = record.payload.get("chunk_index")
+            target_job["_durable_chunk_total"] = record.payload.get("chunk_total")
+            target_job["_durable_delivery_config_snapshot"] = record.payload[
+                "delivery_config_snapshot"
+            ]
+            target_job["attach_to_session"] = bool(
+                (record.payload.get("continuation") or {}).get(
+                    "mirror_enabled", False
+                )
+            )
+            try:
+                error = _deliver_result_legacy(
+                    target_job,
+                    str(record.payload["content"]),
+                    adapters=adapters,
+                    loop=loop,
+                )
+            except _DispatchNeverBegan as exc:
+                error = exc
+            except BaseException as exc:
+                # The provider may have accepted before an unexpected exception.
+                # Do not silently replay an ACK-ambiguous side effect.
+                outbox.mark_unknown(claim, error=f"dispatch outcome unknown: {exc}")
+                raise
+            if isinstance(error, _DispatchNeverBegan):
+                outbox.mark_failed(claim, error=str(error), retryable=True)
+                errors.append(str(error))
+            elif error and _structured_delivery_ack_is_ambiguous(error):
+                outbox.mark_unknown(claim, error=error)
+                errors.append(error)
+            elif error:
+                from gateway.platforms.base import classify_send_error
+
+                if _structured_delivery_identity_mismatch(error):
+                    kind = "identity_mismatch"
+                    retryable = False
+                else:
+                    kind = str(
+                        target_job.get("_durable_error_kind") or ""
+                    ) or classify_send_error(None, error_text=error)
+                    retryable = kind not in {"forbidden", "not_found", "bad_format"}
+                retry_after = _durable_retry_after(target_job)
+                if kind == "rate_limited":
+                    fallback_delay = 30.0 * (
+                        2 ** min(max(claim.attempts - 1, 0), 6)
+                    )
+                    delay = max(fallback_delay, retry_after or 0.0)
+                    outbox.record_platform_circuit(
+                        str(record.payload["logical_platform"]),
+                        blocked_until=time.time() + delay,
+                        reason=error,
+                    )
+                outbox.mark_failed(
+                    claim,
+                    error=error,
+                    retryable=retryable,
+                    retry_after=retry_after,
+                )
+                errors.append(error)
+            else:
+                provider_message_id = target_job.get("_durable_provider_message_id")
+                if provider_message_id:
+                    outbox.mark_delivered(
+                        claim, provider_message_id=str(provider_message_id)
+                    )
+                else:
+                    error = (
+                        "ACK_UNKNOWN: provider reported success without a durable receipt"
+                    )
+                    outbox.mark_unknown(claim, error=error)
+                    errors.append(error)
+    except ClaimLost as exc:
+        errors.append(str(exc))
+    finally:
+        outbox.close()
+    return "; ".join(errors) if errors else None
+
+
+def _deliver_result_legacy(job: dict, content: str, adapters=None, loop=None) -> Optional[str]:
     """
     Deliver job output to the configured target(s) (origin chat, specific platform, etc.).
 
@@ -1483,29 +2461,22 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     from tools.send_message_tool import _send_to_platform
     from gateway.config import load_gateway_config, Platform
 
-    # Optionally wrap the content with a header/footer so the user knows this
-    # is a cron delivery.  Wrapping is on by default; set cron.wrap_response: false
-    # in config.yaml for clean output.
-    wrap_response = True
+    # Durable rows persist the exact provider-visible wrapper. Recovery must
+    # never re-render it from mutable config/job fields.
     user_cfg = None
-    try:
-        user_cfg = load_config()
-        wrap_response = user_cfg.get("cron", {}).get("wrap_response", True)
-    except Exception:
-        pass
-
-    if wrap_response:
-        task_name = job.get("name", job["id"])
-        job_id = job.get("id", "")
-        delivery_content = (
-            f"Cronjob Response: {task_name}\n"
-            f"(job_id: {job_id})\n"
-            f"-------------\n\n"
-            f"{content}\n\n"
-            f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
-        )
+    if job.get("_durable_delivery"):
+        delivery_content = str(job["_durable_provider_content"])
     else:
-        delivery_content = content
+        try:
+            user_cfg = load_config()
+        except Exception:
+            user_cfg = None
+        snapshot = _snapshot_delivery_wrapper(job)
+        if user_cfg is not None:
+            snapshot["wrap_response"] = bool(
+                user_cfg.get("cron", {}).get("wrap_response", True)
+            )
+        delivery_content = _render_delivery_wrapper(content, snapshot)
 
     # Extract MEDIA: tags so attachments are forwarded as files, not raw text
     from gateway.platforms.base import BasePlatformAdapter
@@ -1574,9 +2545,54 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             delivery_errors.append(msg)
             continue
 
+        durable_transport_kind = job.get("_durable_transport_kind")
+        if job.get("_durable_delivery") and durable_transport_kind == "unresolved":
+            msg = "durable delivery transport is unresolved; refusing route drift"
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
+
         from gateway.delivery import resolve_delivery_transport
 
         transport = resolve_delivery_transport(platform, config, adapters)
+        actual_transport_kind = (
+            "relay"
+            if transport is not None and transport.is_relay
+            else "native"
+            if transport is not None
+            else "standalone"
+        )
+        if job.get("_durable_delivery"):
+            frozen_identity = str(
+                job.get("_durable_transport_identity_sha256") or ""
+            )
+            current_identity = _resolved_transport_identity_sha256(
+                target,
+                logical=platform,
+                config=config,
+                transport=transport,
+                transport_kind=actual_transport_kind,
+            )
+            if frozen_identity != current_identity:
+                msg = (
+                    "DURABLE_IDENTITY_MISMATCH: durable delivery transport "
+                    "identity changed; refusing route drift"
+                )
+                logger.warning("Job '%s': %s", job["id"], msg)
+                delivery_errors.append(msg)
+                continue
+        if (
+            job.get("_durable_delivery")
+            and durable_transport_kind
+            and durable_transport_kind != actual_transport_kind
+        ):
+            msg = (
+                "durable delivery transport changed from "
+                f"{durable_transport_kind} to {actual_transport_kind}; refusing route drift"
+            )
+            logger.warning("Job '%s': %s", job["id"], msg)
+            delivery_errors.append(msg)
+            continue
         if transport is not None:
             pconfig = transport.config
             runtime_adapter = transport.adapter
@@ -1705,6 +2721,10 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
             and not in_channel_surface
             and runtime_adapter is not None
             and loop is not None
+            # A provider-created thread is a separate external side effect. The
+            # structured row has no frozen thread ID or thread-creation receipt,
+            # so creating one here would make retry identity crash-ambiguous.
+            and not job.get("_durable_delivery")
             and not thread_id  # never override an explicit origin thread/topic
         ):
             new_thread_id = _open_continuable_cron_thread(
@@ -1772,6 +2792,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     route_metadata["thread_id"] = route_thread_id
                 media_metadata = {"thread_id": thread_id} if thread_id else None
 
+            if job.get("_durable_provider_preformatted_atomic"):
+                route_metadata["_durable_delivery"] = True
+                route_metadata["durable_preformatted_atomic_text"] = True
+                route_metadata["durable_chunk_index"] = job.get(
+                    "_durable_chunk_index"
+                )
+                route_metadata["durable_chunk_total"] = job.get(
+                    "_durable_chunk_total"
+                )
+
             try:
                 # Send cleaned text (MEDIA tags stripped) — not the raw content.
                 # Route through the gateway's DeliveryRouter so the live send
@@ -1780,7 +2810,16 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 # standalone cron path lacked this, so DM-topic cron deliveries
                 # landed in the General topic or were rejected by Bot API 10.0
                 # (#22773).
-                text_to_send = cleaned_delivery_content.strip()
+                atomic_media_obligation = bool(
+                    job.get("_durable_delivery")
+                    and job.get("_durable_unit_kind") == "cron_media"
+                    and media_files
+                )
+                text_to_send = (
+                    ""
+                    if atomic_media_obligation
+                    else cleaned_delivery_content.strip()
+                )
                 adapter_ok = True
                 timed_out = False
                 if text_to_send:
@@ -1833,7 +2872,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             #     message is silently dropped (worse than a
                             #     duplicate).
                             cancelled = future.cancel()
-                            if cancelled:
+                            if cancelled and job.get("_durable_delivery"):
+                                # Cancellation of the thread-safe wrapper is not
+                                # proof that the provider coroutine never crossed
+                                # its side-effect boundary. Durable delivery must
+                                # fail closed instead of issuing an unlabeled
+                                # standalone duplicate.
+                                adapter_ok = False
+                                target_errors.append(
+                                    "ACK_UNKNOWN: provider confirmation timed out "
+                                    f"for {platform_name}:{chat_id}; wrapper cancellation "
+                                    "does not prove dispatch was prevented"
+                                )
+                                timeout_handled = True
+                            elif cancelled:
                                 msg = (
                                     f"live adapter send to {platform_name}:{chat_id} "
                                     "timed out before the coroutine was dispatched"
@@ -1848,6 +2900,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             else:
                                 timed_out = True
                                 timeout_handled = True
+                                if job.get("_durable_delivery"):
+                                    adapter_ok = False
+                                    target_errors.append(
+                                        "ACK_UNKNOWN: provider confirmation timed out "
+                                        f"for {platform_name}:{chat_id} after dispatch"
+                                    )
                                 logger.warning(
                                     "Job '%s': live adapter send to %s:%s timed out "
                                     "after 60s; already dispatched (in flight), "
@@ -1856,6 +2914,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                     job["id"], platform_name, chat_id,
                                 )
                         except Exception as ex:
+                            if job.get("_durable_delivery"):
+                                detail = str(ex).strip() or type(ex).__name__
+                                raise _PostDispatchDeliveryOutcomeUnknown(
+                                    "live adapter provider confirmation unavailable after "
+                                    f"dispatch to {platform_name}:{chat_id}: {detail}"
+                                ) from ex
                             # A real send error (not a slow confirmation) — fall
                             # through to the standalone path so the message is
                             # still delivered.
@@ -1879,12 +2943,35 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                             # is NOT counted as delivered (#47056).
                             if isinstance(send_result, dict):
                                 send_success = bool(send_result.get("success", False))
+                                send_receipt = send_result.get("message_id")
                                 send_raw_response = send_result.get("raw_response")
                             else:
                                 send_success = _confirm_adapter_delivery(send_result)
+                                send_receipt = getattr(send_result, "message_id", None)
                                 send_raw_response = getattr(send_result, "raw_response", None)
 
-                            if not send_success:
+                            _record_durable_send_metadata(job, send_result)
+
+                            if (
+                                send_success
+                                and job.get("_durable_delivery")
+                                and send_receipt
+                            ):
+                                job["_durable_provider_message_id"] = str(send_receipt)
+
+                            if (
+                                send_success
+                                and job.get("_durable_delivery")
+                                and not send_receipt
+                            ):
+                                msg = (
+                                    "ACK_UNKNOWN: live adapter provider operation returned "
+                                    f"no receipt for {platform_name}:{chat_id}"
+                                )
+                                logger.warning("Job '%s': %s", job["id"], msg)
+                                target_errors.append(msg)
+                                adapter_ok = False
+                            elif not send_success:
                                 if isinstance(send_result, dict):
                                     err = send_result.get("error", "unknown")
                                     shape = "dict"
@@ -1894,10 +2981,20 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 else:
                                     err = "no response from adapter"
                                     shape = "None"
-                                msg = (
-                                    f"live adapter send to {platform_name}:{chat_id} "
-                                    f"returned unconfirmed result ({shape}, error={err})"
-                                )
+                                raw_error = str(err)
+                                if (
+                                    job.get("_durable_delivery")
+                                    and raw_error.startswith("ACK_UNKNOWN:")
+                                ):
+                                    # Preserve the typed ambiguity at the outer
+                                    # boundary.  Wrapping it would hide the marker
+                                    # and incorrectly authorize standalone fallback.
+                                    msg = raw_error
+                                else:
+                                    msg = (
+                                        f"live adapter send to {platform_name}:{chat_id} "
+                                        f"returned unconfirmed result ({shape}, error={err})"
+                                    )
                                 if transport is not None and transport.is_relay:
                                     logger.warning("Job '%s': %s", job["id"], msg)
                                 else:
@@ -1939,7 +3036,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                                 routed_media_metadata["user_id"] = logical_home.user_id
                             if logical_home.scope_id:
                                 routed_media_metadata["scope_id"] = logical_home.scope_id
-                    _send_media_via_adapter(
+                    media_send_errors = _send_media_via_adapter(
                         runtime_adapter,
                         chat_id,
                         media_files,
@@ -1947,7 +3044,15 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        caption=(
+                            cleaned_delivery_content.strip()
+                            if atomic_media_obligation
+                            else None
+                        ),
                     )
+                    if media_send_errors:
+                        target_errors.extend(media_send_errors)
+                        adapter_ok = False
                 elif timed_out and media_files:
                     msg = (
                         f"{len(media_files)} media attachment(s) not delivered to "
@@ -1984,8 +3089,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         thread_id=thread_id, user_id=origin_user_id,
                         enabled=mirror_this_target and not thread_seeded and not inchannel_seeded,
                     )
+            except _PostDispatchDeliveryOutcomeUnknown as e:
+                err_msg = f"ACK_UNKNOWN: {e}"
+                if err_msg not in target_errors:
+                    target_errors.append(err_msg)
+                logger.warning("Job '%s': %s", job["id"], err_msg)
             except Exception as e:
-                err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
+                detail = str(e)
+                if job.get("_durable_delivery") and "ACK_UNKNOWN:" in detail:
+                    err_msg = "ACK_UNKNOWN:" + detail.split("ACK_UNKNOWN:", 1)[1]
+                else:
+                    err_msg = f"live adapter delivery to {platform_name}:{chat_id} failed: {e}"
                 if not any(err_msg in err for err in target_errors):
                     target_errors.append(err_msg)
                 if transport is not None and transport.is_relay:
@@ -1997,6 +3111,12 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     )
 
         if not delivered:
+            if any(err.startswith("ACK_UNKNOWN:") for err in target_errors):
+                # The provider may have accepted the send. Structured durable
+                # delivery records this as unknown and never performs an
+                # unlabeled automatic fallback/replay.
+                delivery_errors.extend(target_errors)
+                continue
             if transport is not None and transport.is_relay:
                 # Relay owns the logical destination and its connector owns the
                 # platform credential. A native retry could duplicate delivery
@@ -2005,6 +3125,17 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     target_errors.append(
                         f"relay delivery to {platform_name}:{chat_id} failed"
                     )
+                delivery_errors.extend(target_errors)
+                continue
+            if (
+                job.get("_durable_delivery")
+                and durable_transport_kind == "native"
+                and target_errors
+            ):
+                # A schema-v2 obligation is bound to its native transport.
+                # A confirmed native rejection is retryable through that same
+                # route; it is not permission to mutate the attempt into an
+                # untracked standalone send.
                 delivery_errors.extend(target_errors)
                 continue
             # If the interpreter is finalizing (gateway SIGTERM / restart /
@@ -2019,16 +3150,69 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
-            # Standalone path: run the async send in a fresh event loop (safe from any thread)
-            coro = _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files)
+            # Standalone path: run the async send through one durable provider
+            # boundary. Never let the generic helper expand it into an ACKed
+            # text send followed by a separately failing media upload.
+            atomic_standalone_media = bool(
+                job.get("_durable_delivery")
+                and job.get("_durable_unit_kind") == "cron_media"
+                and media_files
+            )
+            standalone_pconfig = pconfig
+            if job.get("_durable_delivery"):
+                # Carry the durable no-replay contract through the unchanged
+                # public send_message helper signature into the provider plugin.
+                standalone_pconfig = copy.copy(pconfig)
+                setattr(standalone_pconfig, "_durable_delivery", True)
+                setattr(
+                    standalone_pconfig,
+                    "_durable_preformatted_atomic_text",
+                    bool(job.get("_durable_provider_preformatted_atomic")),
+                )
+            if atomic_standalone_media:
+                coro = _send_atomic_media_standalone(
+                    platform,
+                    standalone_pconfig,
+                    chat_id,
+                    cleaned_delivery_content.strip(),
+                    thread_id=thread_id,
+                    media_files=media_files,
+                )
+            else:
+                coro = _send_to_platform(
+                    platform,
+                    standalone_pconfig,
+                    chat_id,
+                    cleaned_delivery_content,
+                    thread_id=thread_id,
+                    media_files=media_files,
+                )
             try:
                 result = asyncio.run(coro)
             except RuntimeError as run_err:
-                # asyncio.run() checks for a running loop before awaiting the coroutine;
-                # when it raises, the original coro was never started — close it to
-                # prevent "coroutine was never awaited" RuntimeWarning, then retry in a
-                # fresh thread that has no running loop.
-                coro.close()
+                # Only a CREATED coroutine proves that asyncio.run rejected the
+                # call before entering provider code (normally because this
+                # thread already owns a running loop). A CLOSED coroutine ran;
+                # its RuntimeError may have followed provider acceptance.
+                coro_state = inspect.getcoroutinestate(coro)
+                if (
+                    job.get("_durable_delivery")
+                    and coro_state != inspect.CORO_CREATED
+                ):
+                    detail = str(run_err).strip() or type(run_err).__name__
+                    msg = (
+                        "ACK_UNKNOWN: standalone provider outcome unavailable after "
+                        f"dispatch to {platform_name}:{chat_id}: {detail}"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    continue
+                # asyncio.run() rejected a still-CREATED coroutine without
+                # awaiting it. Close it before the fresh-thread pre-dispatch
+                # fallback to avoid a RuntimeWarning.
+                if coro_state == inspect.CORO_CREATED:
+                    coro.close()
                 # If the RuntimeError is the interpreter-finalization signal,
                 # the fresh-thread fallback would fail identically — skip
                 # gracefully instead of logging a shutdown-race traceback.
@@ -2049,15 +3233,69 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                 try:
                     pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
                     try:
-                        future = pool.submit(asyncio.run, _send_to_platform(platform, pconfig, chat_id, cleaned_delivery_content, thread_id=thread_id, media_files=media_files))
-                        result = future.result(timeout=30)
+                        if atomic_standalone_media:
+                            retry_coro = _send_atomic_media_standalone(
+                                platform,
+                                standalone_pconfig,
+                                chat_id,
+                                cleaned_delivery_content.strip(),
+                                thread_id=thread_id,
+                                media_files=media_files,
+                            )
+                        else:
+                            retry_coro = _send_to_platform(
+                                platform,
+                                standalone_pconfig,
+                                chat_id,
+                                cleaned_delivery_content,
+                                thread_id=thread_id,
+                                media_files=media_files,
+                            )
+                        try:
+                            try:
+                                future = pool.submit(asyncio.run, retry_coro)
+                                result = future.result(timeout=30)
+                            except Exception as exc:
+                                if job.get("_durable_delivery"):
+                                    detail = str(exc).strip() or type(exc).__name__
+                                    if (
+                                        inspect.getcoroutinestate(retry_coro)
+                                        == inspect.CORO_CREATED
+                                    ):
+                                        raise _DispatchNeverBegan(
+                                            "standalone provider dispatch never began for "
+                                            f"{platform_name}:{chat_id}: {detail}"
+                                        ) from exc
+                                    raise _PostDispatchDeliveryOutcomeUnknown(
+                                        "standalone provider confirmation unavailable after "
+                                        f"dispatch to {platform_name}:{chat_id}: {detail}"
+                                    ) from exc
+                                raise
+                        finally:
+                            # Submission rejection or a cancelled-before-start
+                            # future may never consume the coroutine. Close only
+                            # that CREATED state; any state reached after execution
+                            # began remains an ambiguous provider outcome.
+                            if (
+                                inspect.getcoroutinestate(retry_coro)
+                                == inspect.CORO_CREATED
+                            ):
+                                retry_coro.close()
                     finally:
                         pool.shutdown(wait=False)
+                except _DispatchNeverBegan:
+                    raise
                 except Exception as e:
                     # A shutdown-race here is expected during teardown; downgrade
                     # to a warning so it doesn't read as a genuine failure.
                     if _interpreter_shutting_down(e):
                         msg = f"delivery to {platform_name}:{chat_id} skipped — interpreter is shutting down"
+                        logger.warning("Job '%s': %s", job["id"], msg)
+                        target_errors.append(msg)
+                        delivery_errors.extend(target_errors)
+                        continue
+                    if isinstance(e, _PostDispatchDeliveryOutcomeUnknown):
+                        msg = f"ACK_UNKNOWN: {e}"
                         logger.warning("Job '%s': %s", job["id"], msg)
                         target_errors.append(msg)
                         delivery_errors.extend(target_errors)
@@ -2068,18 +3306,49 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                     delivery_errors.extend(target_errors)
                     continue
             except Exception as e:
-                msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
-                logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
-                target_errors.extend([msg])
+                detail = str(e).strip() or type(e).__name__
+                if job.get("_durable_delivery"):
+                    msg = (
+                        "ACK_UNKNOWN: standalone provider outcome unavailable after "
+                        f"dispatch to {platform_name}:{chat_id}: {detail}"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                else:
+                    msg = f"delivery to {platform_name}:{chat_id} failed: {e}"
+                    logger.error("Job '%s': %s", job["id"], msg, exc_info=True)
+                target_errors.append(msg)
                 delivery_errors.extend(target_errors)
                 continue
 
+            _record_durable_send_metadata(job, result)
             if result and result.get("error"):
-                msg = f"delivery error: {result['error']}"
+                result_error = str(result["error"])
+                msg = (
+                    result_error
+                    if result_error.startswith("ACK_UNKNOWN:")
+                    else f"delivery error: {result_error}"
+                )
                 logger.error("Job '%s': %s", job["id"], msg)
                 target_errors.extend([msg])
                 delivery_errors.extend(target_errors)
                 continue
+
+            if job.get("_durable_delivery"):
+                provider_message_id = (
+                    result.get("message_id")
+                    if isinstance(result, dict)
+                    else getattr(result, "message_id", None)
+                )
+                if not provider_message_id:
+                    msg = (
+                        "ACK_UNKNOWN: standalone provider operation returned no receipt "
+                        f"for {platform_name}:{chat_id}"
+                    )
+                    logger.warning("Job '%s': %s", job["id"], msg)
+                    target_errors.append(msg)
+                    delivery_errors.extend(target_errors)
+                    continue
+                job["_durable_provider_message_id"] = str(provider_message_id)
 
             logger.info("Job '%s': delivered to %s:%s", job["id"], platform_name, chat_id)
             _maybe_mirror_cron_delivery(
@@ -4005,7 +5274,27 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
 
             if should_deliver:
                 try:
-                    delivery_error = _deliver_result(job, deliver_content, adapters=adapters, loop=loop)
+                    try:
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                            execution_id=execution_id,
+                        )
+                    except TypeError as compat_error:
+                        # Narrow compatibility for extensions/test fakes that
+                        # still implement the pre-outbox helper signature.
+                        if "unexpected keyword argument 'execution_id'" not in str(
+                            compat_error
+                        ):
+                            raise
+                        delivery_error = _deliver_result(
+                            job,
+                            deliver_content,
+                            adapters=adapters,
+                            loop=loop,
+                        )
                 except Exception as de:
                     delivery_error = str(de)
                     logger.error("Delivery failed for job %s: %s", job["id"], de)
@@ -4024,14 +5313,25 @@ def run_one_job(job: dict, *, adapters=None, loop=None, verbose: bool = False) -
             error = "Agent completed but produced empty response (model error, timeout, or misconfiguration)"
 
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], success, error, delivery_error=delivery_error)
+            mark_job_run(
+                job["id"],
+                success,
+                error,
+                delivery_error=delivery_error,
+                delivery_execution_id=execution_id,
+            )
         finish_execution(execution_id, success=success, error=error)
         return True
 
     except Exception as e:
         logger.error("Error processing job %s: %s", job['id'], e)
         if not _consume_interrupted_flag(job["id"]):
-            mark_job_run(job["id"], False, str(e))
+            mark_job_run(
+                job["id"],
+                False,
+                str(e),
+                delivery_execution_id=execution_id,
+            )
         finish_execution(execution_id, success=False, error=str(e))
         return False
 

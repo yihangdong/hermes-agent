@@ -166,3 +166,21 @@ class TestProducerHook:
         claimed = dl.sweep_recoverable()
         assert len(claimed) == 1
         assert claimed[0]["needs_marker"] is True
+
+    @pytest.mark.asyncio
+    async def test_cancelled_live_send_releases_obligation_for_retry(self):
+        adapter = _Adapter()
+        adapter.send = AsyncMock(side_effect=asyncio.CancelledError())
+
+        with pytest.raises(asyncio.CancelledError):
+            await _run(adapter, _event())
+
+        with dl._connect() as conn:
+            row = conn.execute(
+                """SELECT state, owner_pid, claim_token, last_error
+                   FROM delivery_obligations"""
+            ).fetchone()
+        assert row[0] == "failed"
+        assert row[1] is None
+        assert row[2] is None
+        assert "cancelled" in row[3]

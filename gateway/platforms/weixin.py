@@ -98,6 +98,14 @@ RATE_LIMIT_ERRCODE = -2  # iLink frequency limit — backoff and retry
 MESSAGE_DEDUP_TTL_SECONDS = 300
 
 
+class _WeixinDefinitiveProviderRejection(RuntimeError):
+    """The provider explicitly rejected the operation before acceptance."""
+
+
+class _WeixinDurableAckUnknown(RuntimeError):
+    """Dispatch began but no trustworthy provider receipt was obtained."""
+
+
 def _is_stale_session_ret(
     ret: "Optional[int]", errcode: "Optional[int]", errmsg: "Optional[str]",
 ) -> bool:
@@ -140,11 +148,20 @@ def _make_ssl_connector() -> Optional["aiohttp.TCPConnector"]:
     if not AIOHTTP_AVAILABLE:
         return None
     ssl_ctx = ssl.create_default_context(cafile=certifi.where())
+    connector_kwargs: Dict[str, Any] = {}
+    try:
+        from aiohttp.connector import NEEDS_CLEANUP_CLOSED
+    except (ImportError, AttributeError):
+        # Older aiohttp releases do not expose this capability flag and still
+        # benefit from explicit cleanup of SSL transports.
+        NEEDS_CLEANUP_CLOSED = True
+    if NEEDS_CLEANUP_CLOSED:
+        connector_kwargs["enable_cleanup_closed"] = True
     return aiohttp.TCPConnector(
         ssl=ssl_ctx,
         # Tighter keepalive so idle CLOSE_WAIT drains promptly (#18451, #69089).
         keepalive_timeout=2,
-        enable_cleanup_closed=True,
+        **connector_kwargs,
     )
 
 ITEM_TEXT = 1
@@ -1797,6 +1814,7 @@ class WeixinAdapter(BasePlatformAdapter):
         chunk: str,
         context_token: Optional[str],
         client_id: str,
+        durable_delivery: bool = False,
     ) -> None:
         """Send a single text chunk with per-chunk retry and backoff.
 
@@ -1811,6 +1829,7 @@ class WeixinAdapter(BasePlatformAdapter):
                 chunk=chunk,
                 context_token=context_token,
                 client_id=client_id,
+                durable_delivery=durable_delivery,
             )
 
     async def _send_text_chunk_locked(
@@ -1820,6 +1839,7 @@ class WeixinAdapter(BasePlatformAdapter):
         chunk: str,
         context_token: Optional[str],
         client_id: str,
+        durable_delivery: bool = False,
     ) -> None:
         """Send a text chunk while holding the adapter-wide outbound text gate."""
         last_error: Optional[Exception] = None
@@ -1827,7 +1847,9 @@ class WeixinAdapter(BasePlatformAdapter):
         for attempt in range(self._send_chunk_retries + 1):
             if self._rate_limit_cooldown_remaining() > 0:
                 raise self._rate_limit_error()
+            dispatch_started = False
             try:
+                dispatch_started = True
                 resp = await _send_message(
                     self._send_session,
                     base_url=self._base_url,
@@ -1875,6 +1897,11 @@ class WeixinAdapter(BasePlatformAdapter):
                             if self._record_rate_limit_event():
                                 last_error = self._rate_limit_error()
                                 break
+                            if durable_delivery:
+                                # The provider explicitly rejected this attempt;
+                                # preserve its cooldown for the durable outbox
+                                # instead of issuing hidden adapter-local retries.
+                                break
                             if attempt >= self._send_chunk_retries:
                                 break
                             wait = self._send_chunk_retry_delay_seconds * 3  # 3x backoff for rate limit
@@ -1885,13 +1912,32 @@ class WeixinAdapter(BasePlatformAdapter):
                             await asyncio.sleep(wait)
                             continue
                         errmsg = resp.get("errmsg") or resp.get("msg") or "unknown error"
-                        raise RuntimeError(
+                        raise _WeixinDefinitiveProviderRejection(
                             f"iLink sendmessage error: ret={ret} errcode={errcode} errmsg={errmsg}"
                         )
                 self._reset_rate_limit_circuit()
                 return
+            except _WeixinDurableAckUnknown:
+                raise
             except Exception as exc:
+                error_kind = classify_send_error(None, error_text=str(exc))
+                if (
+                    durable_delivery
+                    and dispatch_started
+                    and not isinstance(exc, _WeixinDefinitiveProviderRejection)
+                    and error_kind != "rate_limited"
+                ):
+                    detail = str(exc).strip() or type(exc).__name__
+                    raise _WeixinDurableAckUnknown(
+                        "ACK_UNKNOWN: Weixin provider response unavailable after "
+                        f"dispatch began: {detail}"
+                    ) from exc
                 last_error = exc
+                # Durable retry/recovery is owned by the outbox.  A provider
+                # rejection is safe to classify there, but the adapter must not
+                # hide extra physical attempts inside one obligation.
+                if durable_delivery:
+                    break
                 if attempt >= self._send_chunk_retries:
                     break
                 wait = self._send_chunk_retry_delay_seconds * (attempt + 1)
@@ -1921,12 +1967,24 @@ class WeixinAdapter(BasePlatformAdapter):
         context_token = self._token_store.get(self._account_id, chat_id)
         last_message_id: Optional[str] = None
 
-        # Extract MEDIA: tags and bare local file paths before text delivery.
-        media_files, cleaned_content = self.extract_media(content)
-        media_files = self.filter_media_delivery_paths(media_files)
-        _, image_cleaned = self.extract_images(cleaned_content)
-        local_files, final_content = self.extract_local_files(image_cleaned)
-        local_files = self.filter_local_delivery_paths(local_files)
+        # Structured durable chunks are frozen literal text.  Do not reinterpret
+        # provider-visible bytes as MEDIA tags, image markdown, or local paths:
+        # such extraction could create a second external side effect before the
+        # atomic text receipt commits.
+        atomic_preformatted = bool(
+            metadata and metadata.get("durable_preformatted_atomic_text")
+        )
+        if atomic_preformatted:
+            media_files = []
+            local_files = []
+            final_content = content
+        else:
+            # Extract MEDIA: tags and bare local file paths before text delivery.
+            media_files, cleaned_content = self.extract_media(content)
+            media_files = self.filter_media_delivery_paths(media_files)
+            _, image_cleaned = self.extract_images(cleaned_content)
+            local_files, final_content = self.extract_local_files(image_cleaned)
+            local_files = self.filter_local_delivery_paths(local_files)
 
         _AUDIO_EXTS = {".ogg", ".opus", ".mp3", ".wav", ".m4a", ".flac"}
         _VIDEO_EXTS = {".mp4", ".mov", ".avi", ".mkv", ".webm", ".3gp"}
@@ -1958,8 +2016,31 @@ class WeixinAdapter(BasePlatformAdapter):
                 except Exception as exc:
                     logger.warning("[%s] local file delivery failed for %s: %s", self.name, file_path, exc)
 
-            # Deliver text content.
-            chunks = [c for c in self._split_text(self.format_message(final_content)) if c and c.strip()]
+            # Deliver text content.  Structured cron delivery precomputes one
+            # provider-visible chunk per durable obligation.  In that mode this
+            # adapter must cross exactly one provider side-effect boundary: do
+            # not format or split again, and fail closed before sending if the
+            # producer violated the frozen chunk contract.
+            if atomic_preformatted:
+                if media_files or local_files:
+                    return SendResult(
+                        success=False,
+                        error="atomic preformatted Weixin text cannot contain media",
+                        error_kind="bad_format",
+                    )
+                if len(final_content) > self.MAX_MESSAGE_LENGTH:
+                    return SendResult(
+                        success=False,
+                        error="atomic preformatted Weixin text exceeds provider limit",
+                        error_kind="bad_format",
+                    )
+                chunks = [final_content] if final_content and final_content.strip() else []
+            else:
+                chunks = [
+                    c
+                    for c in self._split_text(self.format_message(final_content))
+                    if c and c.strip()
+                ]
             for idx, chunk in enumerate(chunks):
                 client_id = f"hermes-weixin-{uuid.uuid4().hex}"
                 await self._send_text_chunk(
@@ -1967,6 +2048,7 @@ class WeixinAdapter(BasePlatformAdapter):
                     chunk=chunk,
                     context_token=context_token,
                     client_id=client_id,
+                    durable_delivery=atomic_preformatted,
                 )
                 last_message_id = client_id
                 if idx < len(chunks) - 1 and self._send_chunk_delay_seconds > 0:
@@ -2369,6 +2451,17 @@ class WeixinAdapter(BasePlatformAdapter):
         return _wrap_copy_friendly_lines_for_weixin(_normalize_markdown_blocks(content))
 
 
+def _direct_send_failure(prefix: str, result: SendResult) -> Dict[str, Any]:
+    """Preserve typed retry/ambiguity metadata across standalone routing."""
+    detail = str(result.error or "unknown error")
+    error = detail if detail.startswith("ACK_UNKNOWN:") else f"{prefix}: {detail}"
+    return {
+        "error": error,
+        "error_kind": result.error_kind,
+        "retry_after": result.retry_after,
+    }
+
+
 async def send_weixin_direct(
     *,
     extra: Dict[str, Any],
@@ -2376,6 +2469,7 @@ async def send_weixin_direct(
     chat_id: str,
     message: str,
     media_files: Optional[List[Tuple[str, bool]]] = None,
+    metadata: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     """
     One-shot send helper for ``send_message`` and cron delivery.
@@ -2401,11 +2495,16 @@ async def send_weixin_direct(
             and not send_session.closed
             and send_session._loop is asyncio.get_running_loop()):
         last_result: Optional[SendResult] = None
-        cleaned = live_adapter.format_message(message)
+        atomic_preformatted = bool(
+            metadata and metadata.get("durable_preformatted_atomic_text")
+        )
+        cleaned = message if atomic_preformatted else live_adapter.format_message(message)
         if cleaned:
-            last_result = await live_adapter.send(chat_id, cleaned)
+            last_result = await live_adapter.send(
+                chat_id, cleaned, metadata=metadata
+            )
             if not last_result.success:
-                return {"error": f"Weixin send failed: {last_result.error}"}
+                return _direct_send_failure("Weixin send failed", last_result)
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
@@ -2414,7 +2513,7 @@ async def send_weixin_direct(
             else:
                 last_result = await live_adapter.send_document(chat_id, media_path)
             if not last_result.success:
-                return {"error": f"Weixin media send failed: {last_result.error}"}
+                return _direct_send_failure("Weixin media send failed", last_result)
 
         return {
             "success": True,
@@ -2446,11 +2545,14 @@ async def send_weixin_direct(
         adapter._token_store = token_store
 
         last_result: Optional[SendResult] = None
-        cleaned = adapter.format_message(message)
+        atomic_preformatted = bool(
+            metadata and metadata.get("durable_preformatted_atomic_text")
+        )
+        cleaned = message if atomic_preformatted else adapter.format_message(message)
         if cleaned:
-            last_result = await adapter.send(chat_id, cleaned)
+            last_result = await adapter.send(chat_id, cleaned, metadata=metadata)
             if not last_result.success:
-                return {"error": f"Weixin send failed: {last_result.error}"}
+                return _direct_send_failure("Weixin send failed", last_result)
 
         for media_path, _is_voice in media_files or []:
             ext = Path(media_path).suffix.lower()
@@ -2459,7 +2561,7 @@ async def send_weixin_direct(
             else:
                 last_result = await adapter.send_document(chat_id, media_path)
             if not last_result.success:
-                return {"error": f"Weixin media send failed: {last_result.error}"}
+                return _direct_send_failure("Weixin media send failed", last_result)
 
         return {
             "success": True,

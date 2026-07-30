@@ -1645,8 +1645,13 @@ def remove_job(job_id: str) -> bool:
     return False
 
 
-def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
-                 delivery_error: Optional[str] = None):
+def mark_job_run(
+    job_id: str,
+    success: bool,
+    error: Optional[str] = None,
+    delivery_error: Optional[str] = None,
+    delivery_execution_id: Optional[str] = None,
+):
     """
     Mark a job as having been run.
     
@@ -1655,6 +1660,8 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
 
     ``delivery_error`` is tracked separately from the agent error — a job
     can succeed (agent produced output) but fail delivery (platform down).
+    ``delivery_execution_id`` fences later durable-recovery reconciliation so
+    an older retry can never overwrite the status of a newer run.
     """
     with _jobs_lock():
         jobs = load_jobs()
@@ -1666,6 +1673,7 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 job["last_error"] = error if not success else None
                 # Track delivery failures separately — cleared on successful delivery
                 job["last_delivery_error"] = delivery_error
+                job["last_delivery_execution_id"] = delivery_execution_id
                 # Clear any external-fire claim so a re-armed recurring job can
                 # be claimed again on its next fire (Phase 4C CAS).
                 job["fire_claim"] = None
@@ -1738,6 +1746,30 @@ def mark_job_run(job_id: str, success: bool, error: Optional[str] = None,
                 return
 
         logger.warning("mark_job_run: job_id %s not found, skipping save", job_id)
+
+
+def reconcile_job_delivery_success(job_id: str, execution_id: str) -> str:
+    """Clear a recovered delivery error only for the same recorded execution.
+
+    Returns ``updated``, ``superseded``, ``missing``, or ``pending``. ``pending``
+    means the outbox completed before ``mark_job_run`` durably recorded the run;
+    callers must retain their reconciliation marker and retry later.
+    """
+    with _jobs_lock():
+        jobs = load_jobs()
+        for job in jobs:
+            if job["id"] != job_id:
+                continue
+            recorded = job.get("last_delivery_execution_id")
+            if recorded is None:
+                return "pending"
+            if str(recorded) != str(execution_id):
+                return "superseded"
+            if job.get("last_delivery_error") is not None:
+                job["last_delivery_error"] = None
+                save_jobs(jobs)
+            return "updated"
+    return "missing"
 
 
 def claim_dispatch(job_id: str) -> bool:

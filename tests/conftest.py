@@ -5,11 +5,10 @@ Hermetic-test invariants enforced here (see AGENTS.md for rationale):
 1. **No credential env vars.** All provider/credential-shaped env vars
    (ending in _API_KEY, _TOKEN, _SECRET, _PASSWORD, _CREDENTIALS, etc.)
    are unset before every test. Local developer keys cannot leak in.
-2. **Isolated HERMES_HOME.** HERMES_HOME points to a per-test tempdir so
-   code reading ``~/.hermes/*`` via ``get_hermes_home()`` can't see the
-   real one. (We do NOT also redirect HOME — that broke subprocesses in
-   CI. Code using ``Path.home() / ".hermes"`` instead of the canonical
-   ``get_hermes_home()`` is a bug to fix at the callsite.)
+2. **Physically isolated account home.** HOME, USERPROFILE, HERMES_HOME,
+   passwd lookup, user expansion, and child Python interpreters all resolve
+   below one canonical per-test directory. Real service-manager subprocesses
+   are blocked, and an outside LaunchAgent sentinel is re-attested per test.
 3. **Deterministic runtime.** TZ=UTC, LANG=C.UTF-8, PYTHONHASHSEED=0.
 4. **No HERMES_SESSION_* inheritance** — the agent's current gateway
    session must not leak into tests.
@@ -20,8 +19,13 @@ test runner at ``scripts/run_tests.sh``.
 """
 
 import asyncio
+import hashlib
+import json
 import os
+import shlex
+import shutil
 import sqlite3
+import stat
 import sys
 from pathlib import Path
 
@@ -31,6 +35,58 @@ import pytest
 PROJECT_ROOT = Path(__file__).parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
+
+
+def _path_identity(path: Path) -> dict:
+    """Return immutable metadata for an outside-path safety sentinel."""
+    if not path.exists() and not path.is_symlink():
+        return {"exists": False}
+    metadata = os.lstat(path)
+    is_regular = stat.S_ISREG(metadata.st_mode)
+    return {
+        "exists": True,
+        "dev": metadata.st_dev,
+        "inode": metadata.st_ino,
+        "type": stat.S_IFMT(metadata.st_mode),
+        "target": os.readlink(path) if stat.S_ISLNK(metadata.st_mode) else None,
+        "size": metadata.st_size,
+        "sha256": hashlib.sha256(path.read_bytes()).hexdigest() if is_regular else None,
+        "mode": stat.S_IMODE(metadata.st_mode),
+        "mtime_ns": metadata.st_mtime_ns,
+    }
+
+
+def _account_home_before_test_isolation() -> Path:
+    if os.name == "posix":
+        import pwd
+
+        return Path(pwd.getpwuid(os.getuid()).pw_dir).resolve()
+    return Path.home().resolve()
+
+
+_OUTSIDE_SERVICE_SENTINEL = (
+    _account_home_before_test_isolation()
+    / "Library"
+    / "LaunchAgents"
+    / "com.dyhano.hermes-ecosystem-sync.plist"
+)
+_OUTSIDE_SERVICE_SENTINEL_BASELINE = _path_identity(_OUTSIDE_SERVICE_SENTINEL)
+_SERVICE_MANAGER_COMMANDS = frozenset(
+    {"launchctl", "systemctl", "service", "loginctl", "sc", "sc.exe"}
+)
+
+
+def _command_executable(args) -> str:
+    if isinstance(args, (str, bytes)):
+        text = os.fsdecode(args)
+        try:
+            parts = shlex.split(text)
+        except ValueError:
+            parts = text.split()
+        return Path(parts[0]).name.lower() if parts else ""
+    if args:
+        return Path(os.fsdecode(args[0])).name.lower()
+    return ""
 
 
 # ── Per-file process isolation ──────────────────────────────────────────────
@@ -358,12 +414,15 @@ _HERMES_BEHAVIORAL_VARS = frozenset({
 
 @pytest.fixture(autouse=True)
 def _hermetic_environment(tmp_path, monkeypatch):
-    """Blank out all credential/behavioral env vars so local and CI match.
+    """Blank credentials and physically isolate every account-scoped path.
 
-    Also redirects HOME and HERMES_HOME to per-test tempdirs so code that
-    reads ``~/.hermes/*`` can't touch the real one, and pins TZ/LANG so
-    datetime/locale-sensitive tests are deterministic.
+    HOME, HERMES_HOME, passwd lookup, user expansion, and Python subprocesses
+    all resolve below one canonical per-test directory. Real service-manager
+    commands are blocked unless a test replaces the subprocess boundary with a
+    fake. The outside LaunchAgent sentinel is re-attested after every test.
     """
+    assert _path_identity(_OUTSIDE_SERVICE_SENTINEL) == _OUTSIDE_SERVICE_SENTINEL_BASELINE
+
     # 1. Blank every credential-shaped env var that's currently set.
     for name in list(os.environ.keys()):
         if _looks_like_credential(name):
@@ -373,30 +432,90 @@ def _hermetic_environment(tmp_path, monkeypatch):
     for name in _HERMES_BEHAVIORAL_VARS:
         monkeypatch.delenv(name, raising=False)
 
-    # Honcho's fallback host/config resolution legitimately reads the user's
-    # global ~/.honcho/config.json. Keep HOME stable (subprocess tests depend
-    # on it), but pin the host so ordinary tests cannot inherit a developer's
-    # defaultHost and silently select the wrong nested config block. Tests of
-    # custom host resolution override/delete this explicitly.
+    # Honcho's fallback host/config resolution must not select a developer's
+    # defaultHost from any inherited config.
     monkeypatch.setenv("HERMES_HONCHO_HOST", "hermes")
 
-    # 3. Redirect HERMES_HOME to a per-test tempdir. Code that reads
-    #    ``~/.hermes/*`` via ``get_hermes_home()`` now gets the tempdir.
-    #
-    #    NOTE: We do NOT also redirect HOME. Doing so broke CI because
-    #    some tests (and their transitive deps) spawn subprocesses that
-    #    inherit HOME and expect it to be stable. If a test genuinely
-    #    needs HOME isolated, it should set it explicitly in its own
-    #    fixture. Any code in the codebase reading ``~/.hermes/*`` via
-    #    ``Path.home() / ".hermes"`` instead of ``get_hermes_home()``
-    #    is a bug to fix at the callsite.
-    fake_hermes_home = tmp_path / "hermes_test"
+    # 3. Use one physical, canonical home for every account resolver.
+    physical_home = tmp_path / "physical-home"
+    physical_home.mkdir()
+    assert not physical_home.is_symlink()
+    assert physical_home.absolute() == physical_home.resolve()
+    fake_hermes_home = physical_home / ".hermes"
     fake_hermes_home.mkdir()
     (fake_hermes_home / "sessions").mkdir()
     (fake_hermes_home / "cron").mkdir()
     (fake_hermes_home / "memories").mkdir()
     (fake_hermes_home / "skills").mkdir()
+
+    monkeypatch.setenv("HOME", str(physical_home))
+    monkeypatch.setenv("USERPROFILE", str(physical_home))
     monkeypatch.setenv("HERMES_HOME", str(fake_hermes_home))
+    monkeypatch.setenv("HERMES_TEST_PHYSICAL_HOME", str(physical_home))
+    monkeypatch.setenv("HERMES_TEST_OUTSIDE_SENTINEL", str(_OUTSIDE_SERVICE_SENTINEL))
+    monkeypatch.setenv(
+        "HERMES_TEST_OUTSIDE_SENTINEL_BASELINE",
+        json.dumps(_OUTSIDE_SERVICE_SENTINEL_BASELINE, sort_keys=True),
+    )
+
+    # macOS has no systemctl binary. Keep the documented read-only guard
+    # self-tests routed through a real subprocess without consulting any live
+    # manager; mutating commands are rejected by _live_system_guard first.
+    if os.name == "posix" and shutil.which("systemctl") is None:
+        isolated_bin = physical_home / "bin"
+        isolated_bin.mkdir()
+        systemctl_shim = isolated_bin / "systemctl"
+        systemctl_shim.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
+        systemctl_shim.chmod(0o700)
+        monkeypatch.setenv(
+            "PATH", str(isolated_bin) + os.pathsep + os.environ.get("PATH", "")
+        )
+
+    if os.name == "posix":
+        import pwd
+
+        real_getpwuid = pwd.getpwuid
+
+        def isolated_getpwuid(uid):
+            entry = real_getpwuid(uid)
+            if uid != os.getuid():
+                return entry
+            return pwd.struct_passwd(
+                (*entry[:5], str(physical_home), entry.pw_shell)
+            )
+
+        monkeypatch.setattr(pwd, "getpwuid", isolated_getpwuid)
+
+    # Python children need the same passwd override before product imports.
+    startup_dir = tmp_path / "python-startup"
+    startup_dir.mkdir()
+    (startup_dir / "sitecustomize.py").write_text(
+        "import os\n"
+        "try:\n"
+        "    import pwd\n"
+        "except ImportError:\n"
+        "    pwd = None\n"
+        "if pwd is not None and os.environ.get('HERMES_TEST_PHYSICAL_HOME'):\n"
+        "    _real_getpwuid = pwd.getpwuid\n"
+        "    _home = os.environ['HERMES_TEST_PHYSICAL_HOME']\n"
+        "    def _isolated_getpwuid(uid):\n"
+        "        entry = _real_getpwuid(uid)\n"
+        "        if uid != os.getuid():\n"
+        "            return entry\n"
+        "        return pwd.struct_passwd((*entry[:5], _home, entry.pw_shell))\n"
+        "    pwd.getpwuid = _isolated_getpwuid\n",
+        encoding="utf-8",
+    )
+    inherited_pythonpath = os.environ.get("PYTHONPATH", "")
+    isolated_pythonpath = str(startup_dir)
+    if inherited_pythonpath:
+        isolated_pythonpath += os.pathsep + inherited_pythonpath
+    monkeypatch.setenv("PYTHONPATH", isolated_pythonpath)
+
+    # Child-process environment is inherited from the physical home above.
+    # The suite-level live-system guard below preserves this environment while
+    # wrapping Popen as a class (required by third-party type annotations) and
+    # blocks real service-manager commands.
 
     # 4. Deterministic locale / timezone / hashseed. CI runs in UTC with
     #    C.UTF-8 locale; local dev often doesn't. Pin everything.
@@ -430,6 +549,10 @@ def _hermetic_environment(tmp_path, monkeypatch):
     # the generic credential-shaped env-var filter above.
     monkeypatch.delenv("GMI_API_KEY", raising=False)
     monkeypatch.delenv("GMI_BASE_URL", raising=False)
+
+    yield
+
+    assert _path_identity(_OUTSIDE_SERVICE_SENTINEL) == _OUTSIDE_SERVICE_SENTINEL_BASELINE
 
 
 # Backward-compat alias — old tests reference this fixture name. Keep it
@@ -488,6 +611,46 @@ def mock_config():
 # fixture (POSIX-only, didn't work on Windows) is gone.
 
 
+_PYTEST_SESSION_EVENT_LOOP = None
+
+
+def pytest_sessionstart(session):
+    """Install an owned anchor loop for pytest-asyncio's policy hand-off.
+
+    pytest-asyncio snapshots the current loop before temporarily replacing the
+    event-loop policy.  If no current loop exists on Python 3.12, that snapshot
+    call implicitly creates a selector loop which the plugin restores but does
+    not own or close.  Keep one explicit anchor loop instead and close it at
+    session shutdown.
+    """
+    del session
+    global _PYTEST_SESSION_EVENT_LOOP
+    loop = asyncio.new_event_loop()
+    asyncio.set_event_loop(loop)
+    _PYTEST_SESSION_EVENT_LOOP = loop
+
+
+@pytest.hookimpl(trylast=True)
+def pytest_sessionfinish(session, exitstatus):
+    """Close the explicit pytest-asyncio anchor loop without hiding live tasks."""
+    del session, exitstatus
+    global _PYTEST_SESSION_EVENT_LOOP
+    loop = _PYTEST_SESSION_EVENT_LOOP
+    _PYTEST_SESSION_EVENT_LOOP = None
+    try:
+        if loop is not None and not loop.is_closed():
+            if loop.is_running():
+                raise RuntimeError("pytest session anchor event loop is still running")
+            pending = asyncio.all_tasks(loop)
+            if pending:
+                raise RuntimeError(
+                    f"pytest session anchor event loop has {len(pending)} pending task(s)"
+                )
+            loop.close()
+    finally:
+        asyncio.set_event_loop(None)
+
+
 @pytest.fixture(autouse=True)
 def _ensure_current_event_loop(request):
     """Provide a default event loop for sync tests that call get_event_loop().
@@ -529,7 +692,10 @@ def _ensure_current_event_loop(request):
             try:
                 loop.close()
             finally:
-                asyncio.set_event_loop(None)
+                anchor = _PYTEST_SESSION_EVENT_LOOP
+                asyncio.set_event_loop(
+                    anchor if anchor is not None and not anchor.is_closed() else None
+                )
 
 
 # ── Live-system guard ──────────────────────────────────────────────────────
@@ -727,6 +893,26 @@ def _live_system_guard(request, monkeypatch):
     import shlex as _shlex
     import subprocess as _subprocess
 
+    def _physical_child_env(explicit_env=None):
+        """Force every child resolver back under the current disposable home."""
+        # An explicit environment is authoritative: callers such as cron script
+        # execution deliberately express secret removal by omitting keys.  Do
+        # not resurrect those keys from the parent test process here.
+        child_env = dict(_os.environ if explicit_env is None else explicit_env)
+        for name in (
+            "HOME",
+            "USERPROFILE",
+            "HERMES_HOME",
+            "HERMES_TEST_PHYSICAL_HOME",
+            "HERMES_TEST_OUTSIDE_SENTINEL",
+            "HERMES_TEST_OUTSIDE_SENTINEL_BASELINE",
+            "PYTHONPATH",
+        ):
+            value = _os.environ.get(name)
+            if value is not None:
+                child_env[name] = value
+        return child_env
+
     test_pid = _os.getpid()
     # Capture the test process's existing children at fixture start —
     # any *new* children spawned by the test are also allowlisted via
@@ -828,6 +1014,15 @@ def _live_system_guard(request, monkeypatch):
         "reset-failed", "enable", "disable", "mask", "unmask",
         "daemon-reload", "try-restart", "reload-or-restart",
     )
+    _SERVICE_MANAGER_MUTATING_VERBS = frozenset(
+        _MUTATING_VERBS
+        + (
+            "load", "unload", "bootstrap", "bootout", "kickstart", "remove",
+            "submit", "create", "delete", "config", "preset", "reenable",
+            "isolate", "terminate-session", "kill-session", "terminate-user",
+            "kill-user", "enable-linger", "disable-linger",
+        )
+    )
     _PROCESS_KILLERS = ("pkill", "killall", "taskkill", "skill", "fuser")
 
     def _cmd_to_string(cmd) -> str:
@@ -887,6 +1082,11 @@ def _live_system_guard(request, monkeypatch):
         return False
 
     def _check_subprocess_cmd(name, cmd):
+        cmd_str = _cmd_to_string(cmd)
+        try:
+            command_tokens = _shlex.split(cmd_str)
+        except ValueError:
+            command_tokens = cmd_str.split()
         if _is_blocked_systemctl(cmd):
             raise RuntimeError(
                 f"tests/conftest.py live-system guard: blocked "
@@ -894,6 +1094,26 @@ def _live_system_guard(request, monkeypatch):
                 "live hermes-gateway systemd unit. Mock "
                 "subprocess.run / _run_systemctl in the test, or "
                 "mark with @pytest.mark.live_system_guard_bypass."
+            )
+        service_manager = next(
+            (
+                token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+                for token in command_tokens
+                if token.rsplit("/", 1)[-1].rsplit("\\", 1)[-1].lower()
+                in _SERVICE_MANAGER_COMMANDS
+            ),
+            None,
+        )
+        mutating_service_manager = service_manager is not None and any(
+            token.lower() in _SERVICE_MANAGER_MUTATING_VERBS
+            for token in command_tokens
+        )
+        if mutating_service_manager:
+            raise RuntimeError(
+                f"tests/conftest.py physical-home guard: blocked real "
+                f"service-manager command {service_manager!r} in "
+                f"subprocess.{name}({cmd!r}); replace the service boundary "
+                "with a test fake"
             )
         if _is_process_killer(cmd):
             raise RuntimeError(
@@ -960,6 +1180,7 @@ def _live_system_guard(request, monkeypatch):
         class _GuardedPopen(real):  # type: ignore[misc, valid-type]
             def __init__(self, cmd, *args, **kwargs):
                 _check_subprocess_cmd("Popen", cmd)
+                kwargs["env"] = _physical_child_env(kwargs.get("env"))
                 super().__init__(cmd, *args, **kwargs)
 
         _GuardedPopen.__name__ = "Popen"

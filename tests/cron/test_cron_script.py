@@ -172,6 +172,27 @@ class TestRunJobScript:
         assert success is True
         assert output == "ABSENT"
 
+    def test_script_subprocess_env_strips_nous_api_key(self, cron_env, monkeypatch):
+        """No-agent cron children must never inherit the Hermes inference key."""
+        from cron.scheduler import _run_job_script
+        from tools.env_passthrough import (
+            is_env_passthrough,
+            register_env_passthrough,
+        )
+
+        register_env_passthrough(["NOUS_API_KEY"])
+        assert not is_env_passthrough("NOUS_API_KEY")
+        monkeypatch.setenv("NOUS_API_KEY", "must_not_leak")
+        script = cron_env / "scripts" / "nous_env_probe.py"
+        script.write_text(
+            "import os\n"
+            "print('PRESENT' if os.environ.get('NOUS_API_KEY') else 'ABSENT')\n"
+        )
+
+        success, output = _run_job_script("nous_env_probe.py")
+        assert success is True
+        assert output == "ABSENT"
+
     def test_windows_uv_venv_python_script_bypasses_launcher(self, cron_env, tmp_path, monkeypatch):
         from cron import scheduler as sched_mod
         from cron.scheduler import _run_job_script
