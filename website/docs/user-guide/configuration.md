@@ -319,7 +319,14 @@ Runs commands on a remote server over SSH. Uses ControlMaster for connection reu
 terminal:
   backend: ssh
   persistent_shell: true           # Keep a long-lived bash session (default: true)
+  ssh_file_sync: true              # Mirror selected ~/.hermes files (default: true)
 ```
+
+Set `ssh_file_sync: false` when the local and remote nodes manage their
+`~/.hermes` state independently (for example, when durable memories and skills
+are synchronized through Git). Disabled mode does not create the remote sync
+directory tree and does not upload, delete, or sync back Hermes files; SSH
+commands and session snapshots continue to work normally.
 
 **Required environment variables:**
 

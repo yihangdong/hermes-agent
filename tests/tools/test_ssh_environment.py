@@ -3,6 +3,7 @@
 import json
 import os
 import subprocess
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -136,6 +137,17 @@ class TestControlSocketPath:
 
 
 class TestTerminalToolConfig:
+    def test_ssh_file_sync_defaults_true(self, monkeypatch):
+        """Automatic SSH file sync remains enabled for backward compatibility."""
+        monkeypatch.delenv("TERMINAL_SSH_FILE_SYNC", raising=False)
+        from tools.terminal_tool import _get_env_config
+        assert _get_env_config()["ssh_file_sync"] is True
+
+    def test_ssh_file_sync_explicit_false(self, monkeypatch):
+        monkeypatch.setenv("TERMINAL_SSH_FILE_SYNC", "false")
+        from tools.terminal_tool import _get_env_config
+        assert _get_env_config()["ssh_file_sync"] is False
+
     def test_ssh_persistent_default_true(self, monkeypatch):
         """SSH persistent defaults to True (via TERMINAL_PERSISTENT_SHELL)."""
         monkeypatch.delenv("TERMINAL_SSH_PERSISTENT", raising=False)
@@ -199,6 +211,143 @@ class TestSSHPreflight:
         assert called["count"] == 1
         assert env.host == "example.com"
         assert env.user == "alice"
+
+    def test_file_sync_disabled_still_requires_ssh(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: None)
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "_establish_connection",
+            lambda self: pytest.fail("connection must not start when ssh is missing"),
+        )
+
+        with pytest.raises(RuntimeError, match="SSH is not installed or not in PATH"):
+            ssh_env.SSHEnvironment(
+                host="example.com",
+                user="alice",
+                file_sync=False,
+            )
+
+    def test_file_sync_disabled_does_not_require_scp(self, monkeypatch):
+        monkeypatch.setattr(
+            ssh_env.shutil,
+            "which",
+            lambda name: "/usr/bin/ssh" if name == "ssh" else None,
+        )
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", lambda self: None)
+
+        env = ssh_env.SSHEnvironment(
+            host="example.com",
+            user="alice",
+            file_sync=False,
+        )
+
+        assert env.file_sync is False
+        assert env._sync_manager is None
+
+    @pytest.mark.parametrize(
+        "file_sync_kwargs",
+        [{}, {"file_sync": True}],
+        ids=["default", "explicitly-enabled"],
+    )
+    def test_file_sync_enabled_requires_scp(self, monkeypatch, file_sync_kwargs):
+        monkeypatch.setattr(
+            ssh_env.shutil,
+            "which",
+            lambda name: "/usr/bin/ssh" if name == "ssh" else None,
+        )
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "_establish_connection",
+            lambda self: pytest.fail("connection must not start when scp is missing"),
+        )
+
+        with pytest.raises(RuntimeError, match="SCP is not installed or not in PATH"):
+            ssh_env.SSHEnvironment(
+                host="example.com",
+                user="alice",
+                **file_sync_kwargs,
+            )
+
+
+class TestSSHFileSyncOptOut:
+    @pytest.fixture(autouse=True)
+    def _mock_connection(self, monkeypatch):
+        monkeypatch.setattr(ssh_env.shutil, "which", lambda _name: "/usr/bin/ssh")
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_establish_connection", lambda self: None)
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "_detect_remote_home", lambda self: "/home/alice")
+
+    def test_default_still_initializes_and_primes_file_sync(self, monkeypatch):
+        calls = []
+
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "_ensure_remote_dirs",
+            lambda self: calls.append("remote_dirs"),
+        )
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "init_session",
+            lambda self: calls.append("session_snapshot"),
+        )
+
+        class TrackingSyncManager:
+            def __init__(self, **kwargs):
+                calls.append("manager")
+
+            def sync(self, **kwargs):
+                calls.append(("sync", kwargs))
+
+        monkeypatch.setattr(ssh_env, "FileSyncManager", TrackingSyncManager)
+
+        env = SSHEnvironment(host="example.com", user="alice")
+
+        assert env._sync_manager is not None
+        assert calls == [
+            "remote_dirs",
+            "manager",
+            ("sync", {"force": True}),
+            "session_snapshot",
+        ]
+
+    def test_disabled_skips_sync_but_snapshot_execute_and_cleanup_still_work(
+        self, monkeypatch
+    ):
+        calls = []
+
+        monkeypatch.setattr(
+            ssh_env.SSHEnvironment,
+            "_ensure_remote_dirs",
+            lambda self: pytest.fail("sync directories must not be created"),
+        )
+        monkeypatch.setattr(
+            ssh_env,
+            "FileSyncManager",
+            lambda **kwargs: pytest.fail("FileSyncManager must not be initialized"),
+        )
+
+        def _init_session(self):
+            calls.append("session_snapshot")
+            self._snapshot_ready = True
+
+        monkeypatch.setattr(ssh_env.SSHEnvironment, "init_session", _init_session)
+
+        env = SSHEnvironment(host="example.com", user="alice", file_sync=False)
+        env.control_socket = Path("/nonexistent/hermes-ssh.sock")
+        monkeypatch.setattr(env, "_run_bash", lambda *args, **kwargs: object())
+        monkeypatch.setattr(
+            env,
+            "_wait_for_process",
+            lambda *args, **kwargs: {"output": "ok\n", "returncode": 0},
+        )
+
+        result = env.execute("echo ok")
+        env.cleanup()
+
+        assert env._sync_manager is None
+        assert calls == ["session_snapshot"]
+        assert result == {"output": "ok\n", "returncode": 0}
 
 
 def _setup_ssh_env(monkeypatch, persistent: bool):

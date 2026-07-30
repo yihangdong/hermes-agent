@@ -1044,6 +1044,7 @@ def _probe_remote_backend(env_type: str) -> str | None:
                 "port": config.get("ssh_port", 22),
                 "key": config.get("ssh_key", ""),
                 "persistent": config.get("ssh_persistent", False),
+                "file_sync": config.get("ssh_file_sync", True),
             }
 
         container_config = None

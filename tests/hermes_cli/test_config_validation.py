@@ -213,6 +213,24 @@ class TestConfigIssueDataclass:
         assert a == b
 
 
+class TestSSHFileSyncValidation:
+    def test_default_is_enabled_for_backward_compatibility(self):
+        assert DEFAULT_CONFIG["terminal"]["ssh_file_sync"] is True
+
+    def test_boolean_values_are_valid(self):
+        assert validate_config_structure({"terminal": {"ssh_file_sync": False}}) == []
+
+    def test_non_boolean_value_is_rejected(self):
+        issues = validate_config_structure({"terminal": {"ssh_file_sync": "false"}})
+
+        assert any(
+            issue.severity == "error"
+            and "terminal.ssh_file_sync" in issue.message
+            and "boolean" in issue.message
+            for issue in issues
+        )
+
+
 class TestUnknownTopLevelKeys:
     """Arbitrary top-level keys must NOT warn — they are bridged to os.environ.
 

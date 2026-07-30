@@ -775,6 +775,7 @@ def _get_or_create_env(task_id: str):
                 "port": config.get("ssh_port", 22),
                 "key": config.get("ssh_key", ""),
                 "persistent": config.get("ssh_persistent", False),
+                "file_sync": config.get("ssh_file_sync", True),
             }
 
         local_config = None

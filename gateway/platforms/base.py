@@ -5715,6 +5715,7 @@ class BasePlatformAdapter(ABC):
                     # Slash-command and ephemeral replies are cheap to
                     # regenerate and are not recorded.
                     _obligation_id = None
+                    _obligation_claim_token = None
                     if not is_ephemeral_response and not str(
                         event.text or ""
                     ).lstrip().startswith(("/", self.typed_command_prefix or "!")):
@@ -5732,7 +5733,7 @@ class BasePlatformAdapter(ABC):
                                     str(getattr(event, "message_id", "") or ""),
                                     text_content,
                                 )
-                                record_obligation(
+                                _obligation_generation = record_obligation(
                                     obligation_id=_obligation_id,
                                     session_key=session_key,
                                     platform=str(
@@ -5743,16 +5744,41 @@ class BasePlatformAdapter(ABC):
                                     thread_id=getattr(event.source, "thread_id", None),
                                     content=text_content,
                                 )
-                                mark_attempting(_obligation_id)
+                                _obligation_claim_token = mark_attempting(
+                                    _obligation_id,
+                                    generation=_obligation_generation,
+                                )
+                                if not _obligation_claim_token:
+                                    _obligation_id = None
                         except Exception:
                             logger.debug("delivery ledger record failed", exc_info=True)
                             _obligation_id = None
-                    result = await delivery_adapter._send_with_retry(
-                        chat_id=event.source.chat_id,
-                        content=text_content,
-                        reply_to=_reply_anchor,
-                        metadata=_final_thread_metadata,
-                    )
+                    try:
+                        result = await delivery_adapter._send_with_retry(
+                            chat_id=event.source.chat_id,
+                            content=text_content,
+                            reply_to=_reply_anchor,
+                            metadata=_final_thread_metadata,
+                        )
+                    except asyncio.CancelledError:
+                        if _obligation_id is not None:
+                            try:
+                                from gateway.delivery_ledger import mark_failed
+
+                                mark_failed(
+                                    _obligation_id,
+                                    "live delivery send cancelled with outcome unknown",
+                                    retry_after_seconds=30.0,
+                                    generation=_obligation_generation,
+                                    claim_token=_obligation_claim_token,
+                                    retryable=True,
+                                )
+                            except Exception:
+                                logger.warning(
+                                    "delivery ledger cancellation cleanup failed",
+                                    exc_info=True,
+                                )
+                        raise
                     _record_delivery(result)
                     if _obligation_id is not None:
                         try:
@@ -5762,11 +5788,29 @@ class BasePlatformAdapter(ABC):
                             )
 
                             if getattr(result, "success", False):
-                                mark_delivered(_obligation_id)
+                                mark_delivered(
+                                    _obligation_id,
+                                    generation=_obligation_generation,
+                                    claim_token=_obligation_claim_token,
+                                )
                             else:
+                                _error_text = str(
+                                    getattr(result, "error", "") or ""
+                                )
+                                _error_kind = getattr(result, "error_kind", None)
+                                if _error_kind not in SEND_ERROR_KINDS:
+                                    _error_kind = classify_send_error(
+                                        None, error_text=_error_text
+                                    )
                                 mark_failed(
                                     _obligation_id,
-                                    str(getattr(result, "error", "") or ""),
+                                    _error_text,
+                                    retry_after_seconds=getattr(result, "retry_after", None),
+                                    generation=_obligation_generation,
+                                    claim_token=_obligation_claim_token,
+                                    retryable=_error_kind in {
+                                        "rate_limited", "transient", "unknown"
+                                    },
                                 )
                         except Exception:
                             logger.debug(

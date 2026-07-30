@@ -1210,6 +1210,10 @@ DEFAULT_CONFIG = {
         "singularity_image": "docker://nikolaik/python-nodejs:python3.11-nodejs20",
         "modal_image": "nikolaik/python-nodejs:python3.11-nodejs20",
         "daytona_image": "nikolaik/python-nodejs:python3.11-nodejs20",
+        # SSH automatically mirrors selected ~/.hermes runtime files to the
+        # remote host and syncs changes back on cleanup. Disable when the two
+        # nodes manage durable state independently (for example via Git).
+        "ssh_file_sync": True,
         # Container resource limits (docker, singularity, modal, daytona — ignored for local/ssh)
         "container_cpu": 1,
         "container_memory": 5120,       # MB (default 5GB)
@@ -6093,6 +6097,19 @@ def validate_config_structure(config: Optional[Dict[str, Any]] = None) -> List["
             "    base_url: https://...",
         ))
 
+    # ── terminal.ssh_file_sync must be a YAML boolean ───────────────────
+    terminal_cfg = config.get("terminal")
+    if (
+        isinstance(terminal_cfg, dict)
+        and "ssh_file_sync" in terminal_cfg
+        and not isinstance(terminal_cfg["ssh_file_sync"], bool)
+    ):
+        issues.append(ConfigIssue(
+            "error",
+            "terminal.ssh_file_sync must be a boolean (true or false)",
+            "Set terminal.ssh_file_sync to true or false without quotes",
+        ))
+
     # ── Root-level keys that look misplaced ──────────────────────────────
     # Only provider-like fields (base_url, api_key, …) are flagged. Arbitrary
     # unknown top-level keys are deliberately NOT warned about: top-level
@@ -7663,6 +7680,7 @@ TERMINAL_CONFIG_ENV_MAP = {
     "ssh_user": "TERMINAL_SSH_USER",
     "ssh_port": "TERMINAL_SSH_PORT",
     "ssh_key": "TERMINAL_SSH_KEY",
+    "ssh_file_sync": "TERMINAL_SSH_FILE_SYNC",
     "container_cpu": "TERMINAL_CONTAINER_CPU",
     "container_memory": "TERMINAL_CONTAINER_MEMORY",
     "container_disk": "TERMINAL_CONTAINER_DISK",

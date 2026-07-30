@@ -322,3 +322,11 @@ def test_docker_forward_env_is_bridged_everywhere():
     assert "docker_forward_env" in _gateway_env_map_keys()
     assert "docker_forward_env" in _save_config_env_sync_keys()
     assert "TERMINAL_DOCKER_FORWARD_ENV" in _terminal_tool_env_var_names()
+
+
+def test_ssh_file_sync_is_bridged_everywhere():
+    """The SSH sync opt-out must reach every launcher and terminal consumer."""
+    assert "ssh_file_sync" in _cli_env_map_keys()
+    assert "ssh_file_sync" in _gateway_env_map_keys()
+    assert "ssh_file_sync" in _save_config_env_sync_keys()
+    assert "TERMINAL_SSH_FILE_SYNC" in _terminal_tool_env_var_names()

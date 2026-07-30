@@ -238,6 +238,7 @@ terminal:
 #   ssh_user: "myuser"
 #   ssh_port: 22
 #   ssh_key: "~/.ssh/id_rsa"  # Optional - uses ssh-agent if not specified
+#   ssh_file_sync: true  # Set false to keep each node's ~/.hermes state independent
 
 # -----------------------------------------------------------------------------
 # OPTION 3: Docker container

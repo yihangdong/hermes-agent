@@ -21,13 +21,13 @@ from tools.environments.file_sync import (
 logger = logging.getLogger(__name__)
 
 
-def _ensure_ssh_available() -> None:
-    """Fail fast with a clear error when the SSH client is unavailable."""
+def _ensure_ssh_available(*, require_scp: bool = True) -> None:
+    """Fail fast with a clear error when required SSH clients are unavailable."""
     if not shutil.which("ssh"):
         raise RuntimeError(
             "SSH is not installed or not in PATH. Install OpenSSH client: apt install openssh-client"
         )
-    if not shutil.which("scp"):
+    if require_scp and not shutil.which("scp"):
         raise RuntimeError(
             "SCP is not installed or not in PATH. Install OpenSSH client: apt install openssh-client"
         )
@@ -43,12 +43,15 @@ class SSHEnvironment(BaseEnvironment):
     """
 
     def __init__(self, host: str, user: str, cwd: str = "~",
-                 timeout: int = 60, port: int = 22, key_path: str = ""):
+                 timeout: int = 60, port: int = 22, key_path: str = "",
+                 file_sync: bool = True):
         super().__init__(cwd=cwd, timeout=timeout)
         self.host = host
         self.user = user
         self.port = port
         self.key_path = key_path
+        self.file_sync = file_sync
+        self._sync_manager: FileSyncManager | None = None
 
         self.control_dir = Path(tempfile.gettempdir()) / "hermes-ssh"
         self.control_dir.mkdir(parents=True, exist_ok=True)
@@ -64,19 +67,20 @@ class SSHEnvironment(BaseEnvironment):
             f"{user}@{host}:{port}".encode()
         ).hexdigest()[:16]
         self.control_socket = self.control_dir / f"{_socket_id}.sock"
-        _ensure_ssh_available()
+        _ensure_ssh_available(require_scp=self.file_sync)
         self._establish_connection()
         self._remote_home = self._detect_remote_home()
 
-        self._ensure_remote_dirs()
-        self._sync_manager = FileSyncManager(
-            get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
-            upload_fn=self._scp_upload,
-            delete_fn=self._ssh_delete,
-            bulk_upload_fn=self._ssh_bulk_upload,
-            bulk_download_fn=self._ssh_bulk_download,
-        )
-        self._sync_manager.sync(force=True)
+        if self.file_sync:
+            self._ensure_remote_dirs()
+            self._sync_manager = FileSyncManager(
+                get_files_fn=lambda: iter_sync_files(f"{self._remote_home}/.hermes"),
+                upload_fn=self._scp_upload,
+                delete_fn=self._ssh_delete,
+                bulk_upload_fn=self._ssh_bulk_upload,
+                bulk_download_fn=self._ssh_bulk_download,
+            )
+            self._sync_manager.sync(force=True)
 
         self.init_session()
 
@@ -334,7 +338,8 @@ class SSHEnvironment(BaseEnvironment):
 
     def _before_execute(self) -> None:
         """Sync files to remote via FileSyncManager (rate-limited internally)."""
-        self._sync_manager.sync()
+        if self._sync_manager is not None:
+            self._sync_manager.sync()
 
     # ------------------------------------------------------------------
     # Execution
@@ -353,7 +358,7 @@ class SSHEnvironment(BaseEnvironment):
         return _popen_bash(cmd, stdin_data)
 
     def cleanup(self):
-        if self._sync_manager:
+        if self._sync_manager is not None:
             logger.info("SSH: syncing files from sandbox...")
             self._sync_manager.sync_back()
 
