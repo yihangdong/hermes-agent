@@ -726,6 +726,10 @@ async def _send_via_adapter(
                 metadata = {}
                 if thread_id:
                     metadata["thread_id"] = thread_id
+                if getattr(pconfig, "_durable_delivery", False):
+                    metadata["_durable_delivery"] = True
+                if getattr(pconfig, "_durable_preformatted_atomic_text", False):
+                    metadata["durable_preformatted_atomic_text"] = True
                 if platform_name == "ntfy" and chat_id:
                     metadata["publish_topic"] = chat_id
                 if not metadata:
@@ -836,11 +840,27 @@ async def _send_to_platform(platform, pconfig, chat_id, message, thread_id=None,
         except Exception:
             pass
 
-    # Smart-chunk the message to fit within platform limits.
-    # For short messages or platforms without a known limit this is a no-op.
-    # Telegram measures length in UTF-16 code units, not Unicode codepoints.
+    # Durable provider chunks are already final platform bytes and one outbox
+    # obligation. Generic re-splitting here would create multiple provider calls
+    # behind that single replay boundary.
+    atomic_preformatted = bool(
+        getattr(pconfig, "_durable_preformatted_atomic_text", False)
+    )
     max_len = _MAX_LENGTHS.get(platform)
-    if max_len:
+    if atomic_preformatted:
+        if media_files:
+            return {
+                "error": (
+                    "durable preformatted atomic text cannot include media "
+                    "inside the same obligation"
+                )
+            }
+        if not message or not message.strip():
+            return {"error": "durable preformatted atomic text is empty"}
+        if max_len and len(message) > max_len:
+            return {"error": "durable preformatted atomic text exceeds platform limit"}
+        chunks = [message]
+    elif max_len:
         _len_fn = utf16_len if platform == Platform.TELEGRAM else None
         chunks = BasePlatformAdapter.truncate_message(message, max_len, len_fn=_len_fn)
     else:
@@ -1933,6 +1953,11 @@ async def _send_weixin(pconfig, chat_id, message, media_files=None):
             chat_id=chat_id,
             message=message,
             media_files=media_files,
+            metadata=(
+                {"durable_preformatted_atomic_text": True}
+                if getattr(pconfig, "_durable_preformatted_atomic_text", False)
+                else None
+            ),
         )
     except Exception as e:
         return _error(f"Weixin send failed: {e}")

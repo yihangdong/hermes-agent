@@ -31,7 +31,13 @@ def _patch_pipeline(monkeypatch, *, success=True, output="out", final="final res
         calls.append(("deliver", job["id"]))
         return None
 
-    def fake_mark(jid, ok, err=None, delivery_error=None):
+    def fake_mark(
+        jid,
+        ok,
+        err=None,
+        delivery_error=None,
+        delivery_execution_id=None,
+    ):
         calls.append(("mark", jid, ok))
 
     monkeypatch.setattr(s, "run_job", fake_run_job)
@@ -64,6 +70,45 @@ def test_run_one_job_success_sequence(monkeypatch):
     assert ok is True
     assert [c[0] for c in calls] == ["run_job", "save", "deliver", "mark"]
     assert calls[-1] == ("mark", "j2", True)
+
+
+def test_run_one_job_fences_delivery_status_with_execution_id(monkeypatch):
+    """Production run bookkeeping must bind delivery state to its execution."""
+    captured = {}
+
+    monkeypatch.setattr(
+        s,
+        "create_execution",
+        lambda job_id, source: {"id": "exec-delivery-fence-1"},
+    )
+    monkeypatch.setattr(s, "mark_execution_running", lambda execution_id: None)
+    monkeypatch.setattr(s, "finish_execution", lambda *args, **kwargs: None)
+    monkeypatch.setattr(
+        s,
+        "run_job",
+        lambda job, *, defer_agent_teardown=None: (
+            True,
+            "output",
+            "owner report",
+            None,
+        ),
+    )
+    monkeypatch.setattr(s, "save_job_output", lambda job_id, output: "/tmp/out")
+    monkeypatch.setattr(s, "_deliver_result", lambda *args, **kwargs: "rate limited")
+
+    def capture_mark(job_id, success, error=None, **kwargs):
+        captured.update(
+            job_id=job_id,
+            success=success,
+            error=error,
+            **kwargs,
+        )
+
+    monkeypatch.setattr(s, "mark_job_run", capture_mark)
+
+    assert s.run_one_job({"id": "j2-fenced", "name": "t"}) is True
+    assert captured["delivery_error"] == "rate limited"
+    assert captured["delivery_execution_id"] == "exec-delivery-fence-1"
 
 
 def test_run_one_job_silent_skips_delivery(monkeypatch):
@@ -110,7 +155,7 @@ def test_run_one_job_exception_marks_failure(monkeypatch):
     marks = []
     monkeypatch.setattr(
         s, "mark_job_run",
-        lambda jid, ok, err=None, delivery_error=None: marks.append((jid, ok)),
+        lambda jid, ok, err=None, delivery_error=None, delivery_execution_id=None: marks.append((jid, ok)),
     )
 
     ok = s.run_one_job({"id": "j6", "name": "t"})

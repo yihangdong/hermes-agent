@@ -98,7 +98,9 @@ def _concurrent_claim_worker(db: str, spool: str, start, release, results) -> No
 
 
 def test_owner_liveness_uses_cross_platform_probe_not_os_kill_zero() -> None:
-    source = (Path(__file__).parents[2] / "cron" / "durable_delivery.py").read_text()
+    source = (Path(__file__).parents[2] / "cron" / "durable_delivery.py").read_text(
+        encoding="utf-8"
+    )
 
     assert "os.kill(" not in source
     assert "_pid_exists" in source
@@ -129,13 +131,426 @@ def test_enqueue_claim_and_ack_are_durable_and_fenced(tmp_path: Path) -> None:
         provider_message_id="provider-ack-1",
         now=101.0,
     )
-    assert outbox.get(record.obligation_id).state == "delivered"
+    terminal = outbox.get(record.obligation_id)
+    assert (terminal.state, terminal.attempts, terminal.provider_message_id) == (
+        "delivered",
+        1,
+        "provider-ack-1",
+    )
 
     with pytest.raises(ClaimLost):
         outbox.mark_failed(claim, error="late failure", retryable=True, now=102.0)
     assert outbox.get(record.obligation_id).state == "delivered"
 
     outbox.close()
+
+
+def test_all_delivered_marker_revalidates_sibling_execution_scope(tmp_path: Path) -> None:
+    db = tmp_path / "state.db"
+    outbox = StructuredDeliveryOutbox(db, tmp_path / "spool")
+    first = _text_unit("exec-marker-scope", "weixin:owner")
+    first.update(unit_index=0, logical_platform="weixin", chat_id="owner")
+    second = dict(first)
+    second.update(unit_index=1)
+    first_record, second_record = outbox.enqueue_batch([first, second], now=100.0)
+    claim = outbox.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=101.0,
+        obligation_id=first_record.obligation_id,
+    )
+    assert claim is not None
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE cron_delivery_outbox_v2 SET execution_id=? WHERE obligation_id=?",
+            ("exec-diverted", second_record.obligation_id),
+        )
+        conn.commit()
+
+    outbox.mark_delivered(claim, provider_message_id="ack-first", now=102.0)
+
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT execution_id, job_id FROM cron_delivery_job_status_sync_v2"
+        ).fetchall() == []
+        assert conn.execute(
+            "SELECT state FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+            (second_record.obligation_id,),
+        ).fetchone() == ("pending",)
+
+
+def test_chunk_claims_require_delivered_predecessors_in_unit_order(tmp_path: Path) -> None:
+    outbox = StructuredDeliveryOutbox(tmp_path / "state.db", tmp_path / "spool")
+    first = _text_unit("exec-ordered", "weixin:owner")
+    first.update(unit_index=0, logical_platform="weixin", chat_id="owner")
+
+    # Choose second-chunk bytes whose content-addressed obligation id sorts before
+    # the predecessor.  This proves recovery does not rely on hash ordering.
+    second = None
+    first_id = outbox._canonical_payload(first)[0]
+    for suffix in range(1000):
+        candidate = dict(first)
+        content = f"second-{suffix}"
+        candidate.update(
+            unit_index=1,
+            content=content,
+            content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+            provider_content=content,
+            provider_content_sha256=hashlib.sha256(content.encode()).hexdigest(),
+        )
+        if outbox._canonical_payload(candidate)[0] < first_id:
+            second = candidate
+            break
+    assert second is not None
+
+    outbox.enqueue_batch([first, second], now=100.0)
+    claim = outbox.claim_next(owner_pid=123, owner_started_at=45.0, now=100.0)
+    assert claim is not None
+    assert claim.payload["unit_index"] == 0
+
+    # A definitive predecessor failure is terminal for that provider-visible
+    # sequence.  The successor must remain unclaimable, not leapfrog it.
+    outbox.mark_failed(
+        claim,
+        error="provider rejected predecessor",
+        retryable=False,
+        now=101.0,
+    )
+    assert outbox.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=102.0,
+    ) is None
+
+
+def test_tampered_predecessor_cannot_authorize_targeted_successor_claim(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.db"
+    outbox = StructuredDeliveryOutbox(db, tmp_path / "spool")
+    predecessor = _text_unit("exec-tampered-order", "weixin:owner")
+    predecessor.update(unit_index=0, logical_platform="weixin", chat_id="owner")
+    successor = dict(predecessor)
+    successor.update(unit_index=1)
+    predecessor_record, successor_record = outbox.enqueue_batch(
+        [predecessor, successor], now=100.0
+    )
+    with sqlite3.connect(db) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+                (predecessor_record.obligation_id,),
+            ).fetchone()[0]
+        )
+        payload["unit_index"] = 99
+        conn.execute(
+            "UPDATE cron_delivery_outbox_v2 SET payload_json=? WHERE obligation_id=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                predecessor_record.obligation_id,
+            ),
+        )
+        conn.commit()
+
+    claim = outbox.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=101.0,
+        obligation_id=successor_record.obligation_id,
+    )
+    with sqlite3.connect(db) as conn:
+        predecessor_state = conn.execute(
+            "SELECT state, attempts, owner_pid, claim_token "
+            "FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+            (predecessor_record.obligation_id,),
+        ).fetchone()
+        successor_state = conn.execute(
+            "SELECT state, attempts, owner_pid, claim_token "
+            "FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+            (successor_record.obligation_id,),
+        ).fetchone()
+        lease_count = conn.execute(
+            "SELECT COUNT(*) FROM cron_delivery_recovery_lease_v2"
+        ).fetchone()[0]
+
+    assert (claim, predecessor_state, successor_state, lease_count) == (
+        None,
+        ("abandoned", 0, None, None),
+        ("pending", 0, None, None),
+        0,
+    )
+
+
+def test_tampered_predecessor_scope_columns_cannot_escape_targeted_claim(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.db"
+    outbox = StructuredDeliveryOutbox(db, tmp_path / "spool")
+    predecessor = _text_unit("exec-tampered-scope", "weixin:owner")
+    predecessor.update(unit_index=0, logical_platform="weixin", chat_id="owner")
+    successor = dict(predecessor)
+    successor.update(unit_index=1)
+    predecessor_record, successor_record = outbox.enqueue_batch(
+        [predecessor, successor], now=100.0
+    )
+    with sqlite3.connect(db) as conn:
+        payload = json.loads(
+            conn.execute(
+                "SELECT payload_json FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+                (predecessor_record.obligation_id,),
+            ).fetchone()[0]
+        )
+        payload["unit_index"] = 99
+        conn.execute(
+            "UPDATE cron_delivery_outbox_v2 "
+            "SET payload_json=?, execution_id=?, canonical_target=? "
+            "WHERE obligation_id=?",
+            (
+                json.dumps(payload, sort_keys=True, separators=(",", ":")),
+                "exec-forged",
+                "weixin:forged",
+                predecessor_record.obligation_id,
+            ),
+        )
+        conn.commit()
+
+    claim = outbox.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=101.0,
+        obligation_id=successor_record.obligation_id,
+    )
+    with sqlite3.connect(db) as conn:
+        predecessor_state = conn.execute(
+            "SELECT state, attempts, owner_pid, claim_token "
+            "FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+            (predecessor_record.obligation_id,),
+        ).fetchone()
+        successor_state = conn.execute(
+            "SELECT state, attempts, owner_pid, claim_token "
+            "FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+            (successor_record.obligation_id,),
+        ).fetchone()
+        lease_count = conn.execute(
+            "SELECT COUNT(*) FROM cron_delivery_recovery_lease_v2"
+        ).fetchone()[0]
+
+    assert (claim, predecessor_state, successor_state, lease_count) == (
+        None,
+        ("abandoned", 0, None, None),
+        ("pending", 0, None, None),
+        0,
+    )
+
+
+def test_forged_capsule_and_digest_cannot_relocate_corrupt_predecessor_after_reopen(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.db"
+    spool = tmp_path / "spool"
+    outbox = StructuredDeliveryOutbox(db, spool)
+    predecessor = _text_unit("exec-forged-capsule", "weixin:owner")
+    predecessor.update(unit_index=0, logical_platform="weixin", chat_id="owner")
+    successor = dict(predecessor)
+    successor.update(unit_index=1)
+    predecessor_record, successor_record = outbox.enqueue_batch(
+        [predecessor, successor], now=100.0
+    )
+    with sqlite3.connect(db) as conn:
+        capsule = json.loads(
+            conn.execute(
+                "SELECT scope_capsule_json FROM cron_delivery_outbox_v2 "
+                "WHERE obligation_id=?",
+                (predecessor_record.obligation_id,),
+            ).fetchone()[0]
+        )
+        capsule["execution_id"] = "exec-unrelated"
+        capsule["canonical_target"] = "weixin:unrelated"
+        encoded = json.dumps(
+            capsule, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        digest = hashlib.sha256(
+            f"cron-scope-v{capsule['version']}\0".encode("ascii")
+            + encoded.encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            """UPDATE cron_delivery_outbox_v2
+               SET payload_json='{malformed', execution_id=?, canonical_target=?,
+                   scope_capsule_json=?, scope_capsule_sha256=?
+               WHERE obligation_id=?""",
+            (
+                capsule["execution_id"],
+                capsule["canonical_target"],
+                encoded,
+                digest,
+                predecessor_record.obligation_id,
+            ),
+        )
+        conn.commit()
+    outbox.close()
+
+    try:
+        reopened = StructuredDeliveryOutbox(db, spool)
+    except OutboxError:
+        # Unscoped corruption may block startup globally; it must never authorize
+        # the relocated scope's successor.
+        return
+    claim = reopened.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=101.0,
+        obligation_id=successor_record.obligation_id,
+    )
+    assert claim is None
+
+
+def test_legacy_scope_capsule_migrates_only_from_authenticated_canonical_row(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.db"
+    spool = tmp_path / "spool"
+    outbox = StructuredDeliveryOutbox(db, spool)
+    [record] = outbox.enqueue_batch([_text_unit("exec-legacy-capsule")], now=100.0)
+    with sqlite3.connect(db) as conn:
+        current = json.loads(
+            conn.execute(
+                "SELECT scope_capsule_json FROM cron_delivery_outbox_v2 "
+                "WHERE obligation_id=?",
+                (record.obligation_id,),
+            ).fetchone()[0]
+        )
+        legacy = {
+            key: current[key]
+            for key in (
+                "obligation_id",
+                "execution_id",
+                "job_id",
+                "canonical_target",
+                "target_index",
+                "unit_index",
+            )
+        }
+        legacy["version"] = 1
+        encoded = json.dumps(
+            legacy, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        digest = hashlib.sha256(
+            b"cron-scope-v1\0" + encoded.encode("utf-8")
+        ).hexdigest()
+        conn.execute(
+            "UPDATE cron_delivery_outbox_v2 SET scope_capsule_json=?, "
+            "scope_capsule_sha256=? WHERE obligation_id=?",
+            (encoded, digest, record.obligation_id),
+        )
+        conn.commit()
+    outbox.close()
+
+    reopened = StructuredDeliveryOutbox(db, spool)
+    assert reopened.get(record.obligation_id).payload["execution_id"] == (
+        "exec-legacy-capsule"
+    )
+    with sqlite3.connect(db) as conn:
+        migrated = json.loads(
+            conn.execute(
+                "SELECT scope_capsule_json FROM cron_delivery_outbox_v2 "
+                "WHERE obligation_id=?",
+                (record.obligation_id,),
+            ).fetchone()[0]
+        )
+    assert migrated["version"] == 2
+    assert migrated["payload_hash"]
+    assert migrated["transport_kind"] == "native"
+
+
+def test_completion_marker_reauthenticates_delivered_sibling_payload(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.db"
+    outbox = StructuredDeliveryOutbox(db, tmp_path / "spool")
+    first = _text_unit("exec-corrupt-delivered", "weixin:owner")
+    first.update(unit_index=0, logical_platform="weixin", chat_id="owner")
+    second = dict(first)
+    second.update(unit_index=1)
+    first_record, second_record = outbox.enqueue_batch([first, second], now=100.0)
+
+    first_claim = outbox.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=101.0,
+        obligation_id=first_record.obligation_id,
+    )
+    assert first_claim is not None
+    outbox.mark_delivered(first_claim, provider_message_id="ack-first", now=102.0)
+    second_claim = outbox.claim_next(
+        owner_pid=123,
+        owner_started_at=45.0,
+        now=103.0,
+        obligation_id=second_record.obligation_id,
+    )
+    assert second_claim is not None
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE cron_delivery_outbox_v2 SET payload_json='{malformed' "
+            "WHERE obligation_id=?",
+            (first_record.obligation_id,),
+        )
+        conn.commit()
+
+    outbox.mark_delivered(second_claim, provider_message_id="ack-second", now=104.0)
+
+    with sqlite3.connect(db) as conn:
+        markers = conn.execute(
+            "SELECT execution_id, job_id FROM cron_delivery_job_status_sync_v2"
+        ).fetchall()
+    assert markers == []
+
+
+def test_malformed_predecessor_blocks_its_target_but_not_unrelated_target(
+    tmp_path: Path,
+) -> None:
+    db = tmp_path / "state.db"
+    outbox = StructuredDeliveryOutbox(db, tmp_path / "spool")
+    predecessor = _text_unit("exec-malformed-order", "weixin:blocked")
+    predecessor.update(unit_index=0, logical_platform="weixin", chat_id="blocked")
+    successor = dict(predecessor)
+    successor.update(unit_index=1)
+    predecessor_record, successor_record = outbox.enqueue_batch(
+        [predecessor, successor], now=100.0
+    )
+    unrelated = _text_unit("exec-malformed-order", "weixin:unrelated")
+    unrelated.update(
+        target_index=1,
+        unit_index=0,
+        logical_platform="weixin",
+        chat_id="unrelated",
+    )
+    [unrelated_record] = outbox.enqueue_batch([unrelated], now=101.0)
+    with sqlite3.connect(db) as conn:
+        conn.execute(
+            "UPDATE cron_delivery_outbox_v2 SET payload_json=? WHERE obligation_id=?",
+            ("{malformed", predecessor_record.obligation_id),
+        )
+        conn.commit()
+
+    claim = outbox.claim_next(owner_pid=123, owner_started_at=45.0, now=101.0)
+    with sqlite3.connect(db) as conn:
+        states = dict(
+            conn.execute(
+                "SELECT obligation_id, state FROM cron_delivery_outbox_v2"
+            ).fetchall()
+        )
+        lease = conn.execute(
+            "SELECT obligation_id FROM cron_delivery_recovery_lease_v2"
+        ).fetchone()
+
+    assert claim is not None
+    assert claim.obligation_id == unrelated_record.obligation_id
+    assert states == {
+        predecessor_record.obligation_id: "abandoned",
+        successor_record.obligation_id: "pending",
+        unrelated_record.obligation_id: "attempting",
+    }
+    assert lease == (unrelated_record.obligation_id,)
 
 
 def test_obligation_identity_binds_provider_visible_payload_hash(tmp_path: Path) -> None:
@@ -673,7 +1088,27 @@ def test_stale_claim_token_cannot_complete_after_same_generation_transfers_owner
 
     with pytest.raises(ClaimLost):
         outbox.mark_delivered(stale, provider_message_id="stale-ack", now=102.0)
+    with sqlite3.connect(db) as conn:
+        stale_result = conn.execute(
+            "SELECT state, attempts, provider_message_id, claim_token "
+            "FROM cron_delivery_outbox_v2 WHERE obligation_id=?",
+            (record.obligation_id,),
+        ).fetchone()
+        lease = conn.execute(
+            "SELECT obligation_id, generation, claim_token "
+            "FROM cron_delivery_recovery_lease_v2 WHERE singleton=1"
+        ).fetchone()
+    assert stale_result == ("attempting", 2, None, current.claim_token)
+    assert lease == (record.obligation_id, current.generation, current.claim_token)
+
     outbox.mark_delivered(current, provider_message_id="current-ack", now=103.0)
     durable = outbox.get(record.obligation_id)
-    assert durable.state == "delivered"
-    assert durable.provider_message_id == "current-ack"
+    assert (durable.state, durable.attempts, durable.provider_message_id) == (
+        "delivered",
+        2,
+        "current-ack",
+    )
+    with sqlite3.connect(db) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM cron_delivery_recovery_lease_v2"
+        ).fetchone()[0] == 0

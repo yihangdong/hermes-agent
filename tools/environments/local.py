@@ -254,6 +254,10 @@ def _build_provider_env_blocklist() -> frozenset:
         "OPENAI_ORG_ID",
         "OPENAI_ORGANIZATION",
         "OPENROUTER_API_KEY",
+        # Nous Portal is a plugin provider and is not present in the legacy
+        # hermes_cli.auth registry used above.  It is still a Hermes-managed
+        # inference credential and must never reach terminal/cron children.
+        "NOUS_API_KEY",
         "ANTHROPIC_BASE_URL",
         "ANTHROPIC_API_KEY",
         "ANTHROPIC_TOKEN",

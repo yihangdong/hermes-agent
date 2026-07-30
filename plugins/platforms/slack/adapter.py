@@ -10,9 +10,11 @@ Uses slack-bolt (Python) with Socket Mode for:
 
 import asyncio
 import contextvars
+import hashlib
 import inspect
 import json
 import logging
+import math
 import os
 import re
 import time
@@ -2453,10 +2455,23 @@ class SlackAdapter(BasePlatformAdapter):
         if not self._app:
             return SendResult(success=False, error="Not connected")
 
+        atomic_preformatted = bool(
+            (metadata or {}).get("durable_preformatted_atomic_text")
+        )
+        if atomic_preformatted and str(chat_id)[:1] in ("U", "W"):
+            return SendResult(
+                success=False,
+                error=(
+                    "durable Slack atomic delivery requires a pre-resolved "
+                    "channel ID"
+                ),
+                error_kind="bad_format",
+            )
         chat_id = await self._ensure_dm_conversation(
             chat_id, team_id=self._metadata_team_id(metadata)
         )
         thread_ts = None
+        provider_call_started = False
         try:
             team_id = self._metadata_team_id(metadata)
             # Check for a pending slash-command context.  When the user ran a
@@ -2464,7 +2479,11 @@ class SlackAdapter(BasePlatformAdapter):
             # already showed an ephemeral "Running /cmd…" message.  If we have
             # a stashed response_url for this channel, replace that ack with
             # the actual command reply ephemerally instead of posting publicly.
-            slash_ctx = self._pop_slash_context(chat_id, team_id)
+            slash_ctx = (
+                None
+                if atomic_preformatted
+                else self._pop_slash_context(chat_id, team_id)
+            )
             if slash_ctx:
                 ephemeral_result = await self._send_slash_ephemeral(
                     slash_ctx,
@@ -2508,8 +2527,10 @@ class SlackAdapter(BasePlatformAdapter):
                 )
                 return fallback_result
 
-            # Convert standard markdown → Slack mrkdwn
-            formatted = self.format_message(content)
+            # Durable provider chunks are already final Slack mrkdwn bytes.
+            # Re-formatting or re-splitting here would put multiple provider
+            # side effects behind one outbox obligation.
+            formatted = content if atomic_preformatted else self.format_message(content)
 
             # Guard against empty/whitespace-only messages — Slack API
             # returns ``no_text`` for chat.postMessage with blank text.
@@ -2521,8 +2542,17 @@ class SlackAdapter(BasePlatformAdapter):
                 await self._clear_thread_status_quietly(chat_id, metadata)
                 return SendResult(success=True)
 
-            # Split long messages, preserving code block boundaries
-            chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
+            if atomic_preformatted:
+                if len(formatted) > self.MAX_MESSAGE_LENGTH:
+                    return SendResult(
+                        success=False,
+                        error="durable Slack atomic provider chunk exceeds limit",
+                        error_kind="bad_format",
+                    )
+                chunks = [formatted]
+            else:
+                # Split long messages, preserving code block boundaries.
+                chunks = self.truncate_message(formatted, self.MAX_MESSAGE_LENGTH)
 
             thread_ts = self._resolve_thread_ts(reply_to, metadata)
             last_result = None
@@ -2536,7 +2566,11 @@ class SlackAdapter(BasePlatformAdapter):
             # that had to be split is pathological for Block Kit's 50-block /
             # 3000-char limits, so those fall back to plain text. The ``text``
             # field is always kept as the notification/accessibility fallback.
-            blocks = self._maybe_blocks(content) if len(chunks) == 1 else None
+            blocks = (
+                None
+                if atomic_preformatted
+                else self._maybe_blocks(content) if len(chunks) == 1 else None
+            )
 
             for i, chunk in enumerate(chunks):
                 kwargs = {
@@ -2553,6 +2587,7 @@ class SlackAdapter(BasePlatformAdapter):
                         kwargs["reply_broadcast"] = True
 
                 try:
+                    provider_call_started = True
                     last_result = await self._get_client(
                         chat_id, team_id=team_id
                     ).chat_postMessage(**kwargs)
@@ -2564,6 +2599,7 @@ class SlackAdapter(BasePlatformAdapter):
                             "[Slack] Block Kit payload rejected; retrying send without blocks: %s",
                             e,
                         )
+                        provider_call_started = True
                         last_result = await self._get_client(
                             chat_id, team_id=team_id
                         ).chat_postMessage(**retry_kwargs)
@@ -2577,6 +2613,15 @@ class SlackAdapter(BasePlatformAdapter):
             # Track the sent message ts so we can auto-respond to thread
             # replies without requiring @mention.
             sent_ts = last_result.get("ts") if last_result else None
+            if (metadata or {}).get("_durable_delivery") and not sent_ts:
+                return SendResult(
+                    success=False,
+                    error=(
+                        "ACK_UNKNOWN: Slack chat_postMessage returned no provider "
+                        "receipt"
+                    ),
+                    raw_response=last_result,
+                )
             if sent_ts:
                 self._bot_message_ts.add(
                     self._workspace_message_marker(team_id, sent_ts)
@@ -2613,9 +2658,28 @@ class SlackAdapter(BasePlatformAdapter):
                             _retry_after = float(_ra)
                     except (TypeError, ValueError, AttributeError):
                         pass
+            _error = str(e)
+            _response = getattr(e, "response", None)
+            _response_data = getattr(_response, "data", _response)
+            _definitive_response = (
+                isinstance(_response_data, dict)
+                and _response_data.get("ok") is False
+            ) or getattr(_response, "status_code", None) is not None
+            if (
+                (metadata or {}).get("_durable_delivery")
+                and provider_call_started
+                and not _definitive_response
+            ):
+                detail = _error.strip() or type(e).__name__
+                _error = (
+                    "ACK_UNKNOWN: Slack chat_postMessage provider outcome is "
+                    f"ambiguous: {detail}"
+                )
+                _retryable = False
+                _retry_after = None
             return SendResult(
                 success=False,
-                error=str(e),
+                error=_error,
                 retryable=_retryable,
                 retry_after=_retry_after,
             )
@@ -8546,6 +8610,7 @@ async def _standalone_upload_file(
     *,
     initial_comment: str = "",
     thread_id: Optional[str] = None,
+    require_receipt: bool = False,
 ) -> Dict[str, Any]:
     """Upload one local file via ``files_upload_v2`` (same API as the live adapter)."""
     kwargs: Dict[str, Any] = {
@@ -8572,8 +8637,58 @@ async def _standalone_upload_file(
                         break
             if message_id:
                 break
-        message_id = message_id or file_obj.get("timestamp") or result.get("ts")
+        message_id = (
+            message_id
+            or file_obj.get("timestamp")
+            or file_obj.get("id")
+            or result.get("ts")
+        )
+        if message_id is None:
+            files = result.get("files") or []
+            if isinstance(files, list):
+                message_id = next(
+                    (
+                        item.get("id")
+                        for item in files
+                        if isinstance(item, dict) and item.get("id")
+                    ),
+                    None,
+                )
+    if message_id is None and require_receipt:
+        return {
+            "error": (
+                "ACK_UNKNOWN: Slack files_upload_v2 provider operation returned "
+                "no provider receipt"
+            )
+        }
     return {"success": True, "message_id": message_id, "raw": result}
+
+
+def _standalone_token_candidates(pconfig) -> List[str]:
+    """Resolve standalone Slack credentials in deterministic provider order."""
+    raw_token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
+    tokens = [token.strip() for token in str(raw_token or "").split(",") if token.strip()]
+    try:
+        from hermes_constants import get_hermes_home
+
+        tokens_file = get_hermes_home() / "slack_tokens.json"
+        if tokens_file.exists():
+            saved = json.loads(tokens_file.read_text(encoding="utf-8"))
+            for entry in saved.values():
+                token = entry.get("token", "") if isinstance(entry, dict) else ""
+                if token and token not in tokens:
+                    tokens.append(token)
+    except Exception:
+        pass
+    return tokens
+
+
+def _standalone_token_identity_sha256(pconfig) -> str:
+    """Hash only the uniquely selected durable standalone credential."""
+    tokens = _standalone_token_candidates(pconfig)
+    if not tokens:
+        return "missing"
+    return hashlib.sha256(tokens[0].encode("utf-8")).hexdigest()
 
 
 async def _standalone_send(
@@ -8606,29 +8721,34 @@ async def _standalone_send(
     ``chat.postMessage``.
     """
     del force_document  # signature parity with other standalone senders
-    raw_token = getattr(pconfig, "token", None) or os.getenv("SLACK_BOT_TOKEN", "")
-
-    # ``SLACK_BOT_TOKEN`` can be a comma-separated list in multi-workspace
-    # gateways, and OAuth installs persist per-workspace tokens in
-    # slack_tokens.json. The standalone path has no team→client map, so try
-    # each token individually instead of sending the literal comma-joined
-    # string, which Slack rejects as ``invalid_auth`` (#47547).
-    tokens = [t.strip() for t in str(raw_token or "").split(",") if t.strip()]
-    try:
-        from hermes_constants import get_hermes_home
-
-        _tokens_file = get_hermes_home() / "slack_tokens.json"
-        if _tokens_file.exists():
-            _saved = json.loads(_tokens_file.read_text(encoding="utf-8"))
-            for _entry in _saved.values():
-                _tok = _entry.get("token", "") if isinstance(_entry, dict) else ""
-                if _tok and _tok not in tokens:
-                    tokens.append(_tok)
-    except Exception:
-        pass
+    durable_delivery = bool(getattr(pconfig, "_durable_delivery", False))
+    tokens = _standalone_token_candidates(pconfig)
     if not tokens:
         return {"error": "Slack send failed: SLACK_BOT_TOKEN not configured"}
     token = tokens[0]
+    media_files = media_files or []
+    atomic_preformatted = bool(
+        getattr(pconfig, "_durable_preformatted_atomic_text", False)
+    )
+    if atomic_preformatted:
+        if media_files:
+            return {
+                "error": (
+                    "durable Slack atomic text cannot include media inside the "
+                    "same obligation"
+                )
+            }
+        if not message or not message.strip():
+            return {"error": "durable Slack atomic provider chunk is empty"}
+        if len(message) > SlackAdapter.MAX_MESSAGE_LENGTH:
+            return {"error": "durable Slack atomic provider chunk exceeds limit"}
+        if str(chat_id)[:1] in ("U", "W"):
+            return {
+                "error": (
+                    "durable Slack atomic delivery requires a pre-resolved "
+                    "channel ID"
+                )
+            }
 
     # User-targeted delivery: chat.postMessage / files_upload_v2 reject bare
     # user IDs (U.../W...) — resolve to a DM conversation ID (D...) first via
@@ -8637,7 +8757,8 @@ async def _standalone_send(
     chat_id = str(chat_id or "")
     if chat_id[:1] in ("U", "W"):
         resolved = None
-        for _tok in tokens:
+        resolution_tokens = tokens[:1] if durable_delivery else tokens
+        for _tok in resolution_tokens:
             resolved = await _resolve_slack_user_dm(_tok, chat_id)
             if resolved is not None:
                 token = _tok
@@ -8652,7 +8773,6 @@ async def _standalone_send(
         chat_id = resolved
 
 
-    media_files = media_files or []
     warnings: List[str] = []
 
     def _format_mrkdwn(text: str) -> str:
@@ -8668,7 +8788,11 @@ async def _standalone_send(
             )
             return text
 
-    formatted = _format_mrkdwn(message) if message else message
+    formatted = (
+        message
+        if atomic_preformatted
+        else _format_mrkdwn(message) if message else message
+    )
     formatted_caption = _format_mrkdwn(caption) if caption else caption
 
     # --- Media path: AsyncWebClient.files_upload_v2 (+ optional text) ---
@@ -8746,8 +8870,11 @@ async def _standalone_send(
                     media_path,
                     initial_comment=formatted_caption if caption_pending else "",
                     thread_id=thread_id,
+                    require_receipt=durable_delivery,
                 )
                 if upload_result.get("error"):
+                    if str(upload_result["error"]).startswith("ACK_UNKNOWN:"):
+                        return {"error": str(upload_result["error"])}
                     warnings.append(
                         f"Failed to send media {media_path}: {upload_result['error']}"
                     )
@@ -8756,6 +8883,23 @@ async def _standalone_send(
                 caption_pending = False
                 last_message_id = upload_result.get("message_id") or last_message_id
             except Exception as e:
+                response = getattr(e, "response", None)
+                response_data = getattr(response, "data", response)
+                if isinstance(response_data, dict) and response_data.get("ok") is False:
+                    return {
+                        "error": (
+                            "Slack API error: "
+                            f"{response_data.get('error', type(e).__name__)}"
+                        )
+                    }
+                if durable_delivery:
+                    detail = str(e).strip() or type(e).__name__
+                    return {
+                        "error": (
+                            "ACK_UNKNOWN: Slack files_upload_v2 provider outcome is "
+                            f"ambiguous: {detail}"
+                        )
+                    }
                 warning = f"Failed to send media {media_path}: {e}"
                 logger.error("[Slack] %s", warning, exc_info=True)
                 warnings.append(warning)
@@ -8790,6 +8934,7 @@ async def _standalone_send(
     except ImportError:
         return {"error": "aiohttp not installed. Run: pip install aiohttp"}
 
+    provider_call_started = False
     try:
         from gateway.platforms.base import proxy_kwargs_for_aiohttp
 
@@ -8813,15 +8958,23 @@ async def _standalone_send(
             payload = {"channel": chat_id, "text": formatted, "mrkdwn": True}
             if thread_id:
                 payload["thread_ts"] = thread_id
-            for tok in tokens:
+            attempt_tokens = tokens[:1] if durable_delivery else tokens
+            for tok in attempt_tokens:
                 headers = {
                     "Authorization": f"Bearer {tok}",
                     "Content-Type": "application/json",
                 }
+                provider_call_started = True
                 async with session.post(
                     url, headers=headers, json=payload, **_req_kw
                 ) as resp:
                     data = await resp.json()
+                    response_headers = getattr(resp, "headers", {})
+                    raw_retry_after = (
+                        response_headers.get("Retry-After")
+                        if hasattr(response_headers, "get")
+                        else None
+                    )
                 if data.get("ok"):
                     return {
                         "success": True,
@@ -8830,10 +8983,39 @@ async def _standalone_send(
                         "message_id": data.get("ts"),
                     }
                 last_error = data.get("error", "unknown")
+                if last_error == "ratelimited":
+                    retry_after = None
+                    try:
+                        parsed_retry_after = float(raw_retry_after)
+                    except (TypeError, ValueError):
+                        pass
+                    else:
+                        if math.isfinite(parsed_retry_after) and parsed_retry_after > 0:
+                            retry_after = parsed_retry_after
+                    result = {
+                        "error": "Slack API error: ratelimited",
+                        "error_kind": "rate_limited",
+                    }
+                    if retry_after is not None:
+                        result["retry_after"] = retry_after
+                    return result
                 if last_error not in retryable_token_errors:
                     break
         return {"error": f"Slack API error: {last_error}"}
     except Exception as e:
+        response = getattr(e, "response", None)
+        response_data = getattr(response, "data", response)
+        definitive_response = (
+            isinstance(response_data, dict) and response_data.get("ok") is False
+        )
+        if durable_delivery and provider_call_started and not definitive_response:
+            detail = str(e).strip() or type(e).__name__
+            return {
+                "error": (
+                    "ACK_UNKNOWN: Slack chat.postMessage provider outcome is "
+                    f"ambiguous: {detail}"
+                )
+            }
         return {"error": f"Slack send failed: {e}"}
 
 

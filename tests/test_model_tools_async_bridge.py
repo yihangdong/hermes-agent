@@ -12,6 +12,11 @@ The fix replaces asyncio.run() with a persistent event loop in _run_async().
 
 import asyncio
 import json
+import os
+from pathlib import Path
+import signal
+import subprocess
+import sys
 import threading
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -38,6 +43,40 @@ async def _create_and_return_transport():
     fut = loop.create_future()
     fut.set_result("ok")
     return loop, fut
+
+
+def _run_bounded_python(script, *, timeout=2.0):
+    """Run an isolated regression child with bounded TERM-to-KILL cleanup."""
+    repo = Path(__file__).resolve().parents[1]
+    env = os.environ.copy()
+    env["PYTHONDONTWRITEBYTECODE"] = "1"
+    proc = subprocess.Popen(
+        [sys.executable, "-W", "error", "-c", script],
+        cwd=repo,
+        env=env,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    timed_out = False
+    try:
+        stdout, stderr = proc.communicate(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        timed_out = True
+        try:
+            os.killpg(proc.pid, signal.SIGTERM)
+        except (ProcessLookupError, PermissionError):
+            proc.terminate()
+        try:
+            stdout, stderr = proc.communicate(timeout=0.25)
+        except subprocess.TimeoutExpired:
+            try:
+                os.killpg(proc.pid, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                proc.kill()
+            stdout, stderr = proc.communicate(timeout=0.25)
+    return proc.returncode, stdout, stderr, timed_out
 
 
 # ---------------------------------------------------------------------------
@@ -82,6 +121,489 @@ class TestRunAsyncLoopLifecycle:
         loop2 = _run_async(_get_current_loop())
         assert loop2 is loop, "Loop changed between calls"
         assert not loop.is_closed(), "Loop closed before second call"
+
+    def test_explicit_shutdown_is_idempotent_and_next_call_recreates_loop(self):
+        import model_tools
+
+        loop = model_tools._run_async(_get_current_loop())
+        model_tools._shutdown_persistent_tool_loops()
+        model_tools._shutdown_persistent_tool_loops()
+
+        assert loop.is_closed()
+        assert model_tools._tool_loop is None
+
+        replacement = model_tools._run_async(_get_current_loop())
+        assert replacement is not loop
+        assert not replacement.is_closed()
+
+    def test_process_exit_closes_persistent_loop_without_resource_warning(self):
+        repo = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error",
+                "-c",
+                (
+                    "import asyncio, model_tools; "
+                    "model_tools._run_async(asyncio.sleep(0))"
+                ),
+            ],
+            cwd=repo,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert "ResourceWarning" not in proc.stderr
+        assert "unclosed event loop" not in proc.stderr
+
+    def test_shutdown_rejects_new_loops_until_registry_is_closed(self, monkeypatch):
+        """A getter racing shutdown must fail, never escape its snapshot."""
+        import model_tools
+
+        loop = model_tools._get_tool_loop()
+        entered_close = threading.Event()
+        release_close = threading.Event()
+        real_close = model_tools._close_persistent_loop
+
+        def _blocking_close(target):
+            entered_close.set()
+            assert release_close.wait(5), "test did not release shutdown"
+            real_close(target)
+
+        monkeypatch.setattr(model_tools, "_close_persistent_loop", _blocking_close)
+        shutdown_errors = []
+        shutdown = threading.Thread(
+            target=lambda: _capture_exception(
+                model_tools._shutdown_persistent_tool_loops,
+                shutdown_errors,
+            )
+        )
+        shutdown.start()
+        assert entered_close.wait(5), "shutdown never owned the registry"
+
+        with pytest.raises(RuntimeError, match="shutting down"):
+            model_tools._get_tool_loop()
+
+        worker_errors = []
+        worker = threading.Thread(
+            target=lambda: _capture_exception(model_tools._get_worker_loop, worker_errors)
+        )
+        worker.start()
+        worker.join(5)
+        assert not worker.is_alive()
+        assert len(worker_errors) == 1
+        assert isinstance(worker_errors[0], RuntimeError)
+
+        release_close.set()
+        shutdown.join(5)
+        assert not shutdown.is_alive()
+        assert shutdown_errors == []
+        assert loop.is_closed()
+        assert model_tools._tool_loop is None
+        assert model_tools._worker_loops == set()
+
+    def test_run_async_closes_unstarted_coroutine_when_shutdown_gate_rejects(
+        self, monkeypatch
+    ):
+        """The bridge retains no ownership of a coroutine it cannot schedule."""
+        import model_tools
+
+        model_tools._get_tool_loop()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+        real_close = model_tools._close_persistent_loop
+
+        def _barrier_close(loop):
+            close_entered.set()
+            assert release_close.wait(2), "test did not release shutdown"
+            return real_close(loop)
+
+        monkeypatch.setattr(model_tools, "_close_persistent_loop", _barrier_close)
+        shutdown_errors = []
+        shutdown = threading.Thread(
+            target=lambda: _capture_exception(
+                model_tools._shutdown_persistent_tool_loops,
+                shutdown_errors,
+            )
+        )
+        shutdown.start()
+        assert close_entered.wait(2), "shutdown never closed the gate"
+
+        coro = _get_current_loop()
+        try:
+            with pytest.raises(RuntimeError, match="shutting down"):
+                model_tools._run_async(coro)
+            production_closed_coro = coro.cr_frame is None
+        finally:
+            if coro.cr_frame is not None:
+                coro.close()
+            release_close.set()
+            shutdown.join(2)
+
+        assert not shutdown.is_alive()
+        assert shutdown_errors == []
+        assert production_closed_coro
+
+    def test_shutdown_waits_for_active_worker_lease_then_closes_it(self):
+        """An active worker loop remains registered until its run completes."""
+        from concurrent.futures import ThreadPoolExecutor
+        import time
+        import model_tools
+
+        started = threading.Event()
+        release = threading.Event()
+
+        async def _held_run():
+            started.set()
+            while not release.is_set():
+                await asyncio.sleep(0.01)
+            return asyncio.get_running_loop()
+
+        with ThreadPoolExecutor(max_workers=1) as pool:
+            active = pool.submit(model_tools._run_async, _held_run())
+            assert started.wait(5)
+            shutdown_errors = []
+            shutdown = threading.Thread(
+                target=lambda: _capture_exception(
+                    model_tools._shutdown_persistent_tool_loops,
+                    shutdown_errors,
+                )
+            )
+            shutdown.start()
+            deadline = time.monotonic() + 5
+            while not model_tools._loop_shutdown_in_progress and time.monotonic() < deadline:
+                time.sleep(0.01)
+            assert model_tools._loop_shutdown_in_progress
+            assert shutdown.is_alive(), "shutdown detached an active loop"
+            with pytest.raises(RuntimeError, match="shutting down"):
+                model_tools._get_tool_loop()
+            release.set()
+            worker_loop = active.result(timeout=5)
+            shutdown.join(5)
+
+        assert not shutdown.is_alive()
+        assert shutdown_errors == []
+        assert worker_loop.is_closed()
+        assert model_tools._active_persistent_loop_runs == 0
+        assert model_tools._worker_loops == set()
+
+    def test_shutdown_from_active_lease_owner_fails_fast(self):
+        """A coroutine cannot wait for the persistent lease it currently owns."""
+        script = """
+import model_tools
+
+async def invoke_shutdown_from_owner():
+    try:
+        model_tools._shutdown_persistent_tool_loops()
+    except RuntimeError as exc:
+        assert "own active persistent loop lease" in str(exc), str(exc)
+    else:
+        raise AssertionError("same-owner shutdown unexpectedly succeeded")
+
+model_tools._run_async(invoke_shutdown_from_owner())
+assert model_tools._active_persistent_loop_runs == 0
+model_tools._shutdown_persistent_tool_loops()
+print("SELF_SHUTDOWN_FAIL_FAST_OK")
+"""
+        returncode, stdout, stderr, timed_out = _run_bounded_python(script)
+
+        assert not timed_out, "same-owner shutdown deadlocked on its own lease"
+        assert returncode == 0, stderr
+        assert stdout.strip() == "SELF_SHUTDOWN_FAIL_FAST_OK"
+        assert "ResourceWarning" not in stderr
+        assert "Task was destroyed" not in stderr
+
+    def test_shutdown_preserves_unleased_running_loop_reference(self):
+        """A foreign running private loop is rejected, not silently forgotten."""
+        import model_tools
+
+        loop = model_tools._get_tool_loop()
+        started = threading.Event()
+
+        def _run_forever():
+            asyncio.set_event_loop(loop)
+            started.set()
+            loop.run_forever()
+
+        owner = threading.Thread(target=_run_forever)
+        owner.start()
+        assert started.wait(5)
+        try:
+            with pytest.raises(RuntimeError, match="still running"):
+                model_tools._shutdown_persistent_tool_loops()
+            assert model_tools._tool_loop is loop
+            assert not loop.is_closed()
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            owner.join(5)
+        assert not owner.is_alive()
+
+        model_tools._shutdown_persistent_tool_loops()
+        assert loop.is_closed()
+        assert model_tools._tool_loop is None
+
+    def test_shutdown_keeps_reference_if_loop_starts_during_close(self, monkeypatch):
+        """Close/running TOCTOU must fail without detaching the live loop."""
+        import model_tools
+
+        loop = model_tools._get_tool_loop()
+        close_phase = threading.Event()
+        release_close = threading.Event()
+        owner_started = threading.Event()
+        real_close = loop.close
+
+        def _barrier_close():
+            close_phase.set()
+            assert release_close.wait(2), "test did not release close phase"
+            return real_close()
+
+        monkeypatch.setattr(loop, "close", _barrier_close)
+        errors = []
+        shutdown = threading.Thread(
+            target=lambda: _capture_exception(
+                model_tools._shutdown_persistent_tool_loops,
+                errors,
+            )
+        )
+        shutdown.start()
+        assert close_phase.wait(2), "shutdown never reached close phase"
+
+        def _foreign_owner():
+            asyncio.set_event_loop(loop)
+            owner_started.set()
+            loop.run_forever()
+
+        owner = threading.Thread(target=_foreign_owner)
+        owner.start()
+        assert owner_started.wait(2)
+        release_close.set()
+        shutdown.join(2)
+        assert not shutdown.is_alive(), "strict shutdown hung in close/running race"
+        retained = model_tools._tool_loop is loop
+        still_open = not loop.is_closed()
+
+        loop.call_soon_threadsafe(loop.stop)
+        owner.join(2)
+        assert not owner.is_alive()
+        monkeypatch.setattr(loop, "close", real_close)
+        if model_tools._tool_loop is loop:
+            model_tools._shutdown_persistent_tool_loops()
+        elif not loop.is_closed():
+            real_close()
+
+        assert len(errors) == 1
+        assert isinstance(errors[0], RuntimeError)
+        assert "running" in str(errors[0])
+        assert retained
+        assert still_open
+
+    def test_concurrent_shutdown_waiters_share_close_failure_generation(self, monkeypatch):
+        """A close failure is published to every waiter in that generation."""
+        import model_tools
+
+        loop = model_tools._get_tool_loop()
+        close_entered = threading.Event()
+        release_close = threading.Event()
+        waiter_bound = threading.Event()
+        real_close = loop.close
+        real_wait = model_tools._loop_lifecycle.wait
+        waiter_thread = None
+
+        def _failing_close():
+            close_entered.set()
+            assert release_close.wait(2), "test did not release injected close"
+            raise OSError("injected loop close failure")
+
+        def _observed_wait(timeout=None):
+            if threading.current_thread() is waiter_thread:
+                waiter_bound.set()
+            return real_wait(timeout)
+
+        monkeypatch.setattr(loop, "close", _failing_close)
+        monkeypatch.setattr(model_tools._loop_lifecycle, "wait", _observed_wait)
+        outcomes = {}
+
+        def _invoke(name):
+            try:
+                model_tools._shutdown_persistent_tool_loops()
+            except Exception as exc:
+                outcomes[name] = exc
+
+        owner = threading.Thread(target=_invoke, args=("owner",))
+        owner.start()
+        assert close_entered.wait(2), "owner never attempted close"
+        waiter_thread = threading.Thread(target=_invoke, args=("waiter",))
+        waiter_thread.start()
+        assert waiter_bound.wait(2), "second shutdown did not bind to generation"
+        release_close.set()
+        owner.join(2)
+        waiter_thread.join(2)
+        assert not owner.is_alive()
+        assert not waiter_thread.is_alive()
+
+        retained = model_tools._tool_loop is loop
+        still_open = not loop.is_closed()
+        monkeypatch.setattr(loop, "close", real_close)
+        model_tools._shutdown_persistent_tool_loops()
+
+        assert set(outcomes) == {"owner", "waiter"}
+        assert isinstance(outcomes["owner"], OSError)
+        assert outcomes["waiter"] is outcomes["owner"]
+        assert "injected loop close failure" in str(outcomes["owner"])
+        assert retained
+        assert still_open
+        assert loop.is_closed()
+        assert model_tools._tool_loop is None
+
+    def test_shutdown_cancels_and_drains_pending_tasks(self):
+        import model_tools
+
+        cancelled = threading.Event()
+
+        async def _pending_forever():
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cancelled.set()
+
+        async def _create_pending_task():
+            task = asyncio.create_task(_pending_forever())
+            await asyncio.sleep(0)
+            return task
+
+        task = model_tools._run_async(_create_pending_task())
+        loop = task.get_loop()
+        assert not task.done()
+
+        model_tools._shutdown_persistent_tool_loops()
+
+        assert cancelled.is_set()
+        assert task.cancelled()
+        assert loop.is_closed()
+
+    def test_strict_shutdown_bounds_noncooperative_cancel_and_reports_failure(self):
+        """Strict shutdown force-closes but reports a task that ignores cancel."""
+        script = """
+import asyncio
+import gc
+import time
+import model_tools
+
+async def ignores_cancel():
+    while True:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            continue
+
+async def create_stubborn_task():
+    task = asyncio.create_task(ignores_cancel())
+    await asyncio.sleep(0)
+    return task
+
+task = model_tools._run_async(create_stubborn_task())
+loop = task.get_loop()
+started = time.monotonic()
+try:
+    model_tools._shutdown_persistent_tool_loops()
+except RuntimeError as exc:
+    assert "did not quiesce" in str(exc), str(exc)
+else:
+    raise AssertionError("strict shutdown hid a noncooperative task")
+assert time.monotonic() - started < 1.0
+assert loop.is_closed()
+assert model_tools._tool_loop is None
+assert model_tools._active_persistent_loop_runs == 0
+del task
+gc.collect()
+print("BOUNDED_STRICT_SHUTDOWN_OK")
+"""
+        returncode, stdout, stderr, timed_out = _run_bounded_python(script)
+
+        assert not timed_out, "strict shutdown hung on cancellation suppression"
+        assert returncode == 0, stderr
+        assert stdout.strip() == "BOUNDED_STRICT_SHUTDOWN_OK"
+        assert "Task was destroyed" not in stderr
+        assert "was never awaited" not in stderr
+        assert "ResourceWarning" not in stderr
+        assert "unclosed event loop" not in stderr
+
+    def test_atexit_bounds_noncooperative_cancel_without_warning_tail(self):
+        """Atexit uses the bounded transaction but never raises or hangs."""
+        script = """
+import asyncio
+import model_tools
+
+async def ignores_cancel():
+    while True:
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            continue
+
+async def leave_pending():
+    task = asyncio.create_task(ignores_cancel())
+    await asyncio.sleep(0)
+    return task
+
+stubborn_task = model_tools._run_async(leave_pending())
+print("ATEXIT_BOUNDED_SHUTDOWN_OK")
+"""
+        returncode, stdout, stderr, timed_out = _run_bounded_python(script)
+
+        assert not timed_out, "atexit hung on cancellation suppression"
+        assert returncode == 0, stderr
+        assert stdout.strip() == "ATEXIT_BOUNDED_SHUTDOWN_OK"
+        assert "Task was destroyed" not in stderr
+        assert "was never awaited" not in stderr
+        assert "ResourceWarning" not in stderr
+        assert "unclosed event loop" not in stderr
+        assert "Exception ignored in atexit" not in stderr
+
+    def test_process_exit_closes_worker_loop_without_resource_warning(self):
+        repo = Path(__file__).resolve().parents[1]
+        env = os.environ.copy()
+        env["PYTHONDONTWRITEBYTECODE"] = "1"
+        proc = subprocess.run(
+            [
+                sys.executable,
+                "-W",
+                "error",
+                "-c",
+                (
+                    "import asyncio, concurrent.futures, model_tools; "
+                    "pool=concurrent.futures.ThreadPoolExecutor(max_workers=1); "
+                    "pool.submit(model_tools._run_async, asyncio.sleep(0)).result(); "
+                    "pool.shutdown()"
+                ),
+            ],
+            cwd=repo,
+            env=env,
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=60,
+            check=False,
+        )
+
+        assert proc.returncode == 0, proc.stderr
+        assert "ResourceWarning" not in proc.stderr
+        assert "unclosed event loop" not in proc.stderr
+
+
+def _capture_exception(fn, errors):
+    try:
+        fn()
+    except Exception as exc:
+        errors.append(exc)
 
 
 class TestRunAsyncWorkerThread:
@@ -254,8 +776,14 @@ class TestRunAsyncWithRunningLoop:
             FakeExecutor,
         )
 
-        with pytest.raises(concurrent.futures.TimeoutError):
-            _run_async(_never_finishes())
+        coro = _never_finishes()
+        try:
+            with pytest.raises(concurrent.futures.TimeoutError):
+                _run_async(coro)
+        finally:
+            # FakeExecutor intentionally never invokes the submitted worker;
+            # therefore the test, not production, retains ownership.
+            coro.close()
 
         assert events["result_timeout"] == 300
         # The worker wrapper creates its own event loop so _run_async can

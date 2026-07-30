@@ -5,7 +5,7 @@ import itertools
 import json
 import logging
 import os
-from unittest.mock import AsyncMock, patch, MagicMock
+from unittest.mock import ANY, AsyncMock, patch, MagicMock
 
 import pytest
 
@@ -3108,6 +3108,7 @@ class TestSilentDelivery:
             False,
             "Agent completed but produced empty response (model error, timeout, or misconfiguration)",
             delivery_error=None,
+            delivery_execution_id=ANY,
         )
 
 

@@ -20,6 +20,7 @@ Public API (signatures preserved from the original 2,400-line version):
     check_tool_availability(quiet) -> tuple
 """
 
+import atexit
 import os
 import json
 import re
@@ -53,8 +54,251 @@ def _is_delegated_child_context() -> bool:
 # =============================================================================
 
 _tool_loop = None          # persistent loop for the main (CLI) thread
-_tool_loop_lock = threading.Lock()
 _worker_thread_local = threading.local()  # per-worker-thread persistent loops
+_worker_loops = set()
+_loop_lifecycle = threading.Condition(threading.RLock())
+_loop_shutdown_in_progress = False
+_active_persistent_loop_runs = 0
+_persistent_loop_lease_local = threading.local()
+_loop_shutdown_generation = 0
+
+
+class _LoopShutdownTransaction:
+    """One linearized shutdown attempt shared by all concurrent callers."""
+
+    __slots__ = ("generation", "done", "error")
+
+    def __init__(self, generation: int):
+        self.generation = generation
+        self.done = False
+        self.error = None
+
+
+_loop_shutdown_transaction = None
+_PERSISTENT_LOOP_CANCEL_TIMEOUT = 0.25
+_ATEXIT_LOOP_SHUTDOWN_TIMEOUT = 0.5
+_current_loop_shutdown_deadline = None
+
+
+def _consume_finished_task_exception(task) -> None:
+    """Retrieve a finished task exception so teardown emits no diagnostics."""
+    if task.done() and not task.cancelled():
+        try:
+            task.exception()
+        except (asyncio.CancelledError, Exception):
+            pass
+
+
+def _force_abandon_pending_task(task) -> None:
+    """Finalize a noncooperative task without destructor-time warnings."""
+    task.cancel()
+    # A Task has no public force-close API.  Once its loop has stopped, closing
+    # the owned coroutine is the only synchronous finalization path.  Suppress
+    # the Task destructor diagnostic because shutdown reports this condition
+    # synchronously to its caller instead.
+    if hasattr(task, "_log_destroy_pending"):
+        task._log_destroy_pending = False
+    coro = task.get_coro()
+    try:
+        coro.close()
+    except Exception:
+        pass
+
+
+def _bounded_cancel_tasks(
+    loop, tasks, deadline: float, *, request_cancel: bool = True
+) -> tuple:
+    """Pump task cancellation only until a monotonic deadline."""
+    pending = tuple(task for task in tasks if not task.done())
+    if request_cancel:
+        for task in pending:
+            task.cancel()
+
+    while pending and time.monotonic() < deadline:
+        remaining = deadline - time.monotonic()
+        stopper = loop.call_later(max(0.0, remaining), loop.stop)
+        try:
+            loop.run_forever()
+        finally:
+            stopper.cancel()
+        for task in tasks:
+            _consume_finished_task_exception(task)
+        pending = tuple(task for task in tasks if not task.done())
+
+    for task in tasks:
+        _consume_finished_task_exception(task)
+    for task in pending:
+        _force_abandon_pending_task(task)
+    return pending
+
+
+def _close_persistent_loop(loop) -> None:
+    """Boundedly drain and close one bridge-owned event loop.
+
+    A noncooperative task is force-finalized and the selector is still closed,
+    but strict shutdown receives a RuntimeError describing the failed quiesce.
+    """
+    if loop is None or loop.is_closed():
+        return
+    if loop.is_running():
+        raise RuntimeError("persistent bridge loop is still running")
+
+    deadline = _current_loop_shutdown_deadline
+    if deadline is None:
+        deadline = time.monotonic() + _PERSISTENT_LOOP_CANCEL_TIMEOUT
+    pending = asyncio.all_tasks(loop)
+    noncooperative = _bounded_cancel_tasks(loop, pending, deadline)
+
+    # Async-generator finalization is also deadline-bounded.  It must never
+    # replace the old unbounded gather with another unbounded wait.
+    asyncgen_error = None
+    if time.monotonic() < deadline:
+        shutdown_asyncgens = loop.create_task(loop.shutdown_asyncgens())
+        unfinished_asyncgen = _bounded_cancel_tasks(
+            loop, (shutdown_asyncgens,), deadline, request_cancel=False
+        )
+        if unfinished_asyncgen:
+            asyncgen_error = RuntimeError(
+                "persistent bridge async generators did not quiesce before deadline"
+            )
+
+    loop.close()
+    if not loop.is_closed():
+        raise RuntimeError("persistent bridge loop close did not complete")
+    if noncooperative:
+        raise RuntimeError(
+            f"{len(noncooperative)} persistent bridge task(s) did not quiesce "
+            "before the shutdown deadline"
+        )
+    if asyncgen_error is not None:
+        raise asyncgen_error
+
+
+def _detach_closed_persistent_loop(loop) -> None:
+    """Remove *loop* from the registry only after a successful close."""
+    global _tool_loop
+    if not loop.is_closed():
+        raise RuntimeError("persistent bridge loop close did not complete")
+    if _tool_loop is loop:
+        _tool_loop = None
+    _worker_loops.discard(loop)
+
+
+def _shutdown_persistent_tool_loops(*, _deadline: Optional[float] = None) -> None:
+    """Run one linearized shutdown transaction over all registered loops.
+
+    Concurrent callers bind to the in-flight generation and receive its exact
+    result.  A later explicit call starts a fresh generation, so a retained loop
+    can be retried after a close or running-loop failure.  Registry references
+    are detached one by one, and only after ``loop.close()`` has succeeded and
+    ``loop.is_closed()`` confirms the close linearization point.
+    """
+    global _loop_shutdown_generation, _loop_shutdown_in_progress
+    global _loop_shutdown_transaction, _current_loop_shutdown_deadline
+
+    if getattr(_persistent_loop_lease_local, "depth", 0):
+        raise RuntimeError(
+            "cannot shut down persistent bridge loops while holding own active "
+            "persistent loop lease"
+        )
+
+    with _loop_lifecycle:
+        transaction = _loop_shutdown_transaction
+        if transaction is not None and not transaction.done:
+            while not transaction.done:
+                if _deadline is None:
+                    _loop_lifecycle.wait()
+                    continue
+                remaining = _deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "atexit persistent bridge shutdown deadline expired"
+                    )
+                _loop_lifecycle.wait(remaining)
+            if transaction.error is not None:
+                raise transaction.error
+            return
+
+        _loop_shutdown_generation += 1
+        transaction = _LoopShutdownTransaction(_loop_shutdown_generation)
+        _loop_shutdown_transaction = transaction
+        _loop_shutdown_in_progress = True
+
+    first_error = None
+    try:
+        with _loop_lifecycle:
+            while _active_persistent_loop_runs:
+                if _deadline is None:
+                    _loop_lifecycle.wait()
+                    continue
+                remaining = _deadline - time.monotonic()
+                if remaining <= 0:
+                    raise RuntimeError(
+                        "atexit persistent bridge shutdown timed out waiting "
+                        "for active leases"
+                    )
+                _loop_lifecycle.wait(remaining)
+
+            main_loop = _tool_loop
+            worker_loops = tuple(_worker_loops)
+            loops = tuple(
+                loop for loop in (main_loop, *worker_loops)
+                if loop is not None and not loop.is_closed()
+            )
+            if any(loop.is_running() for loop in loops):
+                raise RuntimeError("persistent bridge loop is still running")
+
+        close_deadline = time.monotonic() + _PERSISTENT_LOOP_CANCEL_TIMEOUT
+        if _deadline is not None:
+            close_deadline = min(close_deadline, _deadline)
+        _current_loop_shutdown_deadline = close_deadline
+        seen = set()
+        for loop in loops:
+            if id(loop) in seen:
+                continue
+            seen.add(id(loop))
+            try:
+                _close_persistent_loop(loop)
+                with _loop_lifecycle:
+                    _detach_closed_persistent_loop(loop)
+            except Exception as exc:
+                # A drain failure can be reported after the selector was safely
+                # closed.  Detach in that case; a close failure leaves the open
+                # loop registered for a later explicit generation retry.
+                if loop.is_closed():
+                    with _loop_lifecycle:
+                        _detach_closed_persistent_loop(loop)
+                # Continue closing independent loops.  Successfully closed loops
+                # can be detached even when another registry member failed.
+                if first_error is None:
+                    first_error = exc
+    except Exception as exc:
+        first_error = exc
+    finally:
+        _current_loop_shutdown_deadline = None
+        with _loop_lifecycle:
+            transaction.error = first_error
+            transaction.done = True
+            _loop_shutdown_in_progress = False
+            _loop_lifecycle.notify_all()
+
+    if first_error is not None:
+        raise first_error
+
+
+def _shutdown_persistent_tool_loops_at_exit() -> None:
+    try:
+        _shutdown_persistent_tool_loops(
+            _deadline=time.monotonic() + _ATEXIT_LOOP_SHUTDOWN_TIMEOUT
+        )
+    except Exception:
+        # A foreign direct user of the private loop API may still own a running
+        # loop.  The strict function preserves its registry reference and raises;
+        # atexit itself must not turn interpreter teardown into a traceback.
+        pass
+
+
+atexit.register(_shutdown_persistent_tool_loops_at_exit)
 
 
 def _get_tool_loop():
@@ -66,7 +310,9 @@ def _get_tool_loop():
     close their transport on a dead loop during garbage collection.
     """
     global _tool_loop
-    with _tool_loop_lock:
+    with _loop_lifecycle:
+        if _loop_shutdown_in_progress:
+            raise RuntimeError("persistent bridge loops are shutting down")
         if _tool_loop is None or _tool_loop.is_closed():
             _tool_loop = asyncio.new_event_loop()
         return _tool_loop
@@ -86,12 +332,49 @@ def _get_worker_loop():
     By keeping the loop alive for the thread's lifetime, cached clients
     stay valid and their cleanup runs on a live loop.
     """
-    loop = getattr(_worker_thread_local, 'loop', None)
-    if loop is None or loop.is_closed():
-        loop = asyncio.new_event_loop()
-        asyncio.set_event_loop(loop)
-        _worker_thread_local.loop = loop
-    return loop
+    with _loop_lifecycle:
+        if _loop_shutdown_in_progress:
+            raise RuntimeError("persistent bridge loops are shutting down")
+        loop = getattr(_worker_thread_local, 'loop', None)
+        if loop is None or loop.is_closed():
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            _worker_thread_local.loop = loop
+            _worker_loops.add(loop)
+        return loop
+
+
+def _acquire_persistent_loop(*, worker: bool):
+    global _active_persistent_loop_runs
+    with _loop_lifecycle:
+        loop = _get_worker_loop() if worker else _get_tool_loop()
+        _active_persistent_loop_runs += 1
+        _persistent_loop_lease_local.depth = (
+            getattr(_persistent_loop_lease_local, "depth", 0) + 1
+        )
+        return loop
+
+
+def _release_persistent_loop() -> None:
+    global _active_persistent_loop_runs
+    with _loop_lifecycle:
+        owner_depth = getattr(_persistent_loop_lease_local, "depth", 0)
+        if owner_depth <= 0 or _active_persistent_loop_runs <= 0:
+            raise RuntimeError("persistent bridge loop lease underflow")
+        _persistent_loop_lease_local.depth = owner_depth - 1
+        _active_persistent_loop_runs -= 1
+        if _active_persistent_loop_runs == 0:
+            _loop_lifecycle.notify_all()
+
+
+def _close_unscheduled_coroutine(coro) -> None:
+    """Return ownership of a coroutine that the bridge could not schedule."""
+    if asyncio.iscoroutine(coro):
+        try:
+            coro.close()
+        except Exception:
+            # Never hide the lifecycle error that prevented scheduling.
+            pass
 
 
 def _run_async(coro):
@@ -177,17 +460,19 @@ def _run_async(coro):
             # once the coroutine observes it (usually at the next await).
             pool.shutdown(wait=False)
 
-    # If we're on a worker thread (e.g., parallel tool execution in
-    # delegate_task), use a per-thread persistent loop.  This avoids
-    # contention with the main thread's shared loop while keeping cached
-    # httpx/AsyncOpenAI clients bound to a live loop for the thread's
-    # lifetime — preventing "Event loop is closed" on GC cleanup.
-    if threading.current_thread() is not threading.main_thread():
-        worker_loop = _get_worker_loop()
-        return worker_loop.run_until_complete(coro)
-
-    tool_loop = _get_tool_loop()
-    return tool_loop.run_until_complete(coro)
+    # Persistent bridge runs are leased as one transaction.  If the shutdown
+    # gate rejects the lease, this function never scheduled *coro* and must
+    # close it before returning ownership via the exception.
+    use_worker_loop = threading.current_thread() is not threading.main_thread()
+    try:
+        persistent_loop = _acquire_persistent_loop(worker=use_worker_loop)
+    except Exception:
+        _close_unscheduled_coroutine(coro)
+        raise
+    try:
+        return persistent_loop.run_until_complete(coro)
+    finally:
+        _release_persistent_loop()
 
 
 # =============================================================================

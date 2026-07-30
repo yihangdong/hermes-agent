@@ -225,6 +225,14 @@ def adapter():
     # Mock the Slack app client
     a._app = MagicMock()
     a._app.client = AsyncMock()
+    # Match the real async Slack SDK contract.  An unconfigured AsyncMock
+    # returns another AsyncMock after ``await``; calling ``.get`` on that value
+    # creates an unawaited coroutine and makes warnings surface against later,
+    # unrelated tests.
+    a._app.client.conversations_replies = AsyncMock(return_value={"messages": []})
+    a._app.client.chat_postMessage = AsyncMock(
+        return_value={"ok": True, "ts": "1710000000.000001"}
+    )
     a._app.client.users_info = AsyncMock(
         return_value={
             "user": {
@@ -250,6 +258,59 @@ def _redirect_cache(tmp_path, monkeypatch):
     monkeypatch.setattr(
         "gateway.platforms.base.VIDEO_CACHE_DIR", tmp_path / "video_cache"
     )
+
+
+@pytest.mark.asyncio
+async def test_durable_preformatted_atomic_text_is_exactly_one_slack_call(adapter) -> None:
+    adapter.format_message = MagicMock(
+        side_effect=AssertionError("atomic text must not be reformatted")
+    )
+    adapter.truncate_message = MagicMock(
+        side_effect=AssertionError("atomic text must not be split")
+    )
+    adapter._maybe_blocks = MagicMock(
+        side_effect=AssertionError("atomic text must not be reinterpreted as blocks")
+    )
+    literal = "*already formatted* & literal"
+
+    result = await adapter.send(
+        "C_ATOMIC",
+        literal,
+        metadata={
+            "_durable_delivery": True,
+            "durable_preformatted_atomic_text": True,
+            "durable_chunk_index": 1,
+            "durable_chunk_total": 2,
+        },
+    )
+
+    assert result.success is True
+    adapter._app.client.chat_postMessage.assert_awaited_once_with(
+        channel="C_ATOMIC", text=literal, mrkdwn=True
+    )
+
+
+@pytest.mark.asyncio
+async def test_durable_atomic_slack_rejects_unresolved_user_before_provider_call(
+    adapter,
+) -> None:
+    adapter._app.client.conversations_open = AsyncMock(
+        return_value={"ok": True, "channel": {"id": "D_RESOLVED"}}
+    )
+
+    result = await adapter.send(
+        "U_UNRESOLVED",
+        "*already formatted*",
+        metadata={
+            "_durable_delivery": True,
+            "durable_preformatted_atomic_text": True,
+        },
+    )
+
+    assert result.success is False
+    assert result.error_kind == "bad_format"
+    adapter._app.client.conversations_open.assert_not_awaited()
+    adapter._app.client.chat_postMessage.assert_not_awaited()
 
 
 class TestBotEventDiagnostics:
@@ -749,9 +810,15 @@ class TestSlackConnectCleanup:
         config = PlatformConfig(enabled=True, token="xoxb-fake")
         adapter = SlackAdapter(config)
 
-        # Simulate state left over from a prior connect() call.
-        first_handler = AsyncMock()
-        first_handler.close_async = AsyncMock()
+        # Simulate state left over from a prior connect() call.  The handler
+        # object and SocketModeClient task slots are synchronous; only
+        # ``close_async`` is awaitable.
+        first_handler = MagicMock()
+        first_handler.close_async = AsyncMock(return_value=None)
+        first_handler.client = MagicMock()
+        first_handler.client.current_session_monitor = None
+        first_handler.client.message_processor = None
+        first_handler.client.message_receiver = None
         adapter._handler = first_handler
 
         mock_app = MagicMock()
@@ -4966,6 +5033,9 @@ class TestThreadReplyHandling:
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._app.client = AsyncMock()
+        a._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": []}
+        )
         a._app.client.users_info = AsyncMock(
             return_value={
                 "user": {
@@ -5365,6 +5435,9 @@ class TestAssistantThreadLifecycle:
         a = SlackAdapter(config)
         a._app = MagicMock()
         a._app.client = AsyncMock()
+        a._app.client.conversations_replies = AsyncMock(
+            return_value={"messages": []}
+        )
         a._app.client.users_info = AsyncMock(
             return_value={
                 "user": {

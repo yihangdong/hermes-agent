@@ -22,6 +22,7 @@ from typing import Any, Iterable, Mapping, Optional
 _TERMINAL_STATES = frozenset({"delivered", "abandoned"})
 _RECOVERABLE_STATES = frozenset({"pending", "failed"})
 _SCHEMA_VERSION = 2
+_SCOPE_CAPSULE_VERSION = 2
 _MAX_ATTEMPTS = 3
 _STALE_AFTER_SECONDS = 24 * 60 * 60
 _DEFAULT_MAX_ROWS = 10_000
@@ -148,6 +149,8 @@ class StructuredDeliveryOutbox:
                         schema_version INTEGER NOT NULL CHECK(schema_version = 2),
                         execution_id TEXT NOT NULL,
                         canonical_target TEXT NOT NULL,
+                        scope_capsule_json TEXT NOT NULL,
+                        scope_capsule_sha256 TEXT NOT NULL,
                         payload_hash TEXT NOT NULL,
                         payload_json TEXT NOT NULL,
                         generation INTEGER NOT NULL DEFAULT 1,
@@ -165,6 +168,64 @@ class StructuredDeliveryOutbox:
                         delivered_at REAL
                     )"""
                 )
+                columns = {
+                    str(row[1])
+                    for row in conn.execute("PRAGMA table_info(cron_delivery_outbox_v2)")
+                }
+                for name in ("scope_capsule_json", "scope_capsule_sha256"):
+                    if name not in columns:
+                        conn.execute(
+                            f"ALTER TABLE cron_delivery_outbox_v2 ADD COLUMN {name} TEXT"
+                        )
+                for row in conn.execute("SELECT * FROM cron_delivery_outbox_v2").fetchall():
+                    if (
+                        row["scope_capsule_json"] is not None
+                        and row["scope_capsule_sha256"] is not None
+                    ):
+                        try:
+                            self._validated_scope_capsule(row)
+                        except PayloadConflict:
+                            # A legacy or damaged capsule may be replaced only
+                            # from a fully content-addressed canonical row below.
+                            pass
+                        else:
+                            continue
+                    try:
+                        payload = json.loads(row["payload_json"])
+                        obligation_id, payload_hash, canonical_payload = (
+                            self._canonical_payload(payload)
+                        )
+                        encoded = json.dumps(
+                            canonical_payload,
+                            sort_keys=True,
+                            separators=(",", ":"),
+                            ensure_ascii=False,
+                        )
+                    except (TypeError, ValueError, json.JSONDecodeError, OutboxError) as exc:
+                        raise OutboxError(
+                            "cannot migrate corrupt structured delivery row"
+                        ) from exc
+                    if (
+                        obligation_id != row["obligation_id"]
+                        or payload_hash != row["payload_hash"]
+                        or encoded != row["payload_json"]
+                        or str(row["execution_id"])
+                        != str(canonical_payload["execution_id"])
+                        or str(row["canonical_target"])
+                        != str(canonical_payload["canonical_target"])
+                    ):
+                        raise OutboxError(
+                            "cannot migrate unauthenticated structured delivery scope"
+                        )
+                    capsule_json, capsule_sha256 = self._scope_capsule(
+                        canonical_payload, obligation_id
+                    )
+                    conn.execute(
+                        """UPDATE cron_delivery_outbox_v2
+                           SET scope_capsule_json=?, scope_capsule_sha256=?
+                           WHERE obligation_id=?""",
+                        (capsule_json, capsule_sha256, obligation_id),
+                    )
                 conn.execute(
                     """CREATE INDEX IF NOT EXISTS cron_delivery_outbox_v2_due
                        ON cron_delivery_outbox_v2(state, next_attempt_at, created_at)"""
@@ -192,6 +253,14 @@ class StructuredDeliveryOutbox:
                     """CREATE TABLE IF NOT EXISTS cron_delivery_spool_gc_v2 (
                         singleton INTEGER PRIMARY KEY CHECK(singleton = 1),
                         last_run_at REAL NOT NULL
+                    )"""
+                )
+                conn.execute(
+                    """CREATE TABLE IF NOT EXISTS cron_delivery_job_status_sync_v2 (
+                        execution_id TEXT NOT NULL,
+                        job_id TEXT NOT NULL,
+                        created_at REAL NOT NULL,
+                        PRIMARY KEY(execution_id, job_id)
                     )"""
                 )
                 conn.commit()
@@ -270,6 +339,99 @@ class StructuredDeliveryOutbox:
         obligation_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
         return obligation_id, payload_hash, payload
 
+    def _scope_capsule(
+        self, payload: Mapping[str, Any], obligation_id: str
+    ) -> tuple[str, str]:
+        try:
+            target_index = int(payload["target_index"])
+            unit_index = int(payload["unit_index"])
+            transport_kind = str(payload["transport_kind"])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise PayloadConflict("invalid structured delivery scope identity") from exc
+        if target_index < 0 or unit_index < 0:
+            raise PayloadConflict("structured delivery scope order cannot be negative")
+        payload_hash = str(payload.get("payload_hash") or "")
+        if not payload_hash:
+            encoded_payload = json.dumps(
+                dict(payload), sort_keys=True, separators=(",", ":"), ensure_ascii=False
+            )
+            payload_hash = hashlib.sha256(encoded_payload.encode("utf-8")).hexdigest()
+        if len(payload_hash) != 64 or any(
+            character not in "0123456789abcdef" for character in payload_hash
+        ):
+            raise PayloadConflict("invalid structured delivery payload identity")
+        identity = "|".join(
+            (
+                "cron-v2",
+                str(payload["execution_id"]),
+                str(target_index),
+                str(unit_index),
+                str(payload["canonical_target"]),
+                transport_kind,
+                payload_hash,
+            )
+        )
+        expected_obligation_id = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        if expected_obligation_id != str(obligation_id):
+            raise PayloadConflict("structured delivery scope identity mismatch")
+        capsule = {
+            "version": _SCOPE_CAPSULE_VERSION,
+            "obligation_id": str(obligation_id),
+            "execution_id": str(payload["execution_id"]),
+            "job_id": str(payload["job_id"]),
+            "canonical_target": str(payload["canonical_target"]),
+            "target_index": target_index,
+            "unit_index": unit_index,
+            "transport_kind": transport_kind,
+            "payload_hash": payload_hash,
+        }
+        if (
+            not capsule["execution_id"]
+            or not capsule["canonical_target"]
+            or not capsule["transport_kind"]
+        ):
+            raise PayloadConflict("structured delivery scope cannot be empty")
+        encoded = json.dumps(
+            capsule, sort_keys=True, separators=(",", ":"), ensure_ascii=False
+        )
+        digest = hashlib.sha256(
+            f"cron-scope-v{_SCOPE_CAPSULE_VERSION}\0".encode("ascii")
+            + encoded.encode("utf-8")
+        ).hexdigest()
+        return encoded, digest
+
+    def _validated_scope_capsule(self, row: sqlite3.Row) -> dict[str, Any]:
+        try:
+            capsule = json.loads(row["scope_capsule_json"])
+            if not isinstance(capsule, dict):
+                raise TypeError("capsule is not an object")
+            expected_keys = {
+                "version",
+                "obligation_id",
+                "execution_id",
+                "job_id",
+                "canonical_target",
+                "target_index",
+                "unit_index",
+                "transport_kind",
+                "payload_hash",
+            }
+            if set(capsule) != expected_keys:
+                raise ValueError("capsule fields differ")
+            encoded, digest = self._scope_capsule(
+                capsule, str(capsule["obligation_id"])
+            )
+        except (TypeError, ValueError, json.JSONDecodeError, PayloadConflict) as exc:
+            raise PayloadConflict("structured delivery scope capsule integrity failure") from exc
+        if (
+            capsule["version"] != _SCOPE_CAPSULE_VERSION
+            or str(capsule["obligation_id"]) != str(row["obligation_id"])
+            or encoded != row["scope_capsule_json"]
+            or digest != row["scope_capsule_sha256"]
+        ):
+            raise PayloadConflict("structured delivery scope capsule integrity failure")
+        return capsule
+
     def _record(self, row: sqlite3.Row) -> OutboxRecord:
         try:
             payload = json.loads(row["payload_json"])
@@ -280,12 +442,27 @@ class StructuredDeliveryOutbox:
                 separators=(",", ":"),
                 ensure_ascii=False,
             )
+            capsule = self._validated_scope_capsule(row)
         except (TypeError, ValueError, json.JSONDecodeError, OutboxError) as exc:
             raise PayloadConflict("structured delivery payload integrity failure") from exc
         if (
             obligation_id != row["obligation_id"]
             or payload_hash != row["payload_hash"]
             or encoded != row["payload_json"]
+            or row["schema_version"] != canonical_payload["schema_version"]
+            or str(row["execution_id"]) != str(canonical_payload["execution_id"])
+            or str(row["canonical_target"])
+            != str(canonical_payload["canonical_target"])
+            or str(capsule["execution_id"])
+            != str(canonical_payload["execution_id"])
+            or str(capsule["job_id"]) != str(canonical_payload["job_id"])
+            or str(capsule["canonical_target"])
+            != str(canonical_payload["canonical_target"])
+            or int(capsule["target_index"]) != int(canonical_payload["target_index"])
+            or int(capsule["unit_index"]) != int(canonical_payload["unit_index"])
+            or str(capsule["transport_kind"])
+            != str(canonical_payload["transport_kind"])
+            or str(capsule["payload_hash"]) != payload_hash
         ):
             raise PayloadConflict("structured delivery payload integrity failure")
         return OutboxRecord(
@@ -358,15 +535,21 @@ class StructuredDeliveryOutbox:
             records: list[OutboxRecord] = []
             for obligation_id, payload_hash, payload in prepared:
                 encoded = json.dumps(payload, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
+                scope_capsule_json, scope_capsule_sha256 = self._scope_capsule(
+                    payload, obligation_id
+                )
                 conn.execute(
                     """INSERT OR IGNORE INTO cron_delivery_outbox_v2
                        (obligation_id, schema_version, execution_id, canonical_target,
+                        scope_capsule_json, scope_capsule_sha256,
                         payload_hash, payload_json, state, created_at, updated_at)
-                       VALUES (?, 2, ?, ?, ?, ?, 'pending', ?, ?)""",
+                       VALUES (?, 2, ?, ?, ?, ?, ?, ?, 'pending', ?, ?)""",
                     (
                         obligation_id,
                         str(payload["execution_id"]),
                         str(payload["canonical_target"]),
+                        scope_capsule_json,
+                        scope_capsule_sha256,
                         payload_hash,
                         encoded,
                         timestamp,
@@ -654,6 +837,33 @@ class StructuredDeliveryOutbox:
         finally:
             conn.close()
 
+    @staticmethod
+    def _quarantine_corrupt_row(
+        conn: sqlite3.Connection,
+        row: sqlite3.Row,
+        *,
+        now: float,
+    ) -> None:
+        conn.execute(
+            """UPDATE cron_delivery_outbox_v2
+               SET state='abandoned', updated_at=?,
+                   last_error='structured delivery payload integrity failure',
+                   owner_pid=NULL, owner_started_at=NULL, claim_token=NULL
+               WHERE obligation_id=? AND generation=?
+                 AND state IN ('pending','failed')""",
+            (float(now), row["obligation_id"], row["generation"]),
+        )
+
+    def _corrupt_row_scopes(self, row: sqlite3.Row) -> set[tuple[str, str]]:
+        """Recover a corrupt payload's scope only from its independent capsule."""
+        capsule = self._validated_scope_capsule(row)
+        return {
+            (
+                str(capsule["execution_id"]),
+                str(capsule["canonical_target"]),
+            )
+        }
+
     def claim_next(
         self,
         *,
@@ -714,27 +924,58 @@ class StructuredDeliveryOutbox:
                      AND (attempts >= ? OR created_at < ?)""",
                 (timestamp, _MAX_ATTEMPTS, timestamp - _STALE_AFTER_SECONDS),
             )
-            rows = conn.execute(
+            all_rows = conn.execute(
                 """SELECT * FROM cron_delivery_outbox_v2
-                   WHERE state IN ('pending','failed') AND next_attempt_at <= ?
-                     AND (? IS NULL OR obligation_id = ?)
-                   ORDER BY created_at, obligation_id""",
-                (timestamp, obligation_id, obligation_id),
+                   ORDER BY created_at, obligation_id"""
             ).fetchall()
-            row = None
-            for candidate in rows:
+            validated_rows: list[tuple[sqlite3.Row, OutboxRecord]] = []
+            corrupt_scopes: set[tuple[str, str]] = set()
+            unscoped_corruption = False
+            for persisted in all_rows:
                 try:
-                    validated = self._record(candidate)
+                    persisted_record = self._record(persisted)
                 except PayloadConflict:
-                    conn.execute(
-                        """UPDATE cron_delivery_outbox_v2
-                           SET state='abandoned', updated_at=?,
-                               last_error='structured delivery payload integrity failure',
-                               owner_pid=NULL, owner_started_at=NULL, claim_token=NULL
-                           WHERE obligation_id=? AND generation=?
-                             AND state IN ('pending','failed')""",
-                        (timestamp, candidate["obligation_id"], candidate["generation"]),
+                    try:
+                        corrupt_scopes.update(self._corrupt_row_scopes(persisted))
+                    except PayloadConflict:
+                        unscoped_corruption = True
+                    self._quarantine_corrupt_row(conn, persisted, now=timestamp)
+                    continue
+                validated_rows.append((persisted, persisted_record))
+            if unscoped_corruption:
+                conn.commit()
+                return None
+            row = None
+            for candidate, validated in validated_rows:
+                if candidate["state"] not in ("pending", "failed"):
+                    continue
+                if float(candidate["next_attempt_at"]) > timestamp:
+                    continue
+                if obligation_id is not None and candidate["obligation_id"] != obligation_id:
+                    continue
+                scope = (
+                    str(validated.payload["execution_id"]),
+                    str(validated.payload["canonical_target"]),
+                )
+                if scope in corrupt_scopes:
+                    continue
+                siblings = [
+                    (sibling, sibling_record)
+                    for sibling, sibling_record in validated_rows
+                    if (
+                        str(sibling_record.payload["execution_id"]),
+                        str(sibling_record.payload["canonical_target"]),
                     )
+                    == scope
+                ]
+                target_index = int(validated.payload["target_index"])
+                unit_index = int(validated.payload["unit_index"])
+                if any(
+                    int(sibling_record.payload["target_index"]) == target_index
+                    and int(sibling_record.payload["unit_index"]) < unit_index
+                    and sibling["state"] != "delivered"
+                    for sibling, sibling_record in siblings
+                ):
                     continue
                 circuit = conn.execute(
                     """SELECT 1 FROM cron_delivery_circuit_v2
@@ -845,6 +1086,41 @@ class StructuredDeliveryOutbox:
             )
             if lease_cursor.rowcount != 1:
                 raise ClaimLost("matching global lease was lost")
+            if state == "delivered":
+                execution_id = str(claim.payload["execution_id"])
+                job_id = str(claim.payload["job_id"])
+                all_certified = True
+                remaining = False
+                for persisted in conn.execute(
+                    "SELECT * FROM cron_delivery_outbox_v2"
+                ).fetchall():
+                    try:
+                        capsule = self._validated_scope_capsule(persisted)
+                    except PayloadConflict:
+                        # Without an authenticated scope, conservatively block
+                        # every completion marker in this transaction.
+                        all_certified = False
+                        continue
+                    if str(capsule["execution_id"]) != execution_id:
+                        continue
+                    try:
+                        sibling = self._record(persisted)
+                    except PayloadConflict:
+                        all_certified = False
+                        continue
+                    if (
+                        str(capsule["job_id"]) != job_id
+                        or str(sibling.payload["job_id"]) != job_id
+                    ):
+                        all_certified = False
+                    if sibling.state != "delivered":
+                        remaining = True
+                if all_certified and not remaining:
+                    conn.execute(
+                        """INSERT OR IGNORE INTO cron_delivery_job_status_sync_v2
+                           (execution_id, job_id, created_at) VALUES (?, ?, ?)""",
+                        (execution_id, job_id, float(now)),
+                    )
             conn.commit()
         except BaseException:
             conn.rollback()
@@ -923,6 +1199,37 @@ class StructuredDeliveryOutbox:
                      blocked_until=MAX(blocked_until, excluded.blocked_until),
                      reason=excluded.reason, updated_at=excluded.updated_at""",
                 (str(platform).lower(), float(blocked_until), reason, timestamp),
+            )
+            conn.commit()
+        except BaseException:
+            conn.rollback()
+            raise
+        finally:
+            conn.close()
+
+    def pending_job_status_syncs(self, *, limit: int = 100) -> list[tuple[str, str]]:
+        """Return durable execution/job markers awaiting jobs.json reconciliation."""
+        conn = self._connect()
+        try:
+            rows = conn.execute(
+                """SELECT execution_id, job_id
+                   FROM cron_delivery_job_status_sync_v2
+                   ORDER BY created_at, execution_id, job_id LIMIT ?""",
+                (max(1, int(limit)),),
+            ).fetchall()
+            return [(str(row[0]), str(row[1])) for row in rows]
+        finally:
+            conn.close()
+
+    def mark_job_status_synced(self, execution_id: str, job_id: str) -> None:
+        """Acknowledge one idempotently reconciled mutable job-status marker."""
+        conn = self._connect()
+        try:
+            conn.execute("BEGIN IMMEDIATE")
+            conn.execute(
+                """DELETE FROM cron_delivery_job_status_sync_v2
+                   WHERE execution_id=? AND job_id=?""",
+                (str(execution_id), str(job_id)),
             )
             conn.commit()
         except BaseException:

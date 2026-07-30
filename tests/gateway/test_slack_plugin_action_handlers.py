@@ -71,6 +71,35 @@ from hermes_cli.plugins import (  # noqa: E402
 )
 
 
+async def _pending_for_fake_task():
+    """Remain pending until ``asyncio.run`` performs its normal cleanup."""
+
+    await asyncio.Event().wait()
+
+
+def _fake_create_task(coro):
+    """Consume adapter coroutines while preserving the Task contract.
+
+    A bare ``patch("asyncio.create_task")`` accepts a coroutine object but
+    never awaits or closes it, so warnings-as-errors are reported later against
+    unrelated tests.  Close that coroutine and return a real pending Task that
+    supports cancellation, awaiting, and done callbacks.
+    """
+
+    assert asyncio.iscoroutine(coro)
+    coro.close()
+    return asyncio.get_running_loop().create_task(_pending_for_fake_task())
+
+
+def _mock_socket_mode_handler():
+    """Return a handler double with the real asynchronous method contract."""
+
+    handler = MagicMock()
+    handler.start_async = AsyncMock(return_value=None)
+    handler.close_async = AsyncMock(return_value=None)
+    return handler
+
+
 # ---------------------------------------------------------------------------
 # PluginContext.register_slack_action_handler — input validation + queuing
 # ---------------------------------------------------------------------------
@@ -243,12 +272,16 @@ def _connect_with_recording_app(
 
     with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
          patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
-         patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+         patch.object(
+             _slack_mod,
+             "AsyncSocketModeHandler",
+             return_value=_mock_socket_mode_handler(),
+         ), \
          patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
          patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
          patch("gateway.status.release_scoped_lock"), \
          patch("hermes_cli.plugins.get_plugin_manager", return_value=fake_mgr), \
-         patch("asyncio.create_task"):
+         patch("asyncio.create_task", side_effect=_fake_create_task):
         result = asyncio.run(adapter.connect())
 
     return result, registered_actions
@@ -408,13 +441,17 @@ class TestSlackAdapterPluginActionWiring:
 
         with patch.object(_slack_mod, "AsyncApp", return_value=mock_app), \
              patch.object(_slack_mod, "AsyncWebClient", return_value=mock_web_client), \
-             patch.object(_slack_mod, "AsyncSocketModeHandler", return_value=MagicMock()), \
+             patch.object(
+             _slack_mod,
+             "AsyncSocketModeHandler",
+             return_value=_mock_socket_mode_handler(),
+         ), \
              patch.dict(os.environ, {"SLACK_APP_TOKEN": "xapp-fake"}), \
              patch("gateway.status.acquire_scoped_lock", return_value=(True, None)), \
              patch("gateway.status.release_scoped_lock"), \
              patch("hermes_cli.plugins.get_plugin_manager",
                    side_effect=RuntimeError("plugins broken")), \
-             patch("asyncio.create_task"):
+             patch("asyncio.create_task", side_effect=_fake_create_task):
             result = asyncio.run(adapter.connect())
 
         assert result is True

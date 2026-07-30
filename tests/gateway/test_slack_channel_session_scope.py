@@ -35,6 +35,9 @@ def adapter():
     a = SlackAdapter(config)
     a._app = MagicMock()
     a._app.client = AsyncMock()
+    a._app.client.conversations_replies = AsyncMock(
+        return_value={"messages": []}
+    )
     a._bot_user_id = "U_BOT"
     a._running = True
     a.handle_message = AsyncMock()
