@@ -8,6 +8,7 @@ else.
 """
 
 import asyncio
+import contextlib
 import os
 import stat
 from typing import Any, cast
@@ -24,7 +25,25 @@ OWNER = "wxid_owner"
 OTHER = "wxid_someone_else"
 ACCOUNT = "test-account"
 
-_SOCK_STAT = os.stat_result((stat.S_IFSOCK | 0o660, 0, 0, 1, 0, 0, 0, 0, 0, 0))
+CONTROLLER_UID = 4242
+
+_SOCK_STAT = os.stat_result((stat.S_IFSOCK | 0o660, 101, 1, 1, CONTROLLER_UID, 0, 0, 0, 0, 0))
+_DIR_STAT = os.stat_result((0o40755, 202, 1, 1, CONTROLLER_UID, 0, 0, 0, 0, 0))
+_SOCKET_DIR = os.path.dirname(bridge.DEFAULT_SOCKET_PATH)
+
+
+def _stat_router(path, *args, **kwargs):
+    """Answer per path: the exchange stats the socket again after connecting."""
+    return _DIR_STAT if str(path) == _SOCKET_DIR else _SOCK_STAT
+
+
+@contextlib.contextmanager
+def _socket_layer(open_connection, *, peer_uid=CONTROLLER_UID):
+    """Patch the socket layer: path stats, connected-peer identity, connect."""
+    with patch("os.stat", side_effect=_stat_router):
+        with patch.object(bridge, "read_peer_uid", return_value=peer_uid):
+            with patch.object(asyncio, "open_unix_connection", open_connection, create=True):
+                yield
 
 
 def _adapter(**env) -> Any:
@@ -79,7 +98,16 @@ def _message(text, *, sender=OWNER, message_id="msg-1"):
 
 
 def _enabled(**extra):
-    return {bridge.ENV_OWNER_USER_ID: OWNER, **extra}
+    """Configuration for an enabled bridge.
+
+    The expected controller uid is mandatory now: an enabled bridge that
+    cannot name its peer refuses to connect at all.
+    """
+    return {
+        bridge.ENV_OWNER_USER_ID: OWNER,
+        bridge.ENV_SOCKET_UID: str(CONTROLLER_UID),
+        **extra,
+    }
 
 
 def _fake_peer(reply_builder):
@@ -144,12 +172,12 @@ class TestOrdinaryRoutingUnchanged:
     async def test_non_owner_stagea_text_routes_normally_and_creates_no_request(self):
         adapter = _adapter(**_enabled())
         with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
-            with patch("os.stat") as stat_call:
+            with patch.object(bridge, "check_socket_path") as preflight:
                 await adapter._process_message(_message("/stagea advance", sender=OTHER))
         assert _dispatched(adapter) == 1
         adapter._send_text_chunk.assert_not_awaited()
         opened.assert_not_called()
-        stat_call.assert_not_called()
+        preflight.assert_not_called()
 
     @pytest.mark.asyncio
     async def test_unauthorized_sender_is_still_dropped_before_the_bridge(self):
@@ -179,9 +207,8 @@ class TestAdmittedRequest:
     async def test_owner_request_bypasses_the_agent_entirely(self):
         adapter = _adapter(**_enabled())
         open_connection, captured = _fake_peer(_terminal)
-        with patch("os.stat", return_value=_SOCK_STAT):
-            with patch.object(asyncio, "open_unix_connection", open_connection, create=True):
-                await adapter._process_message(_message("/stagea advance the lane"))
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance the lane"))
 
         # No legacy dispatch of any kind: not the batcher, not handle_message.
         assert _dispatched(adapter) == 0
@@ -199,9 +226,8 @@ class TestAdmittedRequest:
         open_connection, _ = _fake_peer(
             lambda request: {**_terminal(request), "chat_id": "wxid_attacker"}
         )
-        with patch("os.stat", return_value=_SOCK_STAT):
-            with patch.object(asyncio, "open_unix_connection", open_connection, create=True):
-                await adapter._process_message(_message("/stagea advance"))
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance"))
 
         adapter._send_text_chunk.assert_awaited_once()
         kwargs = adapter._send_text_chunk.await_args.kwargs
@@ -215,9 +241,8 @@ class TestAdmittedRequest:
         open_connection, _ = _fake_peer(
             lambda request: {**_terminal(request), "conversation_ref": "f" * 32}
         )
-        with patch("os.stat", return_value=_SOCK_STAT):
-            with patch.object(asyncio, "open_unix_connection", open_connection, create=True):
-                await adapter._process_message(_message("/stagea advance"))
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance"))
         chunk = adapter._send_text_chunk.await_args.kwargs["chunk"]
         assert "reply_wrong_conversation" in chunk
 
@@ -228,9 +253,8 @@ class TestAdmittedRequest:
         open_connection, _ = _fake_peer(
             lambda request: _terminal(request, outcome=outcome, text="see issue")
         )
-        with patch("os.stat", return_value=_SOCK_STAT):
-            with patch.object(asyncio, "open_unix_connection", open_connection, create=True):
-                await adapter._process_message(_message("/stagea advance"))
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance"))
         chunk = adapter._send_text_chunk.await_args.kwargs["chunk"]
         assert chunk.startswith(f"[Stage-A] {outcome}")
 
@@ -262,10 +286,9 @@ class TestAdmittedRequest:
         # actually under test here.
         adapter._dedup.is_duplicate = Mock(return_value=False)
         open_connection, captured = _fake_peer(_terminal)
-        with patch("os.stat", return_value=_SOCK_STAT):
-            with patch.object(asyncio, "open_unix_connection", open_connection, create=True):
-                await adapter._process_message(_message("/stagea advance"))
-                await adapter._process_message(_message("/stagea advance"))
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance"))
+            await adapter._process_message(_message("/stagea advance"))
 
         assert len(captured) == 1
         assert adapter._send_text_chunk.await_count == 2
@@ -285,6 +308,226 @@ class TestAdmittedRequest:
             await adapter._process_message(_message("/stagea advance"))
         chunk = adapter._send_text_chunk.await_args.kwargs["chunk"]
         assert "media_not_admitted" in chunk
+        opened.assert_not_called()
+
+
+class TestAttachmentTruth:
+    """Attachment presence is read from the message, not from the download.
+
+    Finding 3 of the Tier-1 review: ``has_media`` was derived from
+    successfully downloaded media, so an attachment-bearing message whose
+    fetch failed was admitted as text-only.
+    """
+
+    @pytest.mark.parametrize(
+        "item_type",
+        [weixin.ITEM_IMAGE, weixin.ITEM_VOICE, weixin.ITEM_FILE, weixin.ITEM_VIDEO],
+    )
+    def test_every_attachment_type_is_an_attachment(self, item_type):
+        assert weixin._has_attachment_item([{"type": item_type}]) is True
+
+    def test_plain_text_is_not_an_attachment(self):
+        assert weixin._has_attachment_item(
+            [{"type": weixin.ITEM_TEXT, "text_item": {"text": "/stagea go"}}]
+        ) is False
+
+    @pytest.mark.parametrize("item_list", [[], None])
+    def test_nothing_is_not_an_attachment(self, item_list):
+        assert weixin._has_attachment_item(item_list) is False
+
+    def test_quoted_media_counts(self):
+        assert weixin._has_attachment_item(
+            [
+                {
+                    "type": weixin.ITEM_TEXT,
+                    "text_item": {"text": "/stagea go"},
+                    "ref_msg": {"message_item": {"type": weixin.ITEM_IMAGE}},
+                }
+            ]
+        ) is True
+
+    def test_an_unreadable_item_fails_closed(self):
+        """An unrecognised shape must not be assumed to be plain text."""
+        assert weixin._has_attachment_item(["not-a-dict"]) is True
+
+    @pytest.mark.asyncio
+    async def test_a_failed_image_download_is_still_an_attachment(self, monkeypatch):
+        """The exact case the reviewer reproduced."""
+        adapter = _adapter(**_enabled())
+
+        async def _collect(item, media_paths, media_types):
+            return  # the download produced nothing
+
+        monkeypatch.setattr(adapter, "_collect_media", _collect)
+        message = _message("/stagea advance")
+        message["item_list"].append({"type": weixin.ITEM_IMAGE, "image_item": {}})
+
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            with patch.object(bridge, "check_socket_path") as preflight:
+                await adapter._process_message(message)
+
+        chunk = adapter._send_text_chunk.await_args.kwargs["chunk"]
+        assert "media_not_admitted" in chunk
+        assert _dispatched(adapter) == 0
+        opened.assert_not_called()
+        preflight.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_failed_quoted_media_download_is_still_an_attachment(self, monkeypatch):
+        adapter = _adapter(**_enabled())
+
+        async def _collect(item, media_paths, media_types):
+            return
+
+        monkeypatch.setattr(adapter, "_collect_media", _collect)
+        message = _message("/stagea advance")
+        message["item_list"].append(
+            {
+                "type": weixin.ITEM_TEXT,
+                "text_item": {"text": "context"},
+                "ref_msg": {"message_item": {"type": weixin.ITEM_VIDEO}},
+            }
+        )
+
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            await adapter._process_message(message)
+
+        assert "media_not_admitted" in adapter._send_text_chunk.await_args.kwargs["chunk"]
+        opened.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_downloaded_media_alone_is_still_an_attachment(self, monkeypatch):
+        """The two readings are unioned, so neither can weaken the other."""
+        adapter = _adapter(**_enabled())
+
+        async def _collect(item, media_paths, media_types):
+            media_paths.append("/tmp/photo.jpg")
+            media_types.append("image/jpeg")
+
+        monkeypatch.setattr(adapter, "_collect_media", _collect)
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            await adapter._process_message(_message("/stagea advance"))
+
+        assert "media_not_admitted" in adapter._send_text_chunk.await_args.kwargs["chunk"]
+        opened.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_genuinely_text_only_request_is_still_admitted(self):
+        """The stricter reading must not refuse ordinary Stage-A requests."""
+        adapter = _adapter(**_enabled())
+        open_connection, captured = _fake_peer(_terminal)
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance"))
+        assert len(captured) == 1
+
+
+class TestRestartSafeIdentity:
+    """A redelivered message keeps its Stage-A work identity.
+
+    Finding 1 of the Tier-1 review: the id was random per admission, so a
+    redelivery after a restart looked like new work to the controller.
+    """
+
+    @staticmethod
+    def _request_id(frame):
+        import json
+
+        return json.loads(frame[4:].decode("utf-8"))["request_id"]
+
+    @pytest.mark.asyncio
+    async def test_the_same_message_survives_a_restart_with_one_identity(self):
+        open_connection, captured = _fake_peer(_terminal)
+        for _ in range(2):
+            # A brand-new adapter each time: fresh bridge, empty guard —
+            # exactly what a restarted gateway looks like.
+            adapter = _adapter(**_enabled())
+            adapter._dedup.is_duplicate = Mock(return_value=False)
+            with _socket_layer(open_connection):
+                await adapter._process_message(_message("/stagea advance", message_id="msg-7"))
+
+        assert len(captured) == 2
+        assert self._request_id(captured[0]) == self._request_id(captured[1])
+
+    @pytest.mark.asyncio
+    async def test_distinct_messages_keep_distinct_identities(self):
+        open_connection, captured = _fake_peer(_terminal)
+        adapter = _adapter(**_enabled())
+        # The adapter's own content fingerprint would swallow the second
+        # copy; the bridge's identity derivation is what is under test.
+        adapter._dedup.is_duplicate = Mock(return_value=False)
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea advance", message_id="msg-a"))
+            await adapter._process_message(_message("/stagea advance", message_id="msg-b"))
+
+        assert len(captured) == 2
+        assert self._request_id(captured[0]) != self._request_id(captured[1])
+
+    @pytest.mark.asyncio
+    async def test_a_message_without_an_id_creates_no_work(self):
+        adapter = _adapter(**_enabled())
+        message = _message("/stagea advance")
+        message["message_id"] = ""
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            with patch.object(bridge, "check_socket_path") as preflight:
+                await adapter._process_message(message)
+
+        chunk = adapter._send_text_chunk.await_args.kwargs["chunk"]
+        assert "unstable_message_identity" in chunk
+        assert _dispatched(adapter) == 0
+        opened.assert_not_called()
+        preflight.assert_not_called()
+
+
+class TestBrokenConfigurationKeepsOrdinaryRouting:
+    """A broken Stage-A deployment must be invisible to everyone else.
+
+    Finding 2 of the Tier-1 review: an invalid configuration answered any
+    marker-bearing text before the sender and chat type were classified,
+    so it consumed non-Owner and group traffic.
+    """
+
+    @staticmethod
+    def _adapter_with_broken_config():
+        return _adapter(
+            **{bridge.ENV_OWNER_USER_ID: OWNER, bridge.ENV_SOCKET_UID: "not-a-uid"}
+        )
+
+    @pytest.mark.asyncio
+    async def test_a_non_owner_is_still_routed_normally(self):
+        adapter = self._adapter_with_broken_config()
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            await adapter._process_message(_message("/stagea advance", sender=OTHER))
+        assert _dispatched(adapter) == 1
+        adapter._send_text_chunk.assert_not_awaited()
+        opened.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_a_group_message_is_still_routed_normally(self):
+        adapter = self._adapter_with_broken_config()
+        adapter._group_policy = "allowlist"
+        adapter._group_allow_from = ["room-1"]
+        message = _message("/stagea advance")
+        message["room_id"] = "room-1"
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            await adapter._process_message(message)
+        assert _dispatched(adapter) == 1
+        adapter._send_text_chunk.assert_not_awaited()
+        opened.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_ordinary_owner_text_is_still_routed_normally(self):
+        adapter = self._adapter_with_broken_config()
+        await adapter._process_message(_message("what is the current lane?"))
+        assert _dispatched(adapter) == 1
+        adapter._send_text_chunk.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_only_the_owner_stagea_candidate_is_told(self):
+        adapter = self._adapter_with_broken_config()
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            await adapter._process_message(_message("/stagea advance"))
+        assert _dispatched(adapter) == 0
+        assert "config_invalid" in adapter._send_text_chunk.await_args.kwargs["chunk"]
         opened.assert_not_called()
 
 
@@ -362,11 +605,8 @@ class TestCredentialCustody:
             },
             clear=False,
         ):
-            with patch("os.stat", return_value=_SOCK_STAT):
-                with patch.object(
-                    asyncio, "open_unix_connection", open_connection, create=True
-                ):
-                    await adapter._process_message(_message("/stagea advance"))
+            with _socket_layer(open_connection):
+                await adapter._process_message(_message("/stagea advance"))
 
         wire = captured[0].decode("utf-8", errors="replace")
         for sentinel in (

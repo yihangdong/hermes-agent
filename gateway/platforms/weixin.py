@@ -1002,6 +1002,33 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     return ""
 
 
+#: Item types that *are* an attachment, whatever happens to the download.
+_ATTACHMENT_ITEM_TYPES = frozenset({ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO})
+
+
+def _has_attachment_item(item_list: Optional[List[Any]]) -> bool:
+    """Whether the inbound message carries an attachment, per its own metadata.
+
+    Deliberately independent of ``_collect_media``: that reports what was
+    successfully *downloaded*, which is a different question.  A message
+    whose image fetch fails still arrived carrying an image, and Stage-A's
+    text-only admission has to be decided on what was sent.  An item this
+    function cannot read is treated as an attachment, so an unrecognised
+    shape fails closed rather than passing as plain text — which is why
+    the annotation stays loose: this is untrusted inbound data, not a
+    structure the type system can vouch for.
+    """
+    for item in item_list or []:
+        if not isinstance(item, dict):
+            return True
+        if item.get("type") in _ATTACHMENT_ITEM_TYPES:
+            return True
+        ref_item = (item.get("ref_msg") or {}).get("message_item")
+        if isinstance(ref_item, dict) and ref_item.get("type") in _ATTACHMENT_ITEM_TYPES:
+            return True
+    return False
+
+
 def _message_type_from_media(media_types: List[str], text: str) -> MessageType:
     if any(m.startswith("image/") for m in media_types):
         return MessageType.PHOTO
@@ -1541,14 +1568,18 @@ class WeixinAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
-        if await self._maybe_handle_stagea_owner_request(event):
+        if await self._maybe_handle_stagea_owner_request(
+            event, has_attachment=_has_attachment_item(item_list)
+        ):
             return
         if event.message_type == MessageType.TEXT:
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
 
-    async def _maybe_handle_stagea_owner_request(self, event: MessageEvent) -> bool:
+    async def _maybe_handle_stagea_owner_request(
+        self, event: MessageEvent, *, has_attachment: bool
+    ) -> bool:
         """Route one Owner Stage-A request over the local bridge.
 
         Returns ``True`` only when the bridge consumed the event, in which
@@ -1556,13 +1587,17 @@ class WeixinAdapter(BasePlatformAdapter):
         reach ordinary routing.  Every other message — including one that
         merely looks like a Stage-A request but is not from the Owner —
         returns ``False`` and continues down the pre-existing path.
+
+        ``has_attachment`` is read from the inbound metadata by the
+        caller.  Downloaded media is unioned in as well, so the reading is
+        never weaker than either source alone.
         """
         source = event.source
         reply = await self._stagea_bridge.process(
             chat_type=source.chat_type,
             sender_id=source.user_id,
             text=event.text or "",
-            has_media=bool(event.media_urls),
+            has_media=has_attachment or bool(event.media_urls),
             conversation_key=f"{source.platform.value}|{self._account_id}|{source.chat_id}|{source.user_id}",
             message_id=event.message_id,
         )

@@ -10,11 +10,12 @@ Why it is shaped this way
 The consumer on the other end of the socket is a deterministic controller
 that owns and listens on the socket; this module is a **client only** — it
 never binds, listens or accepts, so the bridge adds no network surface of
-any kind.  Peer confinement is the listener's duty (``SO_PEERCRED`` or the
-platform equivalent); this side supplies the typed schema and request id
-that make that enforcement checkable, and additionally refuses to talk to a
-socket path that is not a socket, is world-writable, or sits in a
-world-writable directory.
+any kind.  Peer confinement runs in *both* directions: the listener
+authenticates this client (``SO_PEERCRED`` or the platform equivalent),
+and this client authenticates the listener the same way before it writes
+a single byte of the Owner's request — a path check describes an object,
+but only a peer credential describes the process that is actually holding
+the other end.
 
 Hard boundaries, all enforced below rather than by convention:
 
@@ -26,7 +27,20 @@ Hard boundaries, all enforced below rather than by convention:
   the adapter's own intake authorization and the sender equals the one
   configured Stage-A Owner id, in a direct message, text-only, beginning
   with the fixed :data:`REQUEST_MARKER`.  Anything else falls straight
-  through to ordinary routing untouched.
+  through to ordinary routing untouched.  Admission is decided *before*
+  any secondary configuration is consulted, so a misconfigured deployment
+  can only ever answer the Owner — it can never consume, divert or
+  respond to anybody else's message.
+* **The same message is the same work.**  The Stage-A ``request_id`` is
+  *derived* from the conversation and the platform's own message id, not
+  generated, so a redelivery of one inbound message carries the identity
+  it carried before — across a bridge restart, a gateway restart, or a
+  cold host.  A message the platform cannot identify stably creates no
+  work at all.
+* **Text means text.**  Attachment presence is read from the inbound
+  metadata the platform sent, never inferred from whether a download
+  happened to succeed, so a failed media fetch cannot make an
+  attachment-bearing message look text-only.
 * **The destination is never on the wire.**  A reply is delivered only to
   the conversation captured at ingress.  The reply frame is rejected
   outright if it carries any key outside :data:`_REPLY_KEYS`, so no
@@ -53,10 +67,10 @@ import hashlib
 import json
 import logging
 import os
+import socket as socket_module
 import stat
 import struct
 import time
-import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Callable, Dict, Optional, Tuple
@@ -130,6 +144,11 @@ MAX_INFLIGHT_REQUESTS = 4
 
 REPLY_PREFIX = "[Stage-A]"
 
+#: ``SOL_LOCAL`` / ``XUCRED_VERSION`` from the BSD socket ABI.  Python
+#: does not export either, and both are fixed by that ABI.
+_SOL_LOCAL = 0
+_XUCRED_VERSION = 0
+
 _REFUSAL_TEXT: Dict[str, str] = {
     "media_not_admitted": "attachments are not accepted; send the request as text only",
     "empty_request": "the request text was empty",
@@ -142,6 +161,12 @@ _REFUSAL_TEXT: Dict[str, str] = {
     "socket_world_writable": "the bridge socket is world-writable and was refused",
     "socket_dir_world_writable": "the bridge socket directory is world-writable and was refused",
     "socket_owner_mismatch": "the bridge socket owner did not match the expected identity",
+    "socket_dir_group_writable": "the bridge socket directory is group-writable and was refused",
+    "socket_dir_owner_mismatch": "the bridge socket directory owner did not match the expected identity",
+    "socket_replaced": "the bridge socket changed identity during connection and was refused",
+    "peer_unverifiable": "the Stage-A controller identity could not be proven on this platform",
+    "peer_owner_mismatch": "the connected Stage-A peer did not match the expected identity",
+    "unstable_message_identity": "the request had no stable message identity and was refused",
     "connect_failed": "the Stage-A controller did not accept the connection",
     "send_failed": "the request could not be delivered to the Stage-A controller",
     "reply_timeout": "the Stage-A controller did not answer in time; the outcome is unresolved",
@@ -186,42 +211,64 @@ def outcome_text(outcome: str, text: str) -> str:
 
 @dataclass(frozen=True)
 class BridgeConfig:
-    """Resolved, fixed, non-secret bridge configuration."""
+    """Resolved, fixed, non-secret *secondary* bridge configuration.
+
+    ``socket_uid`` is mandatory: an enabled bridge that cannot name the
+    exact uid it expects to be talking to has no way to prove the peer,
+    so it refuses rather than connecting to whatever answers.
+    """
 
     owner_user_id: str
     socket_path: str
-    socket_uid: Optional[int]
+    socket_uid: int
 
 
-def load_config(getter: Callable[[str, Optional[str]], Optional[str]]) -> Optional[BridgeConfig]:
-    """Resolve configuration, or ``None`` when the bridge is disabled.
+def load_owner_user_id(getter: Callable[[str, Optional[str]], Optional[str]]) -> Optional[str]:
+    """Resolve the *primary* gate: the one exact Stage-A Owner id.
+
+    This is deliberately the only configuration consulted before a
+    message has been classified.  It is a bare identifier with no
+    parseable structure, so it is either present or absent — it can never
+    be "invalid" and can therefore never turn a non-Owner message into a
+    Stage-A outcome.  ``None`` means the bridge is off and ordinary
+    routing is bit-identical to a tree without this module.
 
     ``getter`` is the adapter's profile-scoped configuration reader, so a
     secondary multiplexed profile cannot borrow the default profile's
     Stage-A binding.
+    """
+    return (getter(ENV_OWNER_USER_ID, "") or "").strip() or None
+
+
+def load_config(
+    getter: Callable[[str, Optional[str]], Optional[str]], *, owner_user_id: str
+) -> BridgeConfig:
+    """Resolve the *secondary* configuration for an admitted Owner request.
+
+    Only ever called once a message is already known to be an exact Owner
+    Stage-A candidate, so a broken value can only ever be reported to the
+    Owner — it can never consume anyone else's traffic.
 
     Raises:
-        BridgeError: ``config_invalid`` when the bridge is enabled but a
-            value cannot be used.  Enabled-but-broken fails closed rather
-            than degrading to a weaker check.
+        BridgeError: ``config_invalid`` when a value cannot be used.
+            Enabled-but-broken fails closed rather than degrading to a
+            weaker check.
     """
-    owner = (getter(ENV_OWNER_USER_ID, "") or "").strip()
-    if not owner:
-        return None
-
     socket_path = (getter(ENV_SOCKET_PATH, "") or "").strip() or DEFAULT_SOCKET_PATH
 
     raw_uid = (getter(ENV_SOCKET_UID, "") or "").strip()
-    socket_uid: Optional[int] = None
-    if raw_uid:
-        try:
-            socket_uid = int(raw_uid)
-        except ValueError:
-            raise BridgeError("config_invalid") from None
-        if socket_uid < 0:
-            raise BridgeError("config_invalid")
+    if not raw_uid:
+        raise BridgeError("config_invalid")
+    try:
+        socket_uid = int(raw_uid)
+    except ValueError:
+        raise BridgeError("config_invalid") from None
+    if socket_uid < 0:
+        raise BridgeError("config_invalid")
 
-    return BridgeConfig(owner_user_id=owner, socket_path=socket_path, socket_uid=socket_uid)
+    return BridgeConfig(
+        owner_user_id=owner_user_id, socket_path=socket_path, socket_uid=socket_uid
+    )
 
 
 # --- admission ---------------------------------------------------------
@@ -269,24 +316,28 @@ def _strip_marker(text: str) -> Optional[str]:
 
 
 def classify(
-    config: Optional[BridgeConfig],
+    owner_user_id: Optional[str],
     *,
     chat_type: str,
     sender_id: Optional[str],
     text: str,
     has_media: bool,
+    message_id: Optional[str],
 ) -> Admission:
     """Decide what one already-authorized inbound message is.
 
-    Ordering matters: every check that could route an ordinary message
-    differently is evaluated before any Stage-A-specific check, so a
-    message that is not an Owner Stage-A request can never be consumed.
+    Ordering is the whole security property.  Every check that decides
+    *whose* message this is — bridge enabled, direct message, exact Owner
+    — is evaluated first and returns pass-through, so no state outside
+    this function can make an ordinary message take a Stage-A path.  Only
+    once the message is known to be an exact Owner Stage-A candidate may
+    a problem be answered instead of routed.
     """
-    if config is None:
+    if owner_user_id is None:
         return _PASS_THROUGH
     if chat_type != "dm":
         return _PASS_THROUGH
-    if (sender_id or "") != config.owner_user_id:
+    if (sender_id or "") != owner_user_id:
         return _PASS_THROUGH
 
     request_text = _strip_marker(text or "")
@@ -301,6 +352,10 @@ def classify(
         return Admission(admitted=False, refused=True, reason="empty_request")
     if len(request_text.encode("utf-8")) > MAX_REQUEST_TEXT_BYTES:
         return Admission(admitted=False, refused=True, reason="request_too_large")
+    # Without a stable platform message id there is no work identity that
+    # survives a restart, so no work may be created at all.
+    if not (message_id or "").strip():
+        return Admission(admitted=False, refused=True, reason="unstable_message_identity")
 
     return Admission(admitted=True, refused=False, reason="admitted", request_text=request_text)
 
@@ -317,6 +372,25 @@ def conversation_ref(conversation_key: str) -> str:
     is ever used as a destination.
     """
     digest = hashlib.sha256(f"{SCHEMA}|{conversation_key}".encode("utf-8")).hexdigest()
+    return digest[:32]
+
+
+def derive_request_id(ref: str, message_id: str) -> str:
+    """Stable Stage-A work identity for one authenticated inbound message.
+
+    Derived, never random: the same platform message always yields the
+    same ``request_id``, so a redelivery that arrives after this process
+    (or the whole gateway) has restarted is recognisable as the *same*
+    work by the controller's own request-id persistence, not merely by a
+    cache that died with the process.  Distinct messages yield distinct
+    ids because the platform's message id is distinct.
+
+    The real message id is consumed by the digest and never leaves the
+    process, so this adds no identifier to the wire.
+    """
+    digest = hashlib.sha256(
+        f"{SCHEMA}|request_id|{ref}|{message_id}".encode("utf-8")
+    ).hexdigest()
     return digest[:32]
 
 
@@ -418,12 +492,19 @@ def validate_reply(payload: Dict[str, Any], *, request_id: str, ref: str) -> Tup
 # --- socket preflight --------------------------------------------------
 
 
-def check_socket_path(path: str, expected_uid: Optional[int]) -> None:
+def check_socket_path(path: str, expected_uid: int) -> os.stat_result:
     """Refuse a socket that a local attacker could have substituted.
 
-    The socket must be group-writable for a separate gateway identity to
-    connect at all, so the test is world-writability — on the socket and
-    on the directory that holds it — plus an optional exact owner.
+    The socket itself must stay group-writable for a separate gateway
+    identity to connect at all, so on the socket the test is exact
+    ownership plus world-writability.  The *directory* has no such
+    excuse — connecting needs only search permission on it, never write
+    — so any writability beyond its owner is refused outright, and its
+    owner must be the controller identity or ``root``.  That is what
+    removes the ability to swap the socket out from under this client.
+
+    Returns the socket's ``stat`` result so the caller can prove after
+    connecting that it is still the same object.
     """
     try:
         st = os.stat(path)
@@ -433,7 +514,7 @@ def check_socket_path(path: str, expected_uid: Optional[int]) -> None:
         raise BridgeError("socket_not_a_socket")
     if st.st_mode & stat.S_IWOTH:
         raise BridgeError("socket_world_writable")
-    if expected_uid is not None and st.st_uid != expected_uid:
+    if st.st_uid != expected_uid:
         raise BridgeError("socket_owner_mismatch")
 
     parent = os.path.dirname(os.path.abspath(path)) or os.sep
@@ -443,17 +524,96 @@ def check_socket_path(path: str, expected_uid: Optional[int]) -> None:
         raise BridgeError("socket_unavailable") from exc
     if dir_st.st_mode & stat.S_IWOTH:
         raise BridgeError("socket_dir_world_writable")
+    if dir_st.st_mode & stat.S_IWGRP:
+        raise BridgeError("socket_dir_group_writable")
+    if dir_st.st_uid not in (expected_uid, 0):
+        raise BridgeError("socket_dir_owner_mismatch")
+    return st
+
+
+def check_socket_identity(path: str, preimage: os.stat_result) -> None:
+    """Prove the socket is the very object that passed :func:`check_socket_path`.
+
+    Closes the window between the preflight ``stat`` and the ``connect``:
+    if the path now resolves to a different inode, the connection that
+    was just opened cannot be trusted to be the one that was checked.
+    """
+    try:
+        st = os.stat(path)
+    except OSError as exc:
+        raise BridgeError("socket_replaced") from exc
+    if (st.st_dev, st.st_ino) != (preimage.st_dev, preimage.st_ino):
+        raise BridgeError("socket_replaced")
+
+
+# --- connected-peer confinement ----------------------------------------
+
+
+def read_peer_uid(sock: Any) -> Optional[int]:
+    """Effective uid of the process on the other end, or ``None``.
+
+    ``None`` means *this platform cannot prove it* — which the caller
+    treats as a refusal, never as permission.  Linux answers through
+    ``SO_PEERCRED``; the BSD/macOS family answers through
+    ``LOCAL_PEERCRED``.
+    """
+    if sock is None:
+        return None
+
+    so_peercred = getattr(socket_module, "SO_PEERCRED", None)
+    if so_peercred is not None:
+        try:
+            raw = sock.getsockopt(socket_module.SOL_SOCKET, so_peercred, struct.calcsize("3i"))
+            _pid, uid, _gid = struct.unpack("3i", raw)
+        except (OSError, struct.error, ValueError):
+            return None
+        return int(uid)
+
+    local_peercred = getattr(socket_module, "LOCAL_PEERCRED", None)
+    if local_peercred is not None:
+        # struct xucred: version, then the effective uid.
+        size = struct.calcsize("2I")
+        try:
+            raw = sock.getsockopt(_SOL_LOCAL, local_peercred, size)
+            version, uid = struct.unpack("2I", raw[:size])
+        except (OSError, struct.error, ValueError):
+            return None
+        if version != _XUCRED_VERSION:
+            return None
+        return int(uid)
+
+    return None
+
+
+def verify_connected_peer(sock: Any, expected_uid: int) -> None:
+    """Fail closed unless the connected peer *is* the expected identity.
+
+    Path checks describe an object; this describes the process actually
+    holding the other end of this connection, which is the only thing
+    that can be trusted once the request is about to be written.  A
+    platform that cannot answer is refused rather than assumed safe.
+    """
+    uid = read_peer_uid(sock)
+    if uid is None:
+        raise BridgeError("peer_unverifiable")
+    if uid != expected_uid:
+        raise BridgeError("peer_owner_mismatch")
 
 
 # --- replay guard ------------------------------------------------------
 
 
 class ReplayGuard:
-    """Bounded first-seen guard over ``(conversation, message)`` keys.
+    """Bounded in-process first-seen guard over derived request ids.
 
     Keys are recorded *before* the exchange starts, so a duplicate that
     arrives while the first request is still in flight cannot create a
     second one.
+
+    This is an optimisation, not the idempotency boundary.  It is process
+    memory and dies with the process; the guarantee that survives a
+    restart is that :func:`derive_request_id` hands the controller the
+    same id for the same inbound message.
     """
 
     def __init__(
@@ -483,14 +643,6 @@ class ReplayGuard:
         return True
 
 
-def replay_key(ref: str, message_id: Optional[str], text: str) -> str:
-    """Stable dedupe key for one inbound Owner message."""
-    if message_id:
-        return f"{ref}|id:{message_id}"
-    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()[:32]
-    return f"{ref}|tx:{digest}"
-
-
 # --- bridge ------------------------------------------------------------
 
 
@@ -510,28 +662,40 @@ class StageAOwnerBridge:
     ) -> None:
         self._secret_getter = secret_getter
         self._channel = channel
-        self._config: Optional[BridgeConfig] = None
-        self._config_error: Optional[str] = None
-        self._config_loaded = False
+        self._owner_user_id: Optional[str] = None
+        self._owner_loaded = False
         self._guard = ReplayGuard()
         self._inflight = 0
 
     # -- configuration --
 
-    def _resolve_config(self) -> Optional[BridgeConfig]:
-        if not self._config_loaded:
-            self._config_loaded = True
-            try:
-                self._config = load_config(self._secret_getter)
-            except BridgeError as exc:
-                self._config = None
-                self._config_error = exc.code
-                logger.error("[stagea] bridge configuration rejected: %s", exc.code)
-        return self._config
+    def _resolve_owner_user_id(self) -> Optional[str]:
+        """The primary gate, resolved once.  Never raises."""
+        if not self._owner_loaded:
+            self._owner_loaded = True
+            self._owner_user_id = load_owner_user_id(self._secret_getter)
+        return self._owner_user_id
+
+    def _resolve_config(self, owner_user_id: str) -> BridgeConfig:
+        """Secondary configuration, resolved only for an Owner candidate.
+
+        Deliberately not cached: it is reached only after admission, so it
+        runs at most once per admitted Owner request, and a corrected
+        deployment takes effect without a restart.
+
+        Raises:
+            BridgeError: ``config_invalid``.
+        """
+        try:
+            return load_config(self._secret_getter, owner_user_id=owner_user_id)
+        except BridgeError as exc:
+            logger.error("[stagea] bridge configuration rejected: %s", exc.code)
+            raise
 
     @property
     def enabled(self) -> bool:
-        return self._resolve_config() is not None
+        """Whether the primary gate is configured at all."""
+        return self._resolve_owner_user_id() is not None
 
     # -- main entry point --
 
@@ -552,29 +716,36 @@ class StageAOwnerBridge:
             or ``None`` when the message is ordinary and must continue
             through the caller's normal routing.
         """
-        config = self._resolve_config()
-        if config is None:
-            # A broken configuration must not silently look like "off"
-            # for the Owner's own Stage-A attempts.
-            if self._config_error and _strip_marker(text or "") is not None:
-                return refusal_text(self._config_error)
-            return None
-
+        # Classification first, and against the primary gate only: until
+        # a message is known to be an exact Owner Stage-A candidate, no
+        # secondary configuration — valid, invalid or absent — may change
+        # what happens to it.
+        owner_user_id = self._resolve_owner_user_id()
         decision = classify(
-            config,
+            owner_user_id,
             chat_type=chat_type,
             sender_id=sender_id,
             text=text,
             has_media=has_media,
+            message_id=message_id,
         )
-        if not decision.consumed:
+        # ``owner_user_id is None`` already implies nothing was consumed;
+        # naming it here keeps the narrowing explicit instead of relying
+        # on an assertion that ``python -O`` would strip.
+        if not decision.consumed or owner_user_id is None:
             return None
         if decision.refused:
             logger.info("[stagea] request refused: %s", decision.reason)
             return refusal_text(decision.reason)
 
+        try:
+            config = self._resolve_config(owner_user_id)
+        except BridgeError as exc:
+            return refusal_text(exc.code)
+
         ref = conversation_ref(conversation_key)
-        if not self._guard.check_and_record(replay_key(ref, message_id, decision.request_text)):
+        request_id = derive_request_id(ref, (message_id or "").strip())
+        if not self._guard.check_and_record(request_id):
             logger.info("[stagea] duplicate request suppressed")
             return refusal_text("duplicate_request")
 
@@ -582,7 +753,6 @@ class StageAOwnerBridge:
             logger.warning("[stagea] refusing request: %d already in flight", self._inflight)
             return refusal_text("too_many_inflight")
 
-        request_id = uuid.uuid4().hex
         self._inflight += 1
         try:
             outcome, reply = await self._exchange(config, request_id, ref, decision.request_text)
@@ -614,7 +784,9 @@ class StageAOwnerBridge:
         if open_unix_connection is None:
             raise BridgeError("platform_unsupported")
 
-        await asyncio.to_thread(check_socket_path, config.socket_path, config.socket_uid)
+        preimage = await asyncio.to_thread(
+            check_socket_path, config.socket_path, config.socket_uid
+        )
 
         frame = encode_frame(
             build_request(
@@ -634,6 +806,12 @@ class StageAOwnerBridge:
             raise BridgeError("connect_failed") from exc
 
         try:
+            # Nothing is written until the process on the other end has
+            # been proven to be the expected identity, and the path has
+            # been proven not to have been swapped since the preflight.
+            verify_connected_peer(writer.get_extra_info("socket"), config.socket_uid)
+            await asyncio.to_thread(check_socket_identity, config.socket_path, preimage)
+
             try:
                 writer.write(frame)
                 await writer.drain()
