@@ -22,7 +22,11 @@ Hard boundaries, all enforced below rather than by convention:
 * **Off unless configured.**  With no Owner id configured the bridge is
   completely inert: :meth:`StageAOwnerBridge.process` returns ``None`` on
   the first check and ordinary routing is bit-identical to a tree without
-  this module.
+  this module.  All three settings are non-secret behaviour and live in
+  ``config.yaml`` under the host adapter's own ``extra`` block —
+  ``gateway.platforms.<platform>.extra.stagea_*`` — read through that
+  adapter's profile-scoped configuration reader.  Nothing here reads the
+  environment: ``.env`` is for credentials, and this bridge holds none.
 * **The Owner only.**  A request is admitted only if it *already passed*
   the adapter's own intake authorization and the sender equals the one
   configured Stage-A Owner id, in a direct message, text-only, beginning
@@ -119,12 +123,20 @@ _REPLY_KEYS = frozenset(
 REQUEST_MARKER = "/stagea"
 
 #: Conceptual target from #197 §A3.  The exact path stays host-compatible
-#: through :data:`ENV_SOCKET_PATH`.
+#: through :data:`CONFIG_SOCKET_PATH`.
 DEFAULT_SOCKET_PATH = "/run/dyhano-stagea/owner-bridge.sock"
 
-ENV_OWNER_USER_ID = "HERMES_STAGEA_OWNER_WEIXIN_USER_ID"
-ENV_SOCKET_PATH = "HERMES_STAGEA_BRIDGE_SOCKET"
-ENV_SOCKET_UID = "HERMES_STAGEA_BRIDGE_SOCKET_UID"
+# Stage-A's three settings are non-secret behaviour — which Owner, which
+# socket, whose uid — so they are ordinary platform configuration and
+# live where every other tunable on the host adapter lives: ``config.yaml``
+# under that platform's ``extra`` block, read through the adapter's own
+# profile-scoped reader.  They are deliberately *not* environment
+# variables: ``.env`` is for credentials, and an ambient variable is
+# process-wide, so it could not be scoped to one profile even if it were
+# allowed.
+CONFIG_OWNER_USER_ID = "stagea_owner_user_id"
+CONFIG_SOCKET_PATH = "stagea_bridge_socket_path"
+CONFIG_SOCKET_UID = "stagea_bridge_socket_uid"
 
 MAX_REQUEST_TEXT_BYTES = 8192
 MAX_FRAME_BYTES = 65536
@@ -233,11 +245,12 @@ def load_owner_user_id(getter: Callable[[str, Optional[str]], Optional[str]]) ->
     Stage-A outcome.  ``None`` means the bridge is off and ordinary
     routing is bit-identical to a tree without this module.
 
-    ``getter`` is the adapter's profile-scoped configuration reader, so a
-    secondary multiplexed profile cannot borrow the default profile's
-    Stage-A binding.
+    ``getter`` is the adapter's profile-scoped configuration reader — the
+    platform's own ``config.yaml`` ``extra`` block — so a secondary
+    multiplexed profile cannot borrow the default profile's Stage-A
+    binding.
     """
-    return (getter(ENV_OWNER_USER_ID, "") or "").strip() or None
+    return (getter(CONFIG_OWNER_USER_ID, "") or "").strip() or None
 
 
 def load_config(
@@ -254,9 +267,9 @@ def load_config(
             Enabled-but-broken fails closed rather than degrading to a
             weaker check.
     """
-    socket_path = (getter(ENV_SOCKET_PATH, "") or "").strip() or DEFAULT_SOCKET_PATH
+    socket_path = (getter(CONFIG_SOCKET_PATH, "") or "").strip() or DEFAULT_SOCKET_PATH
 
-    raw_uid = (getter(ENV_SOCKET_UID, "") or "").strip()
+    raw_uid = (getter(CONFIG_SOCKET_UID, "") or "").strip()
     if not raw_uid:
         raise BridgeError("config_invalid")
     try:
@@ -315,6 +328,36 @@ def _strip_marker(text: str) -> Optional[str]:
     return remainder.strip()
 
 
+def is_owner_candidate(
+    owner_user_id: Optional[str],
+    *,
+    chat_type: str,
+    sender_id: Optional[str],
+    text: str,
+) -> bool:
+    """Whether this message is an exact Owner Stage-A candidate.
+
+    These are the checks that decide *whose* message this is — bridge
+    enabled, direct message, exact Owner, explicit marker — and nothing
+    else.  Deliberately independent of anything that could *refuse* a
+    request: media, size, message identity and configuration validity all
+    describe a message that is already the Owner's, and answering those
+    is :func:`classify`'s job.
+
+    Kept separate because the intake path needs the same question one
+    step earlier, before it decides whether an adapter-level cache may
+    discard the message.  Sharing the predicate is what keeps that
+    decision from drifting away from the one the bridge itself makes.
+    """
+    if owner_user_id is None:
+        return False
+    if chat_type != "dm":
+        return False
+    if (sender_id or "") != owner_user_id:
+        return False
+    return _strip_marker(text or "") is not None
+
+
 def classify(
     owner_user_id: Optional[str],
     *,
@@ -333,16 +376,14 @@ def classify(
     once the message is known to be an exact Owner Stage-A candidate may
     a problem be answered instead of routed.
     """
-    if owner_user_id is None:
-        return _PASS_THROUGH
-    if chat_type != "dm":
-        return _PASS_THROUGH
-    if (sender_id or "") != owner_user_id:
+    if not is_owner_candidate(
+        owner_user_id, chat_type=chat_type, sender_id=sender_id, text=text
+    ):
         return _PASS_THROUGH
 
-    request_text = _strip_marker(text or "")
-    if request_text is None:
-        return _PASS_THROUGH
+    # The gate above already proved the marker is present, so this is the
+    # request text and never ``None``.
+    request_text = _strip_marker(text or "") or ""
 
     # From here the Owner has explicitly asked for Stage-A, so a problem
     # is answered rather than quietly handed to ordinary routing.
@@ -657,10 +698,10 @@ class StageAOwnerBridge:
     def __init__(
         self,
         *,
-        secret_getter: Callable[[str, Optional[str]], Optional[str]],
+        config_getter: Callable[[str, Optional[str]], Optional[str]],
         channel: str,
     ) -> None:
-        self._secret_getter = secret_getter
+        self._config_getter = config_getter
         self._channel = channel
         self._owner_user_id: Optional[str] = None
         self._owner_loaded = False
@@ -673,7 +714,7 @@ class StageAOwnerBridge:
         """The primary gate, resolved once.  Never raises."""
         if not self._owner_loaded:
             self._owner_loaded = True
-            self._owner_user_id = load_owner_user_id(self._secret_getter)
+            self._owner_user_id = load_owner_user_id(self._config_getter)
         return self._owner_user_id
 
     def _resolve_config(self, owner_user_id: str) -> BridgeConfig:
@@ -687,7 +728,7 @@ class StageAOwnerBridge:
             BridgeError: ``config_invalid``.
         """
         try:
-            return load_config(self._secret_getter, owner_user_id=owner_user_id)
+            return load_config(self._config_getter, owner_user_id=owner_user_id)
         except BridgeError as exc:
             logger.error("[stagea] bridge configuration rejected: %s", exc.code)
             raise
@@ -696,6 +737,31 @@ class StageAOwnerBridge:
     def enabled(self) -> bool:
         """Whether the primary gate is configured at all."""
         return self._resolve_owner_user_id() is not None
+
+    # -- intake --
+
+    def is_owner_candidate(
+        self, *, chat_type: str, sender_id: Optional[str], text: str
+    ) -> bool:
+        """Whether this inbound message is an exact Owner Stage-A candidate.
+
+        Answers the same question :meth:`process` answers first, against
+        the same primary gate, but without touching the replay guard, the
+        in-flight counter, the secondary configuration or the socket — so
+        the intake path can ask it before it has decided what to do with
+        the message, as many times as it likes, with no side effect.
+
+        A caller uses this to keep its *own* caches from destroying a
+        distinct Owner request; it grants nothing.  Whether a candidate is
+        admitted, refused or passed through is still decided entirely by
+        :meth:`process`.
+        """
+        return is_owner_candidate(
+            self._resolve_owner_user_id(),
+            chat_type=chat_type,
+            sender_id=sender_id,
+            text=text,
+        )
 
     # -- main entry point --
 

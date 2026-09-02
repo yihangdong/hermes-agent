@@ -32,6 +32,7 @@ from gateway.stagea_owner_bridge import (
     conversation_ref,
     derive_request_id,
     encode_frame,
+    is_owner_candidate,
     load_config,
     load_owner_user_id,
     read_frame,
@@ -40,6 +41,7 @@ from gateway.stagea_owner_bridge import (
 )
 
 OWNER = "owner-user-id"
+OTHER = "someone-else-user-id"
 SOCKET = "/run/dyhano-stagea/owner-bridge.sock"
 SOCKET_DIR = os.path.dirname(SOCKET)
 CONTROLLER_UID = 4242
@@ -47,9 +49,9 @@ CONFIG = BridgeConfig(owner_user_id=OWNER, socket_path=SOCKET, socket_uid=CONTRO
 
 #: The configuration an enabled bridge needs now that an exact expected
 #: controller uid is mandatory rather than optional.
-ENABLED_ENV = {
-    bridge.ENV_OWNER_USER_ID: OWNER,
-    bridge.ENV_SOCKET_UID: str(CONTROLLER_UID),
+ENABLED_CONFIG = {
+    bridge.CONFIG_OWNER_USER_ID: OWNER,
+    bridge.CONFIG_SOCKET_UID: str(CONTROLLER_UID),
 }
 
 
@@ -129,10 +131,10 @@ class TestConfiguration:
 
     def test_absent_owner_id_disables_the_bridge(self):
         assert load_owner_user_id(_getter({})) is None
-        assert load_owner_user_id(_getter({bridge.ENV_OWNER_USER_ID: "   "})) is None
+        assert load_owner_user_id(_getter({bridge.CONFIG_OWNER_USER_ID: "   "})) is None
 
     def test_owner_id_is_the_only_primary_gate(self):
-        assert load_owner_user_id(_getter({bridge.ENV_OWNER_USER_ID: OWNER})) == OWNER
+        assert load_owner_user_id(_getter({bridge.CONFIG_OWNER_USER_ID: OWNER})) == OWNER
 
     def test_primary_gate_cannot_fail(self):
         """A bare identifier has no parse step, so it can never be 'invalid'.
@@ -142,10 +144,10 @@ class TestConfiguration:
         classification has no failure mode at all.
         """
         for value in ("not-a-number", "-1", "1.5", "\x00", "  spaced  "):
-            assert load_owner_user_id(_getter({bridge.ENV_OWNER_USER_ID: value})) is not None
+            assert load_owner_user_id(_getter({bridge.CONFIG_OWNER_USER_ID: value})) is not None
 
     def test_secondary_config_defaults_to_the_conceptual_socket(self):
-        config = load_config(_getter(ENABLED_ENV), owner_user_id=OWNER)
+        config = load_config(_getter(ENABLED_CONFIG), owner_user_id=OWNER)
         assert config == BridgeConfig(
             owner_user_id=OWNER,
             socket_path=bridge.DEFAULT_SOCKET_PATH,
@@ -154,7 +156,7 @@ class TestConfiguration:
 
     def test_socket_path_is_host_compatible(self):
         config = load_config(
-            _getter({**ENABLED_ENV, bridge.ENV_SOCKET_PATH: "/tmp/hostpath/owner-bridge.sock"}),
+            _getter({**ENABLED_CONFIG, bridge.CONFIG_SOCKET_PATH: "/tmp/hostpath/owner-bridge.sock"}),
             owner_user_id=OWNER,
         )
         assert config.socket_path == "/tmp/hostpath/owner-bridge.sock"
@@ -163,7 +165,7 @@ class TestConfiguration:
     def test_unusable_expected_uid_fails_closed(self, raw):
         with pytest.raises(BridgeError) as excinfo:
             load_config(
-                _getter({**ENABLED_ENV, bridge.ENV_SOCKET_UID: raw}), owner_user_id=OWNER
+                _getter({**ENABLED_CONFIG, bridge.CONFIG_SOCKET_UID: raw}), owner_user_id=OWNER
             )
         assert excinfo.value.code == "config_invalid"
 
@@ -172,7 +174,7 @@ class TestConfiguration:
         """An enabled bridge that cannot name its peer must not connect."""
         with pytest.raises(BridgeError) as excinfo:
             load_config(
-                _getter({bridge.ENV_OWNER_USER_ID: OWNER, bridge.ENV_SOCKET_UID: raw}),
+                _getter({bridge.CONFIG_OWNER_USER_ID: OWNER, bridge.CONFIG_SOCKET_UID: raw}),
                 owner_user_id=OWNER,
             )
         assert excinfo.value.code == "config_invalid"
@@ -180,8 +182,8 @@ class TestConfiguration:
     @pytest.mark.asyncio
     async def test_broken_configuration_never_looks_like_disabled_to_the_owner(self):
         instance = StageAOwnerBridge(
-            secret_getter=_getter(
-                {bridge.ENV_OWNER_USER_ID: OWNER, bridge.ENV_SOCKET_UID: "nope"}
+            config_getter=_getter(
+                {bridge.CONFIG_OWNER_USER_ID: OWNER, bridge.CONFIG_SOCKET_UID: "nope"}
             ),
             channel="weixin",
         )
@@ -210,8 +212,8 @@ class TestAdmissionOrdering:
     @staticmethod
     def _broken():
         return StageAOwnerBridge(
-            secret_getter=_getter(
-                {bridge.ENV_OWNER_USER_ID: OWNER, bridge.ENV_SOCKET_UID: "nope"}
+            config_getter=_getter(
+                {bridge.CONFIG_OWNER_USER_ID: OWNER, bridge.CONFIG_SOCKET_UID: "nope"}
             ),
             channel="weixin",
         )
@@ -279,6 +281,139 @@ class TestAdmissionOrdering:
                     )
         opened.assert_not_called()
         preflight.assert_not_called()
+
+
+class TestOwnerCandidateGate:
+    """The "whose message is this" predicate the intake path shares.
+
+    The Weixin adapter asks this one step before ``classify``, to keep its
+    own content-fingerprint cache from discarding a distinct Owner
+    request.  Sharing the predicate is what stops that decision from
+    drifting away from the one the bridge makes.
+    """
+
+    @pytest.mark.parametrize(
+        "owner,kwargs",
+        [
+            pytest.param(None, {}, id="bridge-off"),
+            pytest.param(OWNER, {"chat_type": "group"}, id="not-a-dm"),
+            pytest.param(OWNER, {"sender_id": "someone-else"}, id="not-the-owner"),
+            pytest.param(OWNER, {"sender_id": None}, id="no-sender"),
+            pytest.param(OWNER, {"text": "what is the lane?"}, id="no-marker"),
+            pytest.param(OWNER, {"text": "/stageant go"}, id="marker-is-a-prefix"),
+            pytest.param(OWNER, {"text": "please /stagea go"}, id="marker-not-leading"),
+        ],
+    )
+    def test_a_pass_through_message_is_not_a_candidate(self, owner, kwargs):
+        params = {"chat_type": "dm", "sender_id": OWNER, "text": "/stagea go"}
+        params.update(kwargs)
+        assert is_owner_candidate(owner, **params) is False
+        # …and ``classify`` agrees: it routes the message onward untouched.
+        assert _classify(owner, **params, has_media=False, message_id="m1").consumed is False
+
+    @pytest.mark.parametrize(
+        "kwargs,reason",
+        [
+            pytest.param({"has_media": True}, "media_not_admitted", id="media"),
+            pytest.param({"text": "/stagea"}, "empty_request", id="empty"),
+            pytest.param({"message_id": ""}, "unstable_message_identity", id="no-id"),
+        ],
+    )
+    def test_a_refusable_request_is_still_the_owners_message(self, kwargs, reason):
+        """Refusable and pass-through are different questions.
+
+        Everything that can *refuse* a request describes a message that is
+        already the Owner's, so the gate must still call it a candidate —
+        otherwise the intake path would treat a refused Stage-A request as
+        ordinary traffic.
+        """
+        params = {"chat_type": "dm", "sender_id": OWNER, "text": "/stagea go"}
+        params.update({k: v for k, v in kwargs.items() if k == "text"})
+        assert is_owner_candidate(OWNER, **params) is True
+
+        decision = _classify(OWNER, **{**params, **kwargs})
+        assert decision.refused is True
+        assert decision.reason == reason
+
+    def test_the_ordinary_case_is_a_candidate(self):
+        assert (
+            is_owner_candidate(OWNER, chat_type="dm", sender_id=OWNER, text="  /stagea  go  ")
+            is True
+        )
+
+    def test_the_gate_never_reads_the_secondary_configuration(self):
+        """Asking "is this the Owner's?" must not touch socket settings.
+
+        The admission ordering property depends on it: a broken deployment
+        must not be able to change what happens to a message before that
+        message is known to be the Owner's.
+        """
+
+        def explode_on_secondary(name, default=None):
+            if name != bridge.CONFIG_OWNER_USER_ID:
+                raise AssertionError(f"secondary configuration read: {name}")
+            return OWNER
+
+        instance = StageAOwnerBridge(config_getter=explode_on_secondary, channel="weixin")
+        assert (
+            instance.is_owner_candidate(chat_type="dm", sender_id=OWNER, text="/stagea go")
+            is True
+        )
+        assert (
+            instance.is_owner_candidate(chat_type="dm", sender_id=OTHER, text="/stagea go")
+            is False
+        )
+
+    @pytest.mark.asyncio
+    async def test_the_gate_has_no_side_effect_on_the_request_that_follows(self):
+        """It is asked about every inbound message, so it must cost nothing.
+
+        Two ways a side effect would show up, both fatal: consuming the
+        replay guard would make the real request one step later look like
+        a duplicate of the question the intake path just asked, and
+        counting against the in-flight ceiling would refuse it outright.
+        The gate is asked more times than that ceiling allows before the
+        real request is made.
+        """
+        instance = StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+        for _ in range(bridge.MAX_INFLIGHT_REQUESTS + 5):
+            assert (
+                instance.is_owner_candidate(chat_type="dm", sender_id=OWNER, text="/stagea go")
+                is True
+            )
+
+        async def request(message_id):
+            open_connection, captured = TestExchange._connection()
+            with _socket_layer(open_connection):
+                reply = await instance.process(
+                    chat_type="dm",
+                    sender_id=OWNER,
+                    text="/stagea go",
+                    has_media=False,
+                    conversation_key="weixin|acct|chat-1|owner-user-id",
+                    message_id=message_id,
+                )
+            return reply, captured
+
+        reply, captured = await request("m1")
+        assert "ACCEPTED_TERMINAL" in reply
+        assert len(captured) == 1
+
+        # A busy channel now asks the gate about more messages than the
+        # guard can hold.  If the gate recorded any of them, the accepted
+        # request's own entry would be evicted and its replay would be
+        # admitted as new work.
+        for index in range(bridge.REPLAY_CAPACITY + 10):
+            assert (
+                instance.is_owner_candidate(
+                    chat_type="dm", sender_id=OWNER, text=f"/stagea go {index}"
+                )
+                is True
+            )
+
+        replayed, captured = await request("m1")
+        assert "duplicate_request" in replayed
+        assert captured == []
 
 
 class TestAdmission:
@@ -728,11 +863,11 @@ class TestPeerConfinementOnARealSocket:
         server = await asyncio.start_unix_server(handle, path=path)
         try:
             instance = StageAOwnerBridge(
-                secret_getter=_getter(
+                config_getter=_getter(
                     {
-                        bridge.ENV_OWNER_USER_ID: OWNER,
-                        bridge.ENV_SOCKET_PATH: path,
-                        bridge.ENV_SOCKET_UID: str(os.getuid()),
+                        bridge.CONFIG_OWNER_USER_ID: OWNER,
+                        bridge.CONFIG_SOCKET_PATH: path,
+                        bridge.CONFIG_SOCKET_UID: str(os.getuid()),
                     }
                 ),
                 channel="weixin",
@@ -775,11 +910,11 @@ class TestPeerConfinementOnARealSocket:
         server = await asyncio.start_unix_server(handle, path=path)
         try:
             instance = StageAOwnerBridge(
-                secret_getter=_getter(
+                config_getter=_getter(
                     {
-                        bridge.ENV_OWNER_USER_ID: OWNER,
-                        bridge.ENV_SOCKET_PATH: path,
-                        bridge.ENV_SOCKET_UID: str(os.getuid()),
+                        bridge.CONFIG_OWNER_USER_ID: OWNER,
+                        bridge.CONFIG_SOCKET_PATH: path,
+                        bridge.CONFIG_SOCKET_UID: str(os.getuid()),
                     }
                 ),
                 channel="weixin",
@@ -857,7 +992,7 @@ class TestExchange:
 
     @staticmethod
     def _bridge():
-        return StageAOwnerBridge(secret_getter=_getter(ENABLED_ENV), channel="weixin")
+        return StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
 
     @staticmethod
     def _connection(reply_builder=None):
@@ -1001,7 +1136,7 @@ class TestExchange:
 
     @pytest.mark.asyncio
     async def test_disabled_bridge_never_touches_the_socket(self):
-        instance = StageAOwnerBridge(secret_getter=_getter({}), channel="weixin")
+        instance = StageAOwnerBridge(config_getter=_getter({}), channel="weixin")
         with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
             reply = await self._run(instance)
         assert reply is None
@@ -1095,7 +1230,7 @@ class TestExchange:
     @pytest.mark.asyncio
     async def test_an_enabled_bridge_without_an_expected_uid_never_connects(self):
         instance = StageAOwnerBridge(
-            secret_getter=_getter({bridge.ENV_OWNER_USER_ID: OWNER}), channel="weixin"
+            config_getter=_getter({bridge.CONFIG_OWNER_USER_ID: OWNER}), channel="weixin"
         )
         with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
             with patch.object(bridge, "check_socket_path") as preflight:
@@ -1108,23 +1243,81 @@ class TestExchange:
 class TestNoAlternateDestination:
     """The bridge owns exactly one delivery idea: reply where it was asked."""
 
-    def test_module_names_no_other_channel_or_transport(self):
-        source = open(bridge.__file__, encoding="utf-8").read().lower()
-        for forbidden in (
-            "telegram",
-            "discord",
-            "slack",
-            "webhook",
-            "outbox",
-            "broadcast",
-            "http://",
-            "https://",
-            "subprocess",
-            "create_unix_server",
-            "start_server",
-            "socket.bind",
-        ):
-            assert forbidden not in source, f"bridge must not reference {forbidden}"
+    @staticmethod
+    async def _request(instance):
+        return await instance.process(
+            chat_type="dm",
+            sender_id=OWNER,
+            text="/stagea advance",
+            has_media=False,
+            conversation_key="weixin|acct|chat-1|owner-user-id",
+            message_id="m1",
+        )
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _other_transports_armed():
+        """Make every transport but the one Unix socket fail loudly if used.
+
+        Each of these is a way a second destination could exist: another
+        socket, a listener, an HTTP call, a shelled-out command.  Arming
+        them turns "the bridge must not do that" into something the run
+        itself proves, instead of a substring the source happens not to
+        contain.
+        """
+        detonate = Mock(side_effect=AssertionError("second transport opened"))
+        detonate_async = AsyncMock(side_effect=AssertionError("second transport opened"))
+        with patch.object(asyncio, "open_connection", detonate_async, create=True):
+            with patch.object(asyncio, "start_server", detonate_async, create=True):
+                with patch.object(asyncio, "start_unix_server", detonate_async, create=True):
+                    with patch("subprocess.run", detonate):
+                        with patch("subprocess.Popen", detonate):
+                            with patch("urllib.request.urlopen", detonate):
+                                yield
+
+    @pytest.mark.asyncio
+    async def test_a_whole_exchange_uses_the_one_unix_socket_and_nothing_else(self):
+        """One request, one connection, one frame out — and no other transport."""
+        open_connection, captured = TestExchange._connection()
+        opened = []
+
+        async def counting_open(path):
+            opened.append(path)
+            return await open_connection(path)
+
+        instance = StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+        with self._other_transports_armed():
+            with _socket_layer(counting_open):
+                reply = await self._request(instance)
+
+        assert "ACCEPTED_TERMINAL" in reply
+        assert opened == [SOCKET]
+        assert len(captured) == 1
+
+    @pytest.mark.asyncio
+    async def test_the_reply_is_returned_to_the_caller_never_delivered(self):
+        """The bridge has no delivery power: it hands the text back and stops.
+
+        Whoever called it owns the conversation and does the sending, which
+        is what makes "same conversation only" enforceable at all.
+        """
+        open_connection, _ = TestExchange._connection()
+        instance = StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+        with self._other_transports_armed():
+            with _socket_layer(open_connection):
+                reply = await self._request(instance)
+
+        assert isinstance(reply, str) and reply.startswith(bridge.REPLY_PREFIX)
+
+    @pytest.mark.asyncio
+    async def test_a_failing_exchange_still_opens_no_other_transport(self):
+        """No fallback: a dead controller produces a refusal, not a retry elsewhere."""
+        instance = StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+        with self._other_transports_armed():
+            with patch("os.stat", side_effect=FileNotFoundError()):
+                reply = await self._request(instance)
+
+        assert "socket_unavailable" in reply
 
     def test_module_declares_no_listener_api(self):
         for forbidden in ("serve", "listen", "bind", "accept"):

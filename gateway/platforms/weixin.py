@@ -1002,31 +1002,51 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
     return ""
 
 
-#: Item types that *are* an attachment, whatever happens to the download.
-_ATTACHMENT_ITEM_TYPES = frozenset({ITEM_IMAGE, ITEM_VOICE, ITEM_FILE, ITEM_VIDEO})
+#: The only raw inbound item type that is provably plain text.  An
+#: allowlist, not a blocklist: a type this build has never heard of is
+#: exactly the case a blocklist gets wrong, and there is no safe way to
+#: guess what an unknown item is carrying.
+_TEXT_ITEM_TYPES = frozenset({ITEM_TEXT})
 
 
-def _has_attachment_item(item_list: Optional[List[Any]]) -> bool:
-    """Whether the inbound message carries an attachment, per its own metadata.
+def _is_text_only_message(item_list: Optional[List[Any]]) -> bool:
+    """Whether every raw inbound item is provably plain text.
 
     Deliberately independent of ``_collect_media``: that reports what was
     successfully *downloaded*, which is a different question.  A message
     whose image fetch fails still arrived carrying an image, and Stage-A's
-    text-only admission has to be decided on what was sent.  An item this
-    function cannot read is treated as an attachment, so an unrecognised
-    shape fails closed rather than passing as plain text — which is why
-    the annotation stays loose: this is untrusted inbound data, not a
-    structure the type system can vouch for.
+    text-only admission has to be decided on what was sent.
+
+    Quoted (``ref_msg``) items are held to the same rule — quoting a file
+    still puts a file in the message.  Anything this function cannot
+    positively identify as text — an unknown or absent type, a
+    non-``dict`` item, a malformed quote — makes the whole message
+    ineligible, which is why the annotation stays loose: this is
+    untrusted inbound data, not a structure the type system can vouch
+    for.  Ineligible does not mean refused; it means Stage-A never sees
+    it and ordinary routing handles it exactly as before.
     """
-    for item in item_list or []:
+    items = item_list or []
+    if not items:
+        return False
+    for item in items:
         if not isinstance(item, dict):
-            return True
-        if item.get("type") in _ATTACHMENT_ITEM_TYPES:
-            return True
-        ref_item = (item.get("ref_msg") or {}).get("message_item")
-        if isinstance(ref_item, dict) and ref_item.get("type") in _ATTACHMENT_ITEM_TYPES:
-            return True
-    return False
+            return False
+        if item.get("type") not in _TEXT_ITEM_TYPES:
+            return False
+        ref_message = item.get("ref_msg")
+        if ref_message is None:
+            continue
+        if not isinstance(ref_message, dict):
+            return False
+        ref_item = ref_message.get("message_item")
+        if ref_item is None:
+            continue
+        if not isinstance(ref_item, dict):
+            return False
+        if ref_item.get("type") not in _TEXT_ITEM_TYPES:
+            return False
+    return True
 
 
 def _message_type_from_media(media_types: List[str], text: str) -> MessageType:
@@ -1288,11 +1308,12 @@ class WeixinAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
-        # Stage-A Owner bridge.  Inert unless an Owner id is configured;
-        # the profile-scoped reader keeps a secondary multiplexed profile
-        # from borrowing the default profile's binding.
+        # Stage-A Owner bridge.  Inert unless an Owner id is configured
+        # in this profile's own ``extra`` block, which is what keeps a
+        # secondary multiplexed profile from borrowing the default
+        # profile's binding.
         self._stagea_bridge = StageAOwnerBridge(
-            secret_getter=_wx_secret, channel=Platform.WEIXIN.value
+            config_getter=self._stagea_config, channel=Platform.WEIXIN.value
         )
 
         if self._account_id and not self._token:
@@ -1300,6 +1321,30 @@ class WeixinAdapter(BasePlatformAdapter):
             if persisted:
                 self._token = str(persisted.get("token") or "").strip()
                 self._base_url = str(persisted.get("base_url") or self._base_url).strip().rstrip("/")
+
+    def _stagea_config(self, key: str, default: Optional[str] = None) -> Optional[str]:
+        """Read one non-secret Stage-A setting from this profile's config.
+
+        Which Owner, which socket, whose uid: behaviour, not credentials,
+        so they live in ``config.yaml`` under
+        ``gateway.platforms.weixin.extra.stagea_*`` alongside this
+        adapter's other tunables rather than in the environment.  Reading
+        them from ``self.config.extra`` also scopes them for free — that
+        dict belongs to this profile's own ``PlatformConfig``, so a
+        secondary multiplexed profile cannot inherit the default
+        profile's Stage-A binding the way a process-wide variable would
+        let it.
+
+        Values are normalised to text for the bridge's own parsing.
+        ``0`` is a legitimate uid, so presence is tested against ``None``
+        rather than truthiness.
+        """
+        extra = getattr(self.config, "extra", None) or {}
+        value = extra.get(key)
+        if value is None:
+            return default
+        text = str(value).strip()
+        return text or default
 
     def _coerce_float_extra(self, key: str, default: float) -> float:
         """Read a float from ``config.extra``, guarding against bad/non-finite values.
@@ -1513,16 +1558,37 @@ class WeixinAdapter(BasePlatformAdapter):
         if message_id and self._dedup.is_duplicate(message_id):
             return
 
-        # Secondary content-fingerprint dedup for text messages
         item_list = message.get("item_list") or []
         text = _extract_text(item_list)
-        if text:
+        chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
+
+        # Secondary content-fingerprint dedup for text messages.
+        #
+        # It catches what the message-id check above cannot: the same text
+        # redelivered under a *different* id.  For ordinary traffic that is
+        # the right trade — two identical lines in quick succession are one
+        # line sent twice.
+        #
+        # For Stage-A it is the wrong trade.  Two deliberate ``/stagea
+        # advance`` requests are two requests, and this fingerprint would
+        # silently destroy the second one *before* the bridge — whose whole
+        # idempotency story is derived from the platform's own message id —
+        # ever saw it.  So an exact Owner Stage-A candidate skips this one
+        # fingerprint and nothing else: the message-id check above still
+        # runs, so a real redelivery of one message still converges, and
+        # every other sender, chat and text keeps its existing behaviour.
+        #
+        # Skipping the *record* costs nothing either.  A candidate is
+        # consumed by the bridge in every case — admitted or refused — so
+        # it can never reach the ordinary path this fingerprint protects.
+        if text and not self._stagea_bridge.is_owner_candidate(
+            chat_type=chat_type, sender_id=sender_id, text=text
+        ):
             content_key = f"content:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"
             if self._dedup.is_duplicate(content_key):
                 logger.debug("[%s] Content-dedup: skipping duplicate message from %s", self.name, sender_id)
                 return
 
-        chat_type, effective_chat_id = _guess_chat_type(message, self._account_id)
         if chat_type == "group":
             if self._group_policy == "disabled":
                 return
@@ -1569,7 +1635,7 @@ class WeixinAdapter(BasePlatformAdapter):
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
         if await self._maybe_handle_stagea_owner_request(
-            event, has_attachment=_has_attachment_item(item_list)
+            event, text_only=_is_text_only_message(item_list)
         ):
             return
         if event.message_type == MessageType.TEXT:
@@ -1578,7 +1644,7 @@ class WeixinAdapter(BasePlatformAdapter):
             await self.handle_message(event)
 
     async def _maybe_handle_stagea_owner_request(
-        self, event: MessageEvent, *, has_attachment: bool
+        self, event: MessageEvent, *, text_only: bool
     ) -> bool:
         """Route one Owner Stage-A request over the local bridge.
 
@@ -1588,16 +1654,17 @@ class WeixinAdapter(BasePlatformAdapter):
         merely looks like a Stage-A request but is not from the Owner —
         returns ``False`` and continues down the pre-existing path.
 
-        ``has_attachment`` is read from the inbound metadata by the
-        caller.  Downloaded media is unioned in as well, so the reading is
-        never weaker than either source alone.
+        ``text_only`` is decided by the caller from the raw inbound item
+        metadata, on an allowlist: every item must be provably text.
+        Downloaded media is unioned in as well, so the reading is never
+        weaker than either source alone.
         """
         source = event.source
         reply = await self._stagea_bridge.process(
             chat_type=source.chat_type,
             sender_id=source.user_id,
             text=event.text or "",
-            has_media=has_attachment or bool(event.media_urls),
+            has_media=not text_only or bool(event.media_urls),
             conversation_key=f"{source.platform.value}|{self._account_id}|{source.chat_id}|{source.user_id}",
             message_id=event.message_id,
         )
