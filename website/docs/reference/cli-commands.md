@@ -146,7 +146,7 @@ hermes chat --ignore-user-config --ignore-rules -q "Repro without my personal se
 hermes chat --safe-mode -q "Is this bug mine or Hermes'?"
 ```
 
-### `hermes -z <prompt>` — scripted one-shot
+### `hermes -z [prompt]` — scripted one-shot
 
 For programmatic callers (shell scripts, CI, cron, parent processes piping in a prompt), `hermes -z` is the purest one-shot entry point: **single prompt in, final response text out, nothing else on stdout or stderr.** No banner, no spinner, no tool previews, no `Session:` line — just the agent's final reply as plain text.
 
@@ -157,6 +157,31 @@ hermes -z "What's the capital of France?"
 # Parent scripts can cleanly capture the response:
 answer=$(hermes -z "summarize this" < /path/to/file.txt)
 ```
+
+#### Passing the prompt on stdin
+
+Give `-z` no prompt argument and it reads one from stdin instead, to EOF:
+
+```bash
+echo "What's the capital of France?" | hermes -z
+hermes -z < prompt.txt
+answer=$(printf '%s' "$untrusted_text" | hermes -z)
+```
+
+Use this whenever the prompt is long, multi-line, or not yours to trust: the text never becomes a command-line argument, so it can't be truncated by a quote, expanded by the shell, or read out of the process table by other users on the machine.
+
+The bare form is deliberately strict, and every rejection happens **before** the model is called — nothing is sent and nothing is billed:
+
+| Condition | Result |
+|---|---|
+| stdin is a terminal | Refused (exit 2). Bare `-z` never sits waiting for a human to type. |
+| stdin is empty or whitespace-only | Refused (exit 2). |
+| stdin is not valid UTF-8 | Refused (exit 2). |
+| stdin is larger than 262144 bytes | Refused **whole** (exit 2) — the prompt is never silently truncated. |
+
+Passing a prompt argument keeps the old behaviour exactly: `-z "PROMPT"`, `--oneshot "PROMPT"` and `--oneshot=PROMPT` are unchanged and never touch stdin, so `hermes -z "summarize this" < file.txt` still sends `summarize this` and leaves the redirect for the agent's own tools.
+
+This is a different surface from `chat --query-file -`, which also reads stdin but seeds a chat session, replaces undecodable bytes instead of refusing them, and enforces no size limit.
 
 Per-run overrides (no mutation to `~/.hermes/config.yaml`):
 

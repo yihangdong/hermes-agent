@@ -48,7 +48,19 @@ jobs:
             runner: macos-latest
             marker: macos_only
           - name: Windows-only tests
-            runner: windows-latest-32-core
+            # ``windows-latest-32-core`` is an organization-scoped larger
+            # runner. A personal-account fork cannot resolve that label, so
+            # this lane sits QUEUED forever rather than running. The DYHANO
+            # canonical fork selects the ordinary GitHub-hosted standard
+            # Windows runner — free for public repositories, no runner
+            # topology added. Upstream keeps its 32-core label unchanged.
+            #
+            # Nothing else moves: same marker, same selector, same
+            # timeout-minutes, same zero-selected-tests guard. The block
+            # comment above already records why this lane is not sliced —
+            # the marked set is tens of tests, so it does not need the
+            # core count the Linux lane was tuned for.
+            runner: ${{ github.repository == 'yihangdong/hermes-agent' && 'windows-latest' || 'windows-latest-32-core' }}
             marker: windows_only
     steps:
       - name: Checkout code

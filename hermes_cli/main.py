@@ -202,8 +202,119 @@ def _cleanup_oneshot_runtime() -> None:
         pass
 
 
+#: Hard cap on a stdin-delivered one-shot prompt, counted in bytes rather
+#: than characters: the limit has to be enforceable *before* the input is
+#: decoded, so an oversized read is refused without ever being materialized
+#: or re-encoded.
+_ONESHOT_STDIN_MAX_BYTES = 262144
+
+
+def _oneshot_stdin_error(message: str) -> SystemExit:
+    """Build the fail-closed exit for a bare ``-z`` whose stdin is unusable.
+
+    Returned rather than raised so every call site reads ``raise
+    _oneshot_stdin_error(...)``: the refusal is visibly terminal where it
+    happens, and no caller can fall through one by accident. Exit code 2
+    marks it a usage error, matching ``--query-file``'s rejections.
+    """
+    sys.stderr.write(f"hermes -z: {message}\n")
+    return SystemExit(2)
+
+
+def _read_oneshot_prompt_from_stdin(stream=None) -> str:
+    """Read the single prompt for a bare ``-z``/``--oneshot`` from stdin.
+
+    Bare ``-z`` means "the prompt is on stdin": read to EOF and return it.
+    Every rejection below happens here — before ``hermes_cli.oneshot`` is
+    even imported — so a malformed prompt can never reach a provider:
+    nothing is sent, nothing is billed, and the failure surfaces as a usage
+    error instead of a model error.
+
+    Refused, all with exit code 2:
+
+    * no stdin, or stdin is a terminal — otherwise a bare ``-z`` typed at
+      an interactive shell would block forever waiting on a user who was
+      never prompted for anything;
+    * more than ``_ONESHOT_STDIN_MAX_BYTES`` bytes — refused whole, never
+      truncated, because a silently shortened prompt yields a wrong answer
+      that looks like a right one;
+    * not valid UTF-8;
+    * empty or whitespace-only.
+
+    The accepted prompt is returned exactly as received — no stripping — so
+    heredocs and trailing newlines reach the agent byte-for-byte, matching
+    how ``chat --query-file`` hands its text over.
+    """
+    if stream is None:
+        stream = sys.stdin
+    if stream is None:
+        raise _oneshot_stdin_error(
+            "bare -z reads the prompt from stdin, but this process has no "
+            'stdin. Pass the prompt as an argument (hermes -z "PROMPT") or '
+            "redirect a file or pipe into stdin."
+        )
+
+    try:
+        stdin_is_tty = bool(stream.isatty())
+    except Exception as exc:
+        raise _oneshot_stdin_error(
+            f"cannot determine whether stdin is a terminal ({exc}); refusing "
+            "to read a one-shot prompt from it."
+        ) from exc
+    if stdin_is_tty:
+        raise _oneshot_stdin_error(
+            "bare -z reads the prompt from stdin, but stdin is a terminal. "
+            'Pass the prompt as an argument (hermes -z "PROMPT"), or pipe one '
+            "in (echo 'PROMPT' | hermes -z)."
+        )
+
+    limit = _ONESHOT_STDIN_MAX_BYTES
+    # One byte past the limit is all it takes to prove the input is too
+    # large, so an oversized prompt is never fully read into memory.
+    buffer = getattr(stream, "buffer", None)
+    source = stream if buffer is None else buffer
+    try:
+        chunk = source.read(limit + 1)
+    except OSError as exc:
+        raise _oneshot_stdin_error(
+            f"cannot read the prompt from stdin: {exc}"
+        ) from exc
+    if chunk is None:
+        chunk = b""
+    if isinstance(chunk, str):
+        # Text-mode stdin (embedders, test doubles). ``surrogateescape``
+        # round-trips bytes the stream's own decoder already rejected, so
+        # undecodable input still fails the strict decode below instead of
+        # slipping through as U+FFFD.
+        chunk = chunk.encode("utf-8", "surrogateescape")
+
+    if len(chunk) > limit:
+        raise _oneshot_stdin_error(
+            f"prompt on stdin exceeds the {limit}-byte limit and was NOT "
+            "truncated. Shorten the input, or pass a shorter prompt as an "
+            "argument."
+        )
+
+    try:
+        prompt = chunk.decode("utf-8")
+    except UnicodeDecodeError as exc:
+        raise _oneshot_stdin_error(
+            f"prompt on stdin is not valid UTF-8 ({exc.reason} at byte "
+            f"{exc.start})."
+        ) from exc
+
+    if not prompt.strip():
+        raise _oneshot_stdin_error(
+            "prompt on stdin is empty. Bare -z expects exactly one prompt on "
+            'stdin; pass it as an argument (hermes -z "PROMPT") to send an '
+            "argv prompt instead."
+        )
+
+    return prompt
+
+
 def _run_and_exit_oneshot(
-    prompt: str,
+    prompt: object,
     *,
     model: object = None,
     provider: object = None,
@@ -211,6 +322,21 @@ def _run_and_exit_oneshot(
     skills: object = None,
     usage_file: object = None,
 ) -> None:
+    """Run one-shot mode and hard-exit; never returns.
+
+    ``prompt`` is either the argv PROMPT string or
+    ``_parser.ONESHOT_PROMPT_FROM_STDIN`` for a bare ``-z``. Every one-shot
+    dispatch site funnels through here, which is what makes this the single
+    place the stdin prompt is resolved — so it is read exactly once, and a
+    rejected prompt costs no provider call.
+    """
+    if not isinstance(prompt, str):
+        # ``ONESHOT_PROMPT_FROM_STDIN`` is the only non-string argparse can
+        # store in this slot, so this is the bare-`-z` case. Resolving it
+        # before the import below means a bad prompt never loads, let alone
+        # reaches, the provider path.
+        prompt = _read_oneshot_prompt_from_stdin()
+
     try:
         from hermes_cli.oneshot import run_oneshot
 

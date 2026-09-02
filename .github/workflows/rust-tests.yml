@@ -30,7 +30,17 @@ jobs:
     # cargo builds codegen units and test binaries in parallel across the
     # cores. This lane also builds the crate from the start when Cargo.toml
     # changes.
-    runs-on: ubuntu-latest-32-core
+    #
+    # ``ubuntu-latest-32-core`` is an organization-scoped larger runner that a
+    # personal-account fork cannot resolve, so on the DYHANO canonical fork
+    # this lane sits QUEUED forever instead of running. It reaches that state
+    # only because classify_changes.py line 214 forces every lane on for any
+    # .github/ change, so the runner-portability fix itself activates it.
+    # Select the ordinary GitHub-hosted standard runner there — free for
+    # public repositories, no runner topology added. cargo already scales its
+    # parallelism to the core count, so the same tests build and run, just
+    # with less of it; upstream keeps its 32-core label and behavior unchanged.
+    runs-on: ${{ github.repository == 'yihangdong/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
     timeout-minutes: 30
     defaults:
       run:

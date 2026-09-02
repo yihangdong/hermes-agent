@@ -37,6 +37,31 @@ def _wait_job(client, job_id: str, timeout: float = 10.0) -> dict:
     raise AssertionError(f"job {job_id} still running after {timeout}s")
 
 
+def _pin_machine_fit(monkeypatch):
+    """Pin the fit preflight so a test asserts its own branch, not the size
+    of the machine it happens to run on.
+
+    The quickstart route 409s unless ``select_variant`` returns a build for
+    some entry, and ``select_variant`` answers from ``probe_budget()`` —
+    real VRAM/RAM. The catalog fits a 377 GB CI box and does not fit a
+    16 GB standard runner, so a test that means to exercise the *success*
+    path has to say so rather than inherit the machine's verdict. Every
+    entry ships exactly one variant (see ``catalog.select_variant``), so
+    ``variants[0]`` is the build the real selector returns whenever it
+    returns one at all.
+
+    The refusal branch keeps its own coverage: ``select_variant`` -> None
+    in ``test_quickstart_refuses_when_nothing_fits``.
+    """
+    from hermes_cli.local_runtime.catalog import VariantChoice
+
+    monkeypatch.setattr(
+        "hermes_cli.local_runtime.catalog.select_variant",
+        lambda entry, budget: VariantChoice(variant=entry.variants[0],
+                                            zero_spill=True,
+                                            reason_key="best-fits"))
+
+
 def test_quickstart_unknown_model_404s(client):
     r = client.post("/api/local-models/quickstart", json={"model_id": "no-such"})
     assert r.status_code == 404
@@ -56,6 +81,8 @@ def test_quickstart_runs_all_three_legs(client, monkeypatch, tmp_path):
     """Fresh machine: install runtime -> download recommended -> activate.
     Each leg is asserted by its observable call, in order."""
     calls: list[str] = []
+
+    _pin_machine_fit(monkeypatch)
 
     # Leg 1: no runtime installed yet; install is the stubbed binaries call.
     monkeypatch.setattr(
@@ -112,6 +139,8 @@ def test_quickstart_skips_satisfied_legs(client, monkeypatch):
     the job goes straight to activation."""
     calls: list[str] = []
 
+    _pin_machine_fit(monkeypatch)
+
     monkeypatch.setattr(
         "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b10362"])
     monkeypatch.setattr(
@@ -158,15 +187,9 @@ def quickstart_ready(monkeypatch):
     installed and every entry's first variant is servable, so the POST
     reaches the single-flight lock instead of 409ing at fit/engine
     preflight on machines where nothing fits."""
-    from hermes_cli.local_runtime.catalog import VariantChoice
-
     monkeypatch.setattr(
         "hermes_cli.local_runtime.binaries.installed_tags", lambda: ["b10362"])
-    monkeypatch.setattr(
-        "hermes_cli.local_runtime.catalog.select_variant",
-        lambda entry, budget: VariantChoice(variant=entry.variants[0],
-                                            zero_spill=True,
-                                            reason_key="best-fits"))
+    _pin_machine_fit(monkeypatch)
     monkeypatch.setattr(
         "hermes_cli.web_routers.local_models._engine_too_old",
         lambda min_engine: False)
