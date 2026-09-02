@@ -15,6 +15,7 @@ import stat
 import struct
 import tempfile
 import time
+import warnings
 from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -1704,3 +1705,456 @@ class TestExchangeDeadlines:
 
         writer.close.assert_called_once_with()
         writer.wait_closed.assert_not_awaited()
+
+
+class _Stall:
+    """Bookkeeping for one adversarial awaitable.
+
+    A small object rather than a dict so each field keeps its own type:
+    a heterogeneous ``dict`` collapses to the union of its values, and the
+    counters below stop type-checking as counters.
+    """
+
+    def __init__(self) -> None:
+        self.release = asyncio.Event()
+        self.cancellations = 0
+        self.finished = 0
+
+
+class TestCancellationUncooperativeAwaitables:
+    """A step that will not acknowledge cancellation must not extend the exchange.
+
+    The deep/adversarial rereview's finding.  ``_Deadline.bounded``
+    delegated its timeout to :func:`asyncio.wait_for`, which reaches that
+    timeout by cancelling the inner await and then *waiting for the
+    acknowledgement*.  An awaitable that catches ``CancelledError`` and
+    stays pending therefore keeps the wrapper pending with it — and one
+    of the four in-flight slots with that — for as long as it likes, with
+    no external bound at all.
+
+    The committed deadline falsifiers stall on ``asyncio.Event().wait()``,
+    which *cooperates*: it ends the moment it is cancelled, ``wait_for``
+    returns promptly, and those tests pass without ever reaching this
+    boundary.  The doubles below are the ones that reach it — they
+    swallow every ``CancelledError`` until the test itself releases them,
+    which is the only thing that separates a deadline the bridge enforces
+    from one it merely asks for.
+    """
+
+    #: The declared deadlines, tightened so one exchange is short.
+    STEP = 0.02
+
+    #: Scheduling allowance added to the bridge's own declared budget, so
+    #: a loaded runner cannot turn a correct bound into a flake.  It hides
+    #: nothing: unbounded, none of these exchanges finishes *at all* until
+    #: the test releases the adversarial awaitable, so any finite bound
+    #: separates the two implementations.
+    SLACK = 0.5
+
+    #: Outer stop, so a regression fails an assertion instead of hanging
+    #: the suite.  Deliberately far above the bound being asserted.
+    OUTER = 5.0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _declared_deadlines(step=STEP, reply=STEP):
+        with patch.object(bridge, "CONNECT_TIMEOUT_SECONDS", step):
+            with patch.object(bridge, "REPLY_DEADLINE_SECONDS", reply):
+                yield
+
+    @staticmethod
+    def _uncooperative():
+        """An await that absorbs cancellation until the test releases it.
+
+        A plain ``async def`` on purpose: :class:`AsyncMock` only awaits a
+        side effect that :func:`asyncio.iscoroutinefunction` recognises,
+        and an object with an async ``__call__`` is not one — it would be
+        returned un-awaited and the double would quietly become
+        cooperative, proving nothing.
+        """
+        state = _Stall()
+
+        async def stall(*args, **kwargs):
+            while True:
+                try:
+                    await state.release.wait()
+                except asyncio.CancelledError:
+                    state.cancellations += 1
+                    continue
+                state.finished += 1
+                return None
+
+        return stall, state
+
+    @classmethod
+    def _connection(cls, stall_attr):
+        """A peer that answers, then refuses to acknowledge cancellation."""
+        stall, state = cls._uncooperative()
+        calls = {"connects": 0, "writes": 0}
+
+        async def open_connection(path):
+            calls["connects"] += 1
+            reader = asyncio.StreamReader()
+            writer = Mock()
+            writer.close = Mock()
+            writer.drain = AsyncMock()
+            writer.wait_closed = AsyncMock()
+            setattr(writer, stall_attr, AsyncMock(side_effect=stall))
+
+            def on_write(frame):
+                calls["writes"] += 1
+                request = json.loads(frame[4:].decode("utf-8"))
+                reader.feed_data(
+                    encode_frame(_reply(request["request_id"], request["conversation_ref"]))
+                )
+                reader.feed_eof()
+
+            writer.write = on_write
+            return reader, writer
+
+        return open_connection, state, calls
+
+    @staticmethod
+    def _bridge():
+        return StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+
+    @staticmethod
+    def _request(instance, message_id="m1"):
+        return instance.process(
+            chat_type="dm",
+            sender_id=OWNER,
+            text="/stagea advance",
+            has_media=False,
+            conversation_key="weixin|acct|chat-1|owner-user-id",
+            message_id=message_id,
+        )
+
+    @classmethod
+    async def _finished_within(cls, coro, *, bound):
+        """Run one request under a stop that does not rely on cancellation.
+
+        An outer :func:`asyncio.wait_for` is useless against this double:
+        reaching its timeout means cancelling the request, and a request
+        wedged behind an uncooperative await will not acknowledge that
+        either — the suite would hang rather than fail.
+        :func:`asyncio.wait` returns on time whatever the task does, which
+        is what makes the assertion below possible to state at all.
+        """
+        task = asyncio.ensure_future(coro)
+        started = time.monotonic()
+        done, _pending = await asyncio.wait({task}, timeout=cls.OUTER)
+        elapsed = time.monotonic() - started
+        assert done, f"the exchange was still unfinished after {cls.OUTER}s"
+        assert elapsed < bound, f"finished in {elapsed:.3f}s, past the {bound:.3f}s bound"
+        return task.result(), elapsed
+
+    @staticmethod
+    async def _settle(state, *, expected, deadline=2.0):
+        """Release the stall and let every abandoned copy of it end.
+
+        Cleanup, and deliberately assertion-free: it runs in a ``finally``,
+        so an assertion here would mask whichever failure sent the test
+        into it.  What the harvest actually has to guarantee is asserted
+        by :meth:`_drain_stragglers` in the tests that own that claim.
+        """
+        state.release.set()
+        stop = time.monotonic() + deadline
+        while state.finished < expected and time.monotonic() < stop:
+            await asyncio.sleep(0.01)
+        # One more turn so the loop can run each abandoned task's callback.
+        await asyncio.sleep(0)
+
+    @staticmethod
+    async def _drain_stragglers(before, *, deadline=2.0):
+        """Wait for every straggler this test created to be harvested."""
+        stop = time.monotonic() + deadline
+        while (set(bridge._stragglers) - before) and time.monotonic() < stop:
+            await asyncio.sleep(0.01)
+        return set(bridge._stragglers) - before
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _no_unobserved_tasks():
+        """Fail if the loop or the interpreter reports an unobserved task.
+
+        Abandoning a task is only legitimate while its end is still read.
+        Both ways that stops being true are watched here: the loop's
+        exception handler, where an unretrieved task exception surfaces,
+        and the ``RuntimeWarning`` the interpreter emits for a coroutine
+        that was never awaited or a task destroyed while still pending.
+        """
+        loop = asyncio.get_running_loop()
+        previous = loop.get_exception_handler()
+        reported = []
+        loop.set_exception_handler(lambda _loop, context: reported.append(context))
+        with warnings.catch_warnings(record=True) as caught:
+            warnings.simplefilter("always")
+            try:
+                yield
+            finally:
+                loop.set_exception_handler(previous)
+        leaked = [
+            str(w.message)
+            for w in caught
+            if issubclass(w.category, RuntimeWarning)
+            and ("never awaited" in str(w.message) or "destroyed" in str(w.message))
+        ]
+        assert reported == [], f"the loop reported an unobserved task: {reported}"
+        assert leaked == [], f"unobserved-task warnings: {leaked}"
+
+    # -- the bound itself, proved without releasing the stall --
+
+    @pytest.mark.asyncio
+    async def test_an_uncooperative_drain_cannot_outlive_the_exchange_budget(self):
+        """The rereviewer's first probe: a ``drain()`` that ignores cancellation.
+
+        Nothing releases the stall before the assertions — that is the
+        whole point.  The exchange has to end on its own declared budget,
+        hand the Owner the fail-closed answer, and give the slot back.
+        """
+        instance = self._bridge()
+        connection, state, calls = self._connection("drain")
+        try:
+            with _socket_layer(connection):
+                with self._declared_deadlines():
+                    bound = bridge._exchange_budget() + self.SLACK
+                    reply, _elapsed = await self._finished_within(
+                        self._request(instance), bound=bound
+                    )
+
+                    assert not state.release.is_set(), "the stall was released; nothing was proven"
+                    assert state.cancellations >= 1, "the double was never asked to cancel"
+                    assert "send_failed" in reply
+                    assert "No Stage-A work was created." in reply
+                    assert instance._inflight == 0
+                    assert calls == {"connects": 1, "writes": 1}
+        finally:
+            await self._settle(state, expected=1)
+
+    @pytest.mark.asyncio
+    async def test_an_uncooperative_close_cannot_withhold_an_answer_already_earned(self):
+        """The rereviewer's second probe: a ``wait_closed()`` that ignores cancellation.
+
+        The reply was read and validated before teardown began, so a peer
+        that will not finish closing has nothing left to decide — and must
+        not be able to take that answer back or keep the slot while it
+        declines to acknowledge.
+        """
+        instance = self._bridge()
+        connection, state, calls = self._connection("wait_closed")
+        try:
+            with _socket_layer(connection):
+                with self._declared_deadlines():
+                    bound = bridge._exchange_budget() + self.SLACK
+                    reply, _elapsed = await self._finished_within(
+                        self._request(instance), bound=bound
+                    )
+
+                    assert not state.release.is_set(), "the stall was released; nothing was proven"
+                    assert state.cancellations >= 1, "the double was never asked to cancel"
+                    assert reply == "[Stage-A] ACCEPTED_TERMINAL\ndone"
+                    assert instance._inflight == 0
+                    assert calls == {"connects": 1, "writes": 1}
+        finally:
+            await self._settle(state, expected=1)
+
+    @pytest.mark.asyncio
+    async def test_four_uncooperative_peers_cannot_retain_the_four_slots(self):
+        """The availability claim, against the adversarial double this time.
+
+        Four peers, one per admitted slot, none of them acknowledging
+        cancellation.  Every one has to be gone inside the budget, the
+        counter has to be back at zero, and the next Owner message has to
+        be admitted rather than refused as too many in flight.
+        """
+        instance = self._bridge()
+        connection, state, calls = self._connection("drain")
+        peers = bridge.MAX_INFLIGHT_REQUESTS
+        try:
+            with _socket_layer(connection):
+                with self._declared_deadlines():
+                    bound = bridge._exchange_budget() + self.SLACK
+                    burst, _elapsed = await self._finished_within(
+                        asyncio.gather(
+                            *(
+                                self._request(instance, message_id=f"burst-{n}")
+                                for n in range(peers)
+                            )
+                        ),
+                        bound=bound,
+                    )
+
+                    assert not state.release.is_set(), "the stall was released; nothing was proven"
+                    assert all("send_failed" in reply for reply in burst)
+                    assert instance._inflight == 0
+                    assert calls == {"connects": peers, "writes": peers}
+
+                    after, _ = await self._finished_within(
+                        self._request(instance, message_id="after-the-burst"), bound=bound
+                    )
+                    assert "too_many_inflight" not in after
+                    assert calls == {"connects": peers + 1, "writes": peers + 1}
+        finally:
+            await self._settle(state, expected=peers + 1)
+
+    @pytest.mark.asyncio
+    async def test_the_bound_is_the_declared_budget_and_not_the_outer_stop(self):
+        """A lower bound, so the upper one cannot pass by accident.
+
+        An exchange whose declared send deadline is 300 ms cannot answer
+        an uncooperative peer in less than that, so this fails if the
+        bound that actually fired came from anywhere but the bridge's own
+        declared deadlines.
+        """
+        instance = self._bridge()
+        connection, state, _calls = self._connection("drain")
+        try:
+            with _socket_layer(connection):
+                with self._declared_deadlines(step=0.3, reply=0.3):
+                    bound = bridge._exchange_budget() + self.SLACK
+                    reply, elapsed = await self._finished_within(
+                        self._request(instance), bound=bound
+                    )
+
+                    assert not state.release.is_set()
+                    assert "send_failed" in reply
+                    assert elapsed >= 0.3
+        finally:
+            await self._settle(state, expected=1)
+
+    @pytest.mark.asyncio
+    async def test_an_uncooperative_step_does_not_outlive_a_cancelled_exchange(self):
+        """Cancelling the Owner's request must not wait on the stall either.
+
+        The acknowledgement the deadline refuses to wait for is the same
+        one an outer cancellation would otherwise block on, so the
+        abandonment has to cover that path too — otherwise a shutdown
+        inherits the hang the deadline just stopped inheriting.
+        """
+        instance = self._bridge()
+        connection, state, _calls = self._connection("drain")
+        try:
+            with _socket_layer(connection):
+                # Long enough that no deadline can be what ends this.
+                with self._declared_deadlines(step=30.0, reply=30.0):
+                    task = asyncio.ensure_future(self._request(instance))
+                    while instance._inflight == 0:
+                        await asyncio.sleep(0.005)
+                    await asyncio.sleep(0.02)
+
+                    started = time.monotonic()
+                    task.cancel()
+                    done, _pending = await asyncio.wait({task}, timeout=self.OUTER)
+                    elapsed = time.monotonic() - started
+
+                    assert done, "the cancelled exchange never finished"
+                    assert task.cancelled()
+                    assert not state.release.is_set()
+                    assert elapsed < self.SLACK
+                    assert instance._inflight == 0
+        finally:
+            await self._settle(state, expected=1)
+
+    # -- the abandoned step, and how it is accounted for --
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_step_is_harvested_once_it_is_released(self):
+        """Abandonment is bookkeeping, not forgetting.
+
+        The step that overran is held — so the collector cannot reclaim it
+        while it is still pending — and dropped the moment it ends, so
+        holding it is not itself the leak.
+        """
+        instance = self._bridge()
+        before = set(bridge._stragglers)
+        connection, state, _calls = self._connection("drain")
+
+        with self._no_unobserved_tasks():
+            with _socket_layer(connection):
+                with self._declared_deadlines():
+                    await self._finished_within(
+                        self._request(instance), bound=bridge._exchange_budget() + self.SLACK
+                    )
+                    assert set(bridge._stragglers) - before, "nothing was detached"
+
+            await self._settle(state, expected=1)
+            assert await self._drain_stragglers(before) == set()
+
+    @pytest.mark.asyncio
+    async def test_an_abandoned_step_that_fails_is_still_observed(self):
+        """Harvesting reads the outcome; it does not merely drop the reference.
+
+        A straggler that ends in an exception nobody retrieves is reported
+        by the loop, which would dress a deliberate abandonment up as a
+        leak.  This releases the stall into a failure rather than a
+        return, which is the case that would surface it.
+        """
+        state = _Stall()
+
+        async def stall_then_fail():
+            while True:
+                try:
+                    await state.release.wait()
+                except asyncio.CancelledError:
+                    continue
+                raise OSError("the abandoned step failed after it was let go")
+
+        before = set(bridge._stragglers)
+        deadline = bridge._Deadline(0.02)
+
+        with self._no_unobserved_tasks():
+            with pytest.raises(asyncio.TimeoutError):
+                await deadline.bounded(stall_then_fail(), cap=0.02)
+
+            assert len(set(bridge._stragglers) - before) == 1
+            state.release.set()
+            assert await self._drain_stragglers(before) == set()
+
+    @pytest.mark.asyncio
+    async def test_the_number_of_abandoned_steps_is_bounded(self):
+        """Bounded by construction, not by policy.
+
+        One exchange can leave at most two steps behind — the one that
+        spent the budget and the teardown after it — and only an in-flight
+        exchange can leave any, so four admitted slots cap the whole set.
+        """
+        instance = self._bridge()
+        before = set(bridge._stragglers)
+        connection, state, _calls = self._connection("drain")
+        peers = bridge.MAX_INFLIGHT_REQUESTS
+
+        with _socket_layer(connection):
+            with self._declared_deadlines():
+                await self._finished_within(
+                    asyncio.gather(
+                        *(self._request(instance, message_id=f"burst-{n}") for n in range(peers))
+                    ),
+                    bound=bridge._exchange_budget() + self.SLACK,
+                )
+                detached = set(bridge._stragglers) - before
+                assert 0 < len(detached) <= 2 * peers
+
+        await self._settle(state, expected=peers)
+        assert await self._drain_stragglers(before) == set()
+
+    @pytest.mark.asyncio
+    async def test_a_step_that_finished_is_never_parked(self):
+        """The ordinary path leaves nothing behind.
+
+        A step that completes inside its bound is returned rather than
+        detached, and a step that finished just as the bound arrived is
+        read rather than parked — either way the set is where it started.
+        """
+        before = set(bridge._stragglers)
+        deadline = bridge._Deadline(1.0)
+
+        async def prompt():
+            return "answered"
+
+        assert await deadline.bounded(prompt(), cap=1.0) == "answered"
+        assert set(bridge._stragglers) == before
+
+        finished = asyncio.ensure_future(prompt())
+        await finished
+        bridge._detach(finished)
+        assert set(bridge._stragglers) == before

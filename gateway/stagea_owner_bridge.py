@@ -227,13 +227,66 @@ def _exchange_budget() -> float:
     return 5 * _local_step_deadline() + REPLY_DEADLINE_SECONDS
 
 
+#: Steps that outlived their bound and were let go.  An abandoned task has
+#: to stay reachable until it actually ends: the collector reports a task
+#: it reclaims while still pending, and reports again if nobody ever read
+#: the exception it finished with.  This set is the strong reference that
+#: makes that harvest deterministic instead of leaving it to the collector,
+#: and :func:`_harvest` is what empties it.
+#:
+#: Its size is bounded by construction rather than by policy.  A straggler
+#: is only ever created from inside an in-flight exchange, and a single
+#: exchange can leave at most two behind — the step that spent the budget,
+#: and the teardown that follows it — so at most twice
+#: :data:`MAX_INFLIGHT_REQUESTS` can exist at any moment, and none of them
+#: holds an in-flight slot.
+_stragglers: set[asyncio.Future[Any]] = set()
+
+
+def _harvest(task: asyncio.Future[Any]) -> None:
+    """Observe an abandoned step's outcome and forget it.
+
+    Reading the exception is the whole point: a task nobody reads is
+    reported by the loop as an unhandled error, which would dress a
+    deliberate, bounded abandonment up as a leak.  The outcome itself is
+    discarded — the exchange that started this step already answered the
+    Owner without it, and a straggler decides nothing.
+    """
+    _stragglers.discard(task)
+    if task.cancelled():
+        return
+    exc = task.exception()
+    if exc is not None:
+        logger.debug("[stagea] abandoned step ended with %s", type(exc).__name__)
+
+
+def _detach(task: asyncio.Future[Any]) -> None:
+    """Ask a step that lost its budget to stop, and stop waiting for it.
+
+    Cancellation is a request, not a guarantee: an awaitable may catch
+    ``CancelledError`` and carry on, and a worker thread cannot be
+    interrupted at all.  Waiting for the acknowledgement would hand this
+    exchange's deadline to the party the deadline exists to bound.  So the
+    request is made and the task is let go — held only for harvesting,
+    never awaited, never consulted, holding no in-flight slot, starting no
+    new work and issuing no retry.
+    """
+    if task.done():
+        _harvest(task)
+        return
+    task.cancel()
+    _stragglers.add(task)
+    task.add_done_callback(_harvest)
+
+
 class _Deadline:
     """One monotonic budget shared by every await in a single exchange.
 
-    ``asyncio.wait_for`` bounds one await; this bounds their sum.  Each
-    step still carries its own cap, so one slow step cannot quietly spend
-    another's time, and no await in the lifecycle — teardown included —
-    happens outside the budget.
+    A step bound covers one await; this covers their sum.  Each step still
+    carries its own cap, so one slow step cannot quietly spend another's
+    time, and no await in the lifecycle — teardown included — happens
+    outside the budget.  Neither bound depends on the awaited party
+    acknowledging cancellation; see :meth:`bounded`.
     """
 
     __slots__ = ("_expiry",)
@@ -252,6 +305,18 @@ class _Deadline:
         extended by one more step.  The coroutine that will now never run
         is closed rather than abandoned, which keeps the non-blocking
         teardown path from leaving a warning behind it.
+
+        The step runs as its own task and is *waited on* rather than
+        wrapped, because ``asyncio.wait_for`` reaches its timeout by
+        cancelling the inner await and then awaiting the acknowledgement.
+        An awaitable that swallows ``CancelledError`` — or a worker
+        thread, which cannot be cancelled at all — therefore keeps
+        ``wait_for`` itself pending and carries the exchange, and the
+        in-flight slot it holds, past the declared budget.
+        :func:`asyncio.wait` returns at its timeout whatever the task does
+        next, so this bound holds without the peer's cooperation; the
+        task that overran is then cancelled and abandoned by
+        :func:`_detach` rather than waited for.
         """
         timeout = min(cap, self.remaining())
         if timeout <= 0:
@@ -259,7 +324,19 @@ class _Deadline:
             if callable(close):
                 close()
             raise asyncio.TimeoutError
-        return await asyncio.wait_for(awaitable, timeout=timeout)
+        task = asyncio.ensure_future(awaitable)
+        try:
+            done, _pending = await asyncio.wait({task}, timeout=timeout)
+        except BaseException:
+            # Includes this exchange being cancelled from outside: a step
+            # must never outlive the caller that started it, and the same
+            # abandonment is what keeps that teardown non-blocking too.
+            _detach(task)
+            raise
+        if not done:
+            _detach(task)
+            raise asyncio.TimeoutError
+        return task.result()
 
 
 class BridgeError(Exception):
