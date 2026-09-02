@@ -194,6 +194,74 @@ _REFUSAL_TEXT: Dict[str, str] = {
 }
 
 
+# --- exchange deadlines ----------------------------------------------
+
+
+def _local_step_deadline() -> float:
+    """Bound for every step of an exchange except the peer's answer.
+
+    The socket preflight stat, the connect, the post-connect identity
+    re-stat, the write/drain and the close all talk to a socket on *this
+    host*, so one bound is honest for all five.  Only the controller's
+    thinking time deserves a long one, and that is
+    :data:`REPLY_DEADLINE_SECONDS`.
+
+    Read from :data:`CONNECT_TIMEOUT_SECONDS` at call time rather than
+    copied into a constant at import, so shortening the declared connect
+    deadline shortens every local step with it — and, through
+    :func:`_exchange_budget`, the exchange as a whole.  A falsifier that
+    tightens the declared deadlines therefore tightens what it is
+    measuring, instead of leaving a second, longer bound behind.
+    """
+    return CONNECT_TIMEOUT_SECONDS
+
+
+def _exchange_budget() -> float:
+    """Total wall clock one exchange may consume.
+
+    The sum of every declared step bound.  The exchange is bounded *as a
+    whole* and not merely step by step, so a peer cannot chain several
+    individually-legal delays into an unbounded hold on one of the four
+    in-flight slots.
+    """
+    return 5 * _local_step_deadline() + REPLY_DEADLINE_SECONDS
+
+
+class _Deadline:
+    """One monotonic budget shared by every await in a single exchange.
+
+    ``asyncio.wait_for`` bounds one await; this bounds their sum.  Each
+    step still carries its own cap, so one slow step cannot quietly spend
+    another's time, and no await in the lifecycle — teardown included —
+    happens outside the budget.
+    """
+
+    __slots__ = ("_expiry",)
+
+    def __init__(self, budget: float) -> None:
+        self._expiry = time.monotonic() + budget
+
+    def remaining(self) -> float:
+        return self._expiry - time.monotonic()
+
+    async def bounded(self, awaitable: Any, cap: float) -> Any:
+        """Await under the smaller of this step's cap and what is left.
+
+        Once the budget is spent this raises :class:`asyncio.TimeoutError`
+        without awaiting at all, so an exhausted exchange cannot be
+        extended by one more step.  The coroutine that will now never run
+        is closed rather than abandoned, which keeps the non-blocking
+        teardown path from leaving a warning behind it.
+        """
+        timeout = min(cap, self.remaining())
+        if timeout <= 0:
+            close = getattr(awaitable, "close", None)
+            if callable(close):
+                close()
+            raise asyncio.TimeoutError
+        return await asyncio.wait_for(awaitable, timeout=timeout)
+
+
 class BridgeError(Exception):
     """A fail-closed bridge outcome, identified by a fixed reason code.
 
@@ -476,6 +544,27 @@ async def read_frame(reader: asyncio.StreamReader) -> Dict[str, Any]:
     return payload
 
 
+def is_exact_int(value: Any, expected: int) -> bool:
+    """Whether ``value`` *is* the authoritative integer ``expected``.
+
+    ``==`` is not a type test and neither is ``in``.  In Python
+    ``True == 1`` and ``1.0 == 1``, and all three hash equal, so a JSON
+    ``true`` or ``1.0`` satisfies both an equality check and membership
+    in a set that names an integer.  A schema that says "integer ``1``"
+    therefore has to say so in the type system, not only in the value
+    comparison, or a malformed frame passes a contract it never met.
+
+    ``type(value) is int`` is deliberate rather than ``isinstance``:
+    ``bool`` is a subclass of ``int``, and so is any other subclass a
+    caller might construct, and none of them is the authoritative
+    representation.
+
+    Used on both sides of the seam — the raw inbound item type on
+    ingress, the protocol number on reply — so the two cannot drift.
+    """
+    return type(value) is int and value == expected
+
+
 def build_request(*, request_id: str, ref: str, channel: str, text: str) -> Dict[str, Any]:
     """Assemble the typed request payload.
 
@@ -507,7 +596,7 @@ def validate_reply(payload: Dict[str, Any], *, request_id: str, ref: str) -> Tup
     extra = set(payload) - _REPLY_KEYS
     if extra:
         raise BridgeError("reply_unexpected_field")
-    if payload.get("schema") != SCHEMA or payload.get("protocol") != PROTOCOL:
+    if payload.get("schema") != SCHEMA or not is_exact_int(payload.get("protocol"), PROTOCOL):
         raise BridgeError("reply_malformed")
     if payload.get("type") != REPLY_TYPE:
         raise BridgeError("reply_malformed")
@@ -845,14 +934,34 @@ class StageAOwnerBridge:
         ref: str,
         request_text: str,
     ) -> Tuple[str, str]:
-        """One connection: send the request, read one reply, close."""
+        """One connection: send the request, read one reply, close.
+
+        Every await below draws from one :class:`_Deadline`, teardown
+        included, so the exchange holds its in-flight slot for at most
+        :func:`_exchange_budget` seconds however the peer or the socket
+        misbehaves.  An await that is merely slow becomes a refusal the
+        Owner is told about; an await that never returns would hold the
+        slot and suppress that refusal, so none is left unbounded.
+        """
         open_unix_connection = getattr(asyncio, "open_unix_connection", None)
         if open_unix_connection is None:
             raise BridgeError("platform_unsupported")
 
-        preimage = await asyncio.to_thread(
-            check_socket_path, config.socket_path, config.socket_uid
-        )
+        deadline = _Deadline(_exchange_budget())
+        step = _local_step_deadline()
+
+        # A stat is a local call, but local is not the same as bounded: a
+        # wedged filesystem holds this await for as long as it likes.  The
+        # bound protects the slot and the Owner's answer — the worker
+        # thread is left to finish on its own, because a thread cannot be
+        # cancelled and pretending otherwise would be the wrong claim.
+        try:
+            preimage = await deadline.bounded(
+                asyncio.to_thread(check_socket_path, config.socket_path, config.socket_uid),
+                cap=step,
+            )
+        except asyncio.TimeoutError as exc:
+            raise BridgeError("socket_unavailable") from exc
 
         frame = encode_frame(
             build_request(
@@ -864,9 +973,8 @@ class StageAOwnerBridge:
         )
 
         try:
-            reader, writer = await asyncio.wait_for(
-                open_unix_connection(config.socket_path),
-                timeout=CONNECT_TIMEOUT_SECONDS,
+            reader, writer = await deadline.bounded(
+                open_unix_connection(config.socket_path), cap=step
             )
         except (asyncio.TimeoutError, OSError) as exc:
             raise BridgeError("connect_failed") from exc
@@ -876,28 +984,44 @@ class StageAOwnerBridge:
             # been proven to be the expected identity, and the path has
             # been proven not to have been swapped since the preflight.
             verify_connected_peer(writer.get_extra_info("socket"), config.socket_uid)
-            await asyncio.to_thread(check_socket_identity, config.socket_path, preimage)
+            try:
+                await deadline.bounded(
+                    asyncio.to_thread(check_socket_identity, config.socket_path, preimage),
+                    cap=step,
+                )
+            except asyncio.TimeoutError as exc:
+                raise BridgeError("socket_unavailable") from exc
 
             try:
                 writer.write(frame)
-                await writer.drain()
-            except (OSError, ConnectionError) as exc:
+                await deadline.bounded(writer.drain(), cap=step)
+            except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
                 raise BridgeError("send_failed") from exc
 
             try:
-                payload = await asyncio.wait_for(read_frame(reader), timeout=REPLY_DEADLINE_SECONDS)
+                payload = await deadline.bounded(
+                    read_frame(reader), cap=REPLY_DEADLINE_SECONDS
+                )
             except asyncio.TimeoutError as exc:
                 raise BridgeError("reply_timeout") from exc
 
             return validate_reply(payload, request_id=request_id, ref=ref)
         finally:
-            await _close_writer(writer)
+            await _close_writer(writer, deadline)
 
 
-async def _close_writer(writer: Any) -> None:
-    """Close a stream writer without letting teardown mask the outcome."""
+async def _close_writer(writer: Any, deadline: _Deadline) -> None:
+    """Close a stream writer without letting teardown mask the outcome.
+
+    ``close()`` is synchronous and cannot block; ``wait_closed()`` is the
+    only await here, so it is the one that needs a bound.  Once the
+    budget is spent the wait is skipped outright rather than shortened:
+    teardown is allowed to be non-blocking, never unbounded, and a peer
+    that will not finish closing must not be able to withhold an answer
+    this exchange has already earned.
+    """
     try:
         writer.close()
-        await writer.wait_closed()
+        await deadline.bounded(writer.wait_closed(), cap=_local_step_deadline())
     except (OSError, ConnectionError, asyncio.TimeoutError) as exc:
         logger.debug("[stagea] writer close failed: %s", exc)

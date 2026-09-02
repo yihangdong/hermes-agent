@@ -66,7 +66,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
-from gateway.stagea_owner_bridge import StageAOwnerBridge
+from gateway.stagea_owner_bridge import StageAOwnerBridge, is_exact_int
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 from agent.secret_scope import UnscopedSecretError, get_secret
@@ -1009,6 +1009,22 @@ def _extract_text(item_list: List[Dict[str, Any]]) -> str:
 _TEXT_ITEM_TYPES = frozenset({ITEM_TEXT})
 
 
+def _is_text_item_type(value: Any) -> bool:
+    """Whether a raw item's ``type`` *is* the authoritative text enum.
+
+    Membership in :data:`_TEXT_ITEM_TYPES` is a value test, and a value
+    test is not enough here: ``True == ITEM_TEXT`` and ``1.0 ==
+    ITEM_TEXT``, and both hash equal, so a JSON ``true`` or ``1.0``
+    satisfied the allowlist while being neither the integer Weixin
+    documents nor anything this build can identify.  The runtime type has
+    to be exactly ``int`` — which :func:`is_exact_int`, shared with the
+    bridge's own reply schema so the two rules cannot drift, is what
+    decides.  Anything else is a malformed item and disqualifies the
+    message from Stage-A.
+    """
+    return any(is_exact_int(value, admitted) for admitted in _TEXT_ITEM_TYPES)
+
+
 def _is_text_only_message(item_list: Optional[List[Any]]) -> bool:
     """Whether every raw inbound item is provably plain text.
 
@@ -1019,12 +1035,22 @@ def _is_text_only_message(item_list: Optional[List[Any]]) -> bool:
 
     Quoted (``ref_msg``) items are held to the same rule — quoting a file
     still puts a file in the message.  Anything this function cannot
-    positively identify as text — an unknown or absent type, a
-    non-``dict`` item, a malformed quote — makes the whole message
-    ineligible, which is why the annotation stays loose: this is
-    untrusted inbound data, not a structure the type system can vouch
-    for.  Ineligible does not mean refused; it means Stage-A never sees
-    it and ordinary routing handles it exactly as before.
+    positively identify as text — an unknown or absent type, a type of
+    the wrong runtime type, a non-``dict`` item, a malformed quote —
+    makes the whole message ineligible, which is why the annotation stays
+    loose: this is untrusted inbound data, not a structure the type
+    system can vouch for.  Ineligible does not mean refused; it means
+    Stage-A never sees it and ordinary routing handles it exactly as
+    before.
+
+    This is the only caller-visible reading of raw item types that
+    Stage-A depends on, and it is deliberately the *only* place tightened
+    for exact typing.  :func:`_extract_text` keeps its value-equal match
+    because it serves ordinary routing, where changing what a malformed
+    item means is a change this correction has no mandate to make — and
+    it cannot weaken Stage-A, because a message only reaches the bridge
+    after this gate has already proven every one of its item types is the
+    exact integer enum.
     """
     items = item_list or []
     if not items:
@@ -1032,7 +1058,7 @@ def _is_text_only_message(item_list: Optional[List[Any]]) -> bool:
     for item in items:
         if not isinstance(item, dict):
             return False
-        if item.get("type") not in _TEXT_ITEM_TYPES:
+        if not _is_text_item_type(item.get("type")):
             return False
         ref_message = item.get("ref_msg")
         if ref_message is None:
@@ -1044,7 +1070,7 @@ def _is_text_only_message(item_list: Optional[List[Any]]) -> bool:
             continue
         if not isinstance(ref_item, dict):
             return False
-        if ref_item.get("type") not in _TEXT_ITEM_TYPES:
+        if not _is_text_item_type(ref_item.get("type")):
             return False
     return True
 

@@ -14,6 +14,7 @@ import shutil
 import stat
 import struct
 import tempfile
+import time
 from typing import Any, Dict
 from unittest.mock import AsyncMock, Mock, patch
 
@@ -650,6 +651,55 @@ class TestReplyValidation:
             )
         assert excinfo.value.code == "reply_malformed"
 
+    @pytest.mark.parametrize(
+        "protocol",
+        [
+            pytest.param(True, id="json-true"),
+            pytest.param(False, id="json-false"),
+            pytest.param(1.0, id="json-float-one"),
+            pytest.param("1", id="stringified"),
+            pytest.param(2, id="wrong-number"),
+            pytest.param(None, id="null"),
+        ],
+    )
+    def test_only_the_exact_integer_protocol_is_accepted(self, protocol):
+        """The deep review's second finding, and its neighbours.
+
+        ``!= 1`` is a value test, and ``True`` and ``1.0`` both pass it.
+        A frame whose protocol number is a boolean or a float never met
+        the schema this bridge claims to enforce, so no text in it may be
+        trusted, let alone delivered to the Owner.
+        """
+        with pytest.raises(BridgeError) as excinfo:
+            validate_reply(
+                _reply(self.RID, self.REF, protocol=protocol),
+                request_id=self.RID,
+                ref=self.REF,
+            )
+        assert excinfo.value.code == "reply_malformed"
+
+    def test_the_exact_integer_protocol_is_still_accepted(self):
+        """The tightening must reject aliases, not the contract itself."""
+        outcome, text = validate_reply(
+            _reply(self.RID, self.REF, protocol=1), request_id=self.RID, ref=self.REF
+        )
+        assert (outcome, text) == ("ACCEPTED_TERMINAL", "done")
+
+    def test_an_aliased_protocol_is_refused_before_its_text_is_read(self):
+        """Rejection has to happen before the frame's text is trusted.
+
+        A reply carrying ``protocol=True`` *and* unusable text must fail
+        on the protocol, not on the text: that ordering is what stops a
+        malformed frame from being read at all.
+        """
+        with pytest.raises(BridgeError) as excinfo:
+            validate_reply(
+                _reply(self.RID, self.REF, protocol=True, text=""),
+                request_id=self.RID,
+                ref=self.REF,
+            )
+        assert excinfo.value.code == "reply_malformed"
+
     @pytest.mark.parametrize("text", ["", "   ", 42, None, "x" * (bridge.MAX_REPLY_TEXT_CHARS + 1)])
     def test_unusable_reply_text_is_rejected(self, text):
         with pytest.raises(BridgeError) as excinfo:
@@ -664,6 +714,59 @@ class TestReplyValidation:
 
         largest = bridge.outcome_text("ACCEPTED_TERMINAL", "x" * bridge.MAX_REPLY_TEXT_CHARS)
         assert len(largest) < WeixinAdapter._SPLIT_THRESHOLD
+
+
+class TestExactIntegerTyping:
+    """One rule for "an integer enum is an integer", used on both sides.
+
+    The deep review found the same type confusion at ingress and at
+    reply, which is what a duplicated rule buys.  :func:`is_exact_int` is
+    the single definition both now use, so the falsifiers below pin the
+    rule itself rather than one of its two call sites.
+    """
+
+    def test_the_authoritative_integer_passes(self):
+        assert bridge.is_exact_int(1, 1) is True
+
+    @pytest.mark.parametrize(
+        "value",
+        [
+            pytest.param(True, id="bool-true"),
+            pytest.param(False, id="bool-false"),
+            pytest.param(1.0, id="float"),
+            pytest.param("1", id="str"),
+            pytest.param(2, id="other-int"),
+            pytest.param(None, id="none"),
+            pytest.param([1], id="list"),
+        ],
+    )
+    def test_no_alias_passes(self, value):
+        assert bridge.is_exact_int(value, 1) is False
+
+    def test_an_int_subclass_is_not_the_authoritative_representation(self):
+        """``isinstance`` would admit this; ``type(...) is int`` does not.
+
+        Excluding ``bool`` by name would leave every other subclass in,
+        which is the same defect with a different constructor.
+        """
+
+        class Sneaky(int):
+            pass
+
+        assert Sneaky(1) == 1
+        assert bridge.is_exact_int(Sneaky(1), 1) is False
+
+    def test_equality_and_membership_would_both_have_been_fooled(self):
+        """Why the helper exists at all — the Python facts it corrects.
+
+        Stated as a test rather than a comment so that a future Python
+        in which these stop being true would say so here, at the rule,
+        instead of somewhere further downstream.
+        """
+        for alias in (True, 1.0):
+            assert alias == 1
+            assert alias in {1}
+            assert hash(alias) == hash(1)
 
 
 class TestSocketPreflight:
@@ -1322,3 +1425,282 @@ class TestNoAlternateDestination:
     def test_module_declares_no_listener_api(self):
         for forbidden in ("serve", "listen", "bind", "accept"):
             assert not hasattr(bridge, forbidden)
+
+
+class TestExchangeDeadlines:
+    """No await in one exchange may outlive that exchange's own budget.
+
+    The deep/adversarial review's third finding: ``drain()`` and
+    ``wait_closed()`` were awaited with no deadline at all.  A peer that
+    accepted the connection and then simply stopped could hold one of the
+    four in-flight slots indefinitely and suppress the fail-closed answer
+    the Owner is owed — and ``except TimeoutError`` around an unbounded
+    await cannot create a deadline.
+
+    Every test here stalls one await *forever* and asserts the exchange
+    still finishes.  The outer :func:`asyncio.wait_for` is what makes
+    that deterministic: an unbounded implementation fails on the outer
+    bound instead of hanging the suite.
+    """
+
+    #: The declared deadlines, tightened the way the reviewer tightened
+    #: them.  Every local step derives from the connect deadline, so this
+    #: shortens the whole exchange rather than two steps of it.
+    STEP = 0.02
+
+    #: Outer observation bound.  Generous on purpose — it exists to turn
+    #: "hangs forever" into a failed assertion, not to measure anything.
+    OUTER = 5.0
+
+    #: What "the bridge's own deadline fired" means here: two orders of
+    #: magnitude under the shortest *unpatched* declared bound, and two
+    #: orders of magnitude over the ~40 ms this actually takes, so it is
+    #: neither timing-fragile nor vacuous.
+    BOUNDED = 1.0
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _declared_deadlines(step=STEP, reply=STEP):
+        with patch.object(bridge, "CONNECT_TIMEOUT_SECONDS", step):
+            with patch.object(bridge, "REPLY_DEADLINE_SECONDS", reply):
+                yield
+
+    @staticmethod
+    def _connection(*, stall=None, reply_builder=None):
+        """A peer that answers, but stalls forever on one named await."""
+        builder = reply_builder or (lambda p: _reply(p["request_id"], p["conversation_ref"]))
+
+        async def never(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        async def open_connection(path):
+            reader = asyncio.StreamReader()
+            writer = Mock()
+            writer.drain = AsyncMock()
+            writer.wait_closed = AsyncMock()
+            if stall is not None:
+                setattr(writer, stall, AsyncMock(side_effect=never))
+
+            def on_write(frame):
+                request = json.loads(frame[4:].decode("utf-8"))
+                reader.feed_data(encode_frame(builder(request)))
+                reader.feed_eof()
+
+            writer.write = on_write
+            return reader, writer
+
+        return open_connection
+
+    @staticmethod
+    def _bridge():
+        return StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+
+    @classmethod
+    async def _timed(cls, instance, *, message_id="m1", outer=None):
+        """Run one request under an outer bound, returning ``(reply, elapsed)``."""
+        started = time.monotonic()
+        reply = await asyncio.wait_for(
+            instance.process(
+                chat_type="dm",
+                sender_id=OWNER,
+                text="/stagea advance",
+                has_media=False,
+                conversation_key="weixin|acct|chat-1|owner-user-id",
+                message_id=message_id,
+            ),
+            timeout=outer or cls.OUTER,
+        )
+        return reply, time.monotonic() - started
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_drain_becomes_a_bounded_refusal(self):
+        """The reviewer's first F-3 probe, at this head."""
+        instance = self._bridge()
+        with _socket_layer(self._connection(stall="drain")):
+            with self._declared_deadlines():
+                reply, elapsed = await self._timed(instance)
+
+        assert "send_failed" in reply
+        assert "No Stage-A work was created." in reply
+        assert elapsed < self.BOUNDED
+        assert instance._inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_close_cannot_withhold_an_answer_already_earned(self):
+        """The reviewer's second F-3 probe, at this head.
+
+        The reply was read and validated before teardown began, so
+        teardown has nothing left to decide.  A peer that refuses to
+        finish closing must not be able to take that answer back.
+        """
+        instance = self._bridge()
+        with _socket_layer(self._connection(stall="wait_closed")):
+            with self._declared_deadlines():
+                reply, elapsed = await self._timed(instance)
+
+        assert reply == "[Stage-A] ACCEPTED_TERMINAL\ndone"
+        assert elapsed < self.BOUNDED
+        assert instance._inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_close_cannot_withhold_a_refusal_either(self):
+        """Teardown must not swallow the failure path any more than the
+        success path: both are answers the Owner is owed."""
+        instance = self._bridge()
+        connection = self._connection(
+            stall="wait_closed",
+            reply_builder=lambda p: _reply(p["request_id"], "f" * 32),
+        )
+        with _socket_layer(connection):
+            with self._declared_deadlines():
+                reply, elapsed = await self._timed(instance)
+
+        assert "reply_wrong_conversation" in reply
+        assert elapsed < self.BOUNDED
+        assert instance._inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_socket_stat_is_bounded_too(self):
+        """"Local" is not "bounded": a wedged filesystem is a stall.
+
+        The preflight and the post-connect identity re-check both run in
+        a worker thread, and a thread cannot be cancelled — so the await
+        is what carries the bound, and the slot is freed on time whether
+        or not the thread ever finishes.
+        """
+
+        async def never(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        instance = self._bridge()
+        with patch.object(asyncio, "to_thread", never):
+            with self._declared_deadlines():
+                reply, elapsed = await self._timed(instance)
+
+        assert "socket_unavailable" in reply
+        assert elapsed < self.BOUNDED
+        assert instance._inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_identity_recheck_is_bounded_too(self):
+        """The second stat gets its own bound, not the first one's.
+
+        Bounding the preflight and leaving the post-connect re-check open
+        would move the hole rather than close it — and move it somewhere
+        strictly worse, because by then a connection is open and an
+        in-flight slot is already held.
+        """
+
+        async def never(*args, **kwargs):
+            await asyncio.Event().wait()
+
+        real_to_thread = asyncio.to_thread
+        calls = []
+
+        async def stall_after_the_first(func, *args, **kwargs):
+            calls.append(func)
+            if len(calls) == 1:
+                return await real_to_thread(func, *args, **kwargs)
+            return await never()
+
+        instance = self._bridge()
+        with _socket_layer(self._connection()):
+            with patch.object(asyncio, "to_thread", stall_after_the_first):
+                with self._declared_deadlines():
+                    reply, elapsed = await self._timed(instance)
+
+        assert len(calls) == 2, "the identity re-check never ran, so nothing was proven"
+        assert "socket_unavailable" in reply
+        assert elapsed < self.BOUNDED
+        assert instance._inflight == 0
+
+    @pytest.mark.asyncio
+    async def test_a_stalled_peer_cannot_exhaust_the_in_flight_slots(self):
+        """The availability claim, stated as the reviewer stated it.
+
+        Filling every slot with a peer that never finishes used to be
+        permanent: the slots were held by awaits that could not time out.
+        Bounded, the same burst drains and the next request is admitted.
+        """
+        instance = self._bridge()
+        with _socket_layer(self._connection(stall="drain")):
+            with self._declared_deadlines():
+                burst = await asyncio.wait_for(
+                    asyncio.gather(
+                        *(
+                            instance.process(
+                                chat_type="dm",
+                                sender_id=OWNER,
+                                text="/stagea advance",
+                                has_media=False,
+                                conversation_key="weixin|acct|chat-1|owner-user-id",
+                                message_id=f"burst-{n}",
+                            )
+                            for n in range(bridge.MAX_INFLIGHT_REQUESTS)
+                        )
+                    ),
+                    timeout=self.OUTER,
+                )
+                assert instance._inflight == 0
+                after, _ = await self._timed(instance, message_id="after-the-burst")
+
+        assert all("send_failed" in reply for reply in burst)
+        assert "too_many_inflight" not in after
+
+    @pytest.mark.asyncio
+    async def test_the_declared_deadline_is_what_governs(self):
+        """Bounded by the declared deadline, not by luck or by the outer bound.
+
+        A lower bound is the honest test here: an exchange whose send
+        deadline is 300 ms cannot answer a stalled peer in less, so this
+        fails if the bound came from anywhere else.
+        """
+        instance = self._bridge()
+        with _socket_layer(self._connection(stall="drain")):
+            with self._declared_deadlines(step=0.3, reply=0.3):
+                reply, elapsed = await self._timed(instance)
+
+        assert "send_failed" in reply
+        assert elapsed >= 0.3
+        assert elapsed < 3.0
+
+    def test_the_whole_exchange_budget_is_the_sum_of_the_declared_bounds(self):
+        """Bounded as a whole, not merely step by step.
+
+        Five local steps — preflight stat, connect, identity re-stat,
+        write/drain, close — plus the one long wait for the controller's
+        answer.  Chaining individually-legal delays cannot exceed it.
+        """
+        assert bridge._exchange_budget() == (
+            5 * bridge._local_step_deadline() + bridge.REPLY_DEADLINE_SECONDS
+        )
+
+    def test_the_declared_bounds_are_read_at_call_time(self):
+        """A copy taken at import would leave a second, longer bound behind.
+
+        This is what lets a falsifier tighten the declared deadlines and
+        actually shorten what it is measuring — including the local steps
+        that have no constant of their own.
+        """
+        with patch.object(bridge, "CONNECT_TIMEOUT_SECONDS", 0.5):
+            assert bridge._local_step_deadline() == 0.5
+            with patch.object(bridge, "REPLY_DEADLINE_SECONDS", 1.0):
+                assert bridge._exchange_budget() == pytest.approx(3.5)
+
+    @pytest.mark.asyncio
+    async def test_an_exhausted_budget_skips_the_wait_rather_than_shortening_it(self):
+        """Teardown is allowed to be non-blocking; it is never unbounded.
+
+        With nothing left in the budget the close must not await at all —
+        and must not leave an un-awaited coroutine behind when it
+        declines to.
+        """
+        writer = Mock()
+        writer.close = Mock()
+        writer.wait_closed = AsyncMock()
+        spent = bridge._Deadline(-1.0)
+
+        await bridge._close_writer(writer, spent)
+
+        writer.close.assert_called_once_with()
+        writer.wait_closed.assert_not_awaited()

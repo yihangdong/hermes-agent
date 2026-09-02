@@ -384,6 +384,145 @@ class TestAttachmentTruth:
         assert weixin._is_text_only_message([item]) is False
 
     @pytest.mark.parametrize(
+        "item_type",
+        [
+            pytest.param(True, id="json-true"),
+            pytest.param(False, id="json-false"),
+            pytest.param(1.0, id="json-float-one"),
+        ],
+    )
+    def test_a_python_numeric_alias_is_not_the_text_enum(self, item_type):
+        """The deep review's first finding.
+
+        ``ITEM_TEXT`` is the integer ``1``, and in Python ``True == 1``
+        and ``1.0 == 1`` — and both hash equal, so an allowlist written
+        as a set membership test admitted them.  Neither is a type Weixin
+        ever sends, so neither may promote a message to Stage-A.
+        """
+        assert weixin._is_text_only_message(
+            [{"type": item_type, "text_item": {"text": "/stagea go"}}]
+        ) is False
+
+    @pytest.mark.parametrize(
+        "ref_type",
+        [
+            pytest.param(True, id="json-true"),
+            pytest.param(1.0, id="json-float-one"),
+        ],
+    )
+    def test_a_quoted_alias_is_not_the_text_enum_either(self, ref_type):
+        """A quote gets exactly the rule the outer item gets."""
+        assert weixin._is_text_only_message(
+            [
+                {
+                    "type": weixin.ITEM_TEXT,
+                    "text_item": {"text": "/stagea go"},
+                    "ref_msg": {"message_item": {"type": ref_type}},
+                }
+            ]
+        ) is False
+
+    def test_the_authoritative_integer_is_still_text(self):
+        """The tightening must reject aliases, not the enum itself."""
+        assert weixin._is_text_only_message(
+            [{"type": 1, "text_item": {"text": "/stagea go"}}]
+        ) is True
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "item_type",
+        [pytest.param(True, id="json-true"), pytest.param(1.0, id="json-float-one")],
+    )
+    async def test_an_aliased_item_type_never_reaches_the_socket(self, item_type):
+        """The reviewer's end-to-end probe, through the real intake.
+
+        A raw ``type=true`` item carrying ``/stagea`` produced one wire
+        request and one Owner reply at the reviewed head.  It must now
+        produce a fail-closed refusal in the same conversation and no
+        connection at all.
+        """
+        adapter = _adapter(**_enabled())
+        message = _message("/stagea advance")
+        message["item_list"] = [{"type": item_type, "text_item": {"text": "/stagea advance"}}]
+
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            with patch.object(bridge, "check_socket_path") as preflight:
+                await adapter._process_message(message)
+
+        chunk = adapter._send_text_chunk.await_args.kwargs["chunk"]
+        assert "media_not_admitted" in chunk
+        assert _dispatched(adapter) == 0
+        opened.assert_not_called()
+        preflight.assert_not_called()
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "item_type",
+        [pytest.param(True, id="json-true"), pytest.param(1.0, id="json-float-one")],
+    )
+    async def test_an_aliased_item_type_leaves_ordinary_routing_alone(self, item_type):
+        """Failing closed is scoped to Stage-A, exactly as admitted.
+
+        The same malformed item from anybody but the Owner still routes
+        the way it did before this correction: the gate is a Stage-A
+        admission rule, not a new drop rule for the whole adapter.
+        """
+        adapter = _adapter(**_enabled())
+        message = _message("hello there", sender=OTHER)
+        message["item_list"] = [{"type": item_type, "text_item": {"text": "hello there"}}]
+
+        with patch.object(asyncio, "open_unix_connection", AsyncMock(), create=True) as opened:
+            await adapter._process_message(message)
+
+        assert _dispatched(adapter) == 1
+        adapter._send_text_chunk.assert_not_awaited()
+        opened.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_every_item_the_bridge_ever_sees_is_exactly_typed(self):
+        """Why :func:`_extract_text` needs no tightening of its own.
+
+        It keeps a value-equal match because it serves ordinary routing.
+        That looseness cannot weaken Stage-A, and this is the proof
+        rather than the assertion: the bridge is reached only after the
+        gate has established that every raw item type — quoted items
+        included — is the exact integer enum.
+        """
+        adapter = _adapter(**_enabled())
+        seen = []
+
+        original = weixin._is_text_only_message
+
+        def recording(item_list):
+            verdict = original(item_list)
+            if verdict:
+                seen.append(item_list)
+            return verdict
+
+        message = _message("/stagea advance")
+        message["item_list"].append(
+            {
+                "type": weixin.ITEM_TEXT,
+                "text_item": {"text": "context"},
+                "ref_msg": {"message_item": {"type": weixin.ITEM_TEXT}},
+            }
+        )
+
+        open_connection, _ = _fake_peer(_terminal)
+        with patch.object(weixin, "_is_text_only_message", recording):
+            with _socket_layer(open_connection):
+                await adapter._process_message(message)
+
+        adapter._send_text_chunk.assert_awaited_once()
+        assert seen, "the bridge was never reached, so the claim went untested"
+        for item_list in seen:
+            for item in item_list:
+                assert type(item["type"]) is int
+                quoted = (item.get("ref_msg") or {}).get("message_item")
+                if quoted is not None:
+                    assert type(quoted["type"]) is int
+
+    @pytest.mark.parametrize(
         "ref_msg",
         [
             pytest.param({"message_item": {"type": 999}}, id="unknown-quoted-type"),
