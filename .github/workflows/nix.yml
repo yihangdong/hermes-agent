@@ -54,7 +54,15 @@ jobs:
     # takes minutes and not seconds when the cache misses. `nix flake check`
     # builds 21 checks, and --max-jobs defaults to the core count. It uses the
     # wider runner with no more configuration.
-    runs-on: ubuntu-latest-32-core
+    #
+    # ``ubuntu-latest-32-core`` is an organization-scoped larger runner, which
+    # a personal-account fork cannot resolve — the lane sits QUEUED forever
+    # instead of running. The DYHANO canonical fork selects the ordinary
+    # GitHub-hosted standard runner, free for public repositories and adding
+    # no runner topology. Because --max-jobs already follows the core count,
+    # the standard runner needs no other change: the same 21 checks build,
+    # just with less parallelism. Upstream keeps its 32-core label unchanged.
+    runs-on: ${{ github.repository == 'yihangdong/hermes-agent' && 'ubuntu-latest' || 'ubuntu-latest-32-core' }}
     timeout-minutes: 60
     steps:
       - name: Checkout code
