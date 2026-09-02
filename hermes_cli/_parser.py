@@ -24,6 +24,30 @@ PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [
 ]
 
 
+class _OneshotPromptFromStdin:
+    """Marker stored in ``args.oneshot`` for a bare ``-z``/``--oneshot``.
+
+    A dedicated singleton rather than a magic string, because the marker
+    decides whether the prompt is read from stdin: no prompt a caller can
+    type, pipe or shell-quote is able to compare equal to it, so an argv
+    prompt can never be mistaken for "read stdin" and vice versa.
+
+    Deliberately truthy, so every existing ``if args.oneshot:`` dispatch
+    site keeps routing to one-shot mode with no change.
+    ``main._run_and_exit_oneshot`` is the single choke point that resolves
+    it to real prompt text.
+    """
+
+    __slots__ = ()
+
+    def __repr__(self) -> str:  # pragma: no cover - debugging aid only
+        return "<oneshot prompt from stdin>"
+
+
+#: Value ``-z``/``--oneshot`` takes when given without an argv PROMPT.
+ONESHOT_PROMPT_FROM_STDIN = _OneshotPromptFromStdin()
+
+
 # Static snapshot fallback for ``top_level_value_flag_sets`` — used only if
 # introspecting the live parser fails (e.g. argparse surface broken mid-edit).
 # The derived path is authoritative; a parity test in
@@ -31,7 +55,6 @@ PRE_ARGPARSE_INHERITED_FLAGS: list[tuple[str, bool]] = [
 # grows a value-taking flag this snapshot lacks AND derivation regresses.
 _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset(
     {
-        "-z", "--oneshot",
         "-m", "--model",
         "--provider", "--reasoning",
         "-t", "--toolsets",
@@ -41,7 +64,12 @@ _VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset(
         "--in",
     }
 )
-_OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset({"-c", "--continue"})
+# ``-z``/``--oneshot`` belongs here, not above: its value is optional
+# (nargs="?"), so an argv scanner must not assume it swallows the next
+# token — ``hermes -z --usage-file x.json`` still passes a real flag.
+_OPTIONAL_VALUE_FLAGS_FALLBACK: frozenset[str] = frozenset(
+    {"-c", "--continue", "-z", "--oneshot"}
+)
 
 
 @lru_cache(maxsize=1)
@@ -90,6 +118,8 @@ _EPILOGUE = """
 Examples:
     hermes                        Start interactive chat
     hermes chat -q "Hello"        Single query mode
+    hermes -z "Hello"             One-shot: prompt in argv, final answer out
+    echo "Hello" | hermes -z      One-shot: prompt read from stdin until EOF
     hermes --tui                  Launch the modern TUI (or set display.interface: tui)
     hermes --cli                  Force the classic REPL (overrides display.interface: tui)
     hermes -c                     Resume the most recent session
@@ -154,13 +184,21 @@ def build_top_level_parser():
         "-z",
         "--oneshot",
         metavar="PROMPT",
+        # nargs="?" adds the bare form without disturbing `-z "PROMPT"`:
+        # an argv value is still consumed exactly as before, and only its
+        # absence selects the stdin path via ``const``.
+        nargs="?",
+        const=ONESHOT_PROMPT_FROM_STDIN,
         default=None,
         help=(
             "One-shot mode: send a single prompt and print ONLY the final "
             "response text to stdout. No banner, no spinner, no tool "
             "previews, no session_id line. Tools, memory, rules, and "
             "AGENTS.md in the CWD are loaded as normal; approvals are "
-            "auto-bypassed. Intended for scripts / pipes."
+            "auto-bypassed. Intended for scripts / pipes. With no PROMPT "
+            "argument the prompt is read from stdin until EOF instead — "
+            "stdin must not be a terminal, and the input must be non-empty, "
+            "valid UTF-8 and at most 262144 bytes."
         ),
     )
     parser.add_argument(

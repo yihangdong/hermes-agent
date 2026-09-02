@@ -30,6 +30,10 @@ hermes chat -q "Hello"
 hermes chat --query-file prompt.txt
 hermes chat --query-file - < prompt.txt
 
+# Scripted one-shot: final answer only, prompt as an argument or on stdin
+hermes -z "Hello"
+echo "Hello" | hermes -z
+
 # With a specific model
 hermes chat --model "anthropic/claude-sonnet-4"
 
