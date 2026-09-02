@@ -66,6 +66,7 @@ from gateway.platforms.base import (
     cache_document_from_bytes,
     cache_image_from_bytes,
 )
+from gateway.stagea_owner_bridge import StageAOwnerBridge
 from hermes_constants import get_hermes_home
 from utils import atomic_json_write
 from agent.secret_scope import UnscopedSecretError, get_secret
@@ -1260,6 +1261,13 @@ class WeixinAdapter(BasePlatformAdapter):
         self._pending_text_batches: Dict[str, MessageEvent] = {}
         self._pending_text_batch_tasks: Dict[str, asyncio.Task] = {}
 
+        # Stage-A Owner bridge.  Inert unless an Owner id is configured;
+        # the profile-scoped reader keeps a secondary multiplexed profile
+        # from borrowing the default profile's binding.
+        self._stagea_bridge = StageAOwnerBridge(
+            secret_getter=_wx_secret, channel=Platform.WEIXIN.value
+        )
+
         if self._account_id and not self._token:
             persisted = load_weixin_account(hermes_home, self._account_id)
             if persisted:
@@ -1533,10 +1541,58 @@ class WeixinAdapter(BasePlatformAdapter):
             timestamp=datetime.now(),
         )
         logger.info("[%s] inbound from=%s type=%s media=%d", self.name, _safe_id(sender_id), source.chat_type, len(media_paths))
+        if await self._maybe_handle_stagea_owner_request(event):
+            return
         if event.message_type == MessageType.TEXT:
             self._enqueue_text_event(event)
         else:
             await self.handle_message(event)
+
+    async def _maybe_handle_stagea_owner_request(self, event: MessageEvent) -> bool:
+        """Route one Owner Stage-A request over the local bridge.
+
+        Returns ``True`` only when the bridge consumed the event, in which
+        case it has been answered in this same conversation and must not
+        reach ordinary routing.  Every other message — including one that
+        merely looks like a Stage-A request but is not from the Owner —
+        returns ``False`` and continues down the pre-existing path.
+        """
+        source = event.source
+        reply = await self._stagea_bridge.process(
+            chat_type=source.chat_type,
+            sender_id=source.user_id,
+            text=event.text or "",
+            has_media=bool(event.media_urls),
+            conversation_key=f"{source.platform.value}|{self._account_id}|{source.chat_id}|{source.user_id}",
+            message_id=event.message_id,
+        )
+        if reply is None:
+            return False
+        await self._send_stagea_reply(source.chat_id, reply)
+        return True
+
+    async def _send_stagea_reply(self, chat_id: str, text: str) -> None:
+        """Deliver a Stage-A reply into the initiating conversation only.
+
+        Deliberately bypasses :meth:`send`: that path extracts ``MEDIA:``
+        tags and bare local file paths out of the content, so routing a
+        peer-supplied string through it would turn text into a file
+        delivery.  ``_send_text_chunk`` sends the string as text and
+        nothing else.  ``chat_id`` comes from the inbound event, never
+        from the peer.
+        """
+        if not self._send_session or not self._token:
+            logger.error("[%s] stage-a reply dropped: adapter not connected", self.name)
+            return
+        try:
+            await self._send_text_chunk(
+                chat_id=chat_id,
+                chunk=text,
+                context_token=self._token_store.get(self._account_id, chat_id),
+                client_id=f"hermes-weixin-{uuid.uuid4().hex}",
+            )
+        except Exception as exc:
+            logger.error("[%s] stage-a reply failed to=%s: %s", self.name, _safe_id(chat_id), exc)
 
     def _open_dm_opted_in(self) -> bool:
         # Scoped reads (#93522): the default profile's allow-all flag must
