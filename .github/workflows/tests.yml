@@ -13,7 +13,18 @@ concurrency:
 
 jobs:
   test:
-    name: Run tests
+    # Upstream is one job named exactly ``Run tests``; the fork is the same
+    # job, run as four equal slices. The name is repository-conditional so
+    # upstream's check name — which branch protection may require by name —
+    # is unchanged.
+    name: ${{ github.repository == 'yihangdong/hermes-agent' && format('Run tests {0}/4', matrix.slice) || 'Run tests' }}
+    strategy:
+      # Report every slice. fail-fast would cancel the siblings of a failing
+      # slice and hide which other files fail; it can never turn red green.
+      # Upstream's matrix has a single entry, so both settings are no-ops there.
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(github.repository == 'yihangdong/hermes-agent' && '[1, 2, 3, 4]' || '[1]') }}
     # One 96-core runner for the whole suite. There is no slicing. Slicing
     # existed to spread the suite over 4-core runners. It cost a matrix job, a
     # duration cache, a per-slice artifact and a merge job to do it.
@@ -21,6 +32,17 @@ jobs:
     # 96 cores clear the floor that the slowest single test file sets (about
     # 82s). A second slice divides work that is already at that floor, and
     # adds a second setup.
+    #
+    # That reasoning holds on 96 cores and inverts on the 4-vCPU standard
+    # runner the fork must use. Measured on the fork (run 33600583344): the
+    # whole suite reached 91.3% at 29m54s and was cut by the unchanged 30m
+    # timeout — about 33 minutes of work against a 30-minute budget. So the
+    # fork takes back exactly the slicing this comment describes, using the
+    # runner's own ``--slice I/N`` support (scripts/run_tests_parallel.py),
+    # and none of the machinery that made slicing expensive: no artifact, no
+    # merge job, no committed duration cache. Four slices of the SAME
+    # discovery set; every slice must pass, so the union of tests and the
+    # pass/fail rule are identical to the single-job lane.
     #
     # ``ubuntu-latest-96-core`` is an organization-scoped larger runner. A
     # personal-account fork cannot resolve that label, so the job sits QUEUED
@@ -103,9 +125,21 @@ jobs:
         #
         # No --files: the runner discovers the suite itself. The discovered
         # set is identical to the list the removed matrix job used to pass in.
+        # ``--slice`` is passed as an ARGUMENT, never as HERMES_TEST_SLICE.
+        # The env knob is global: run_tests.sh forwards it through its
+        # hermetic ``env -i`` allowlist into every per-file pytest
+        # subprocess, so tests/test_run_tests_parallel.py — which runs the
+        # runner against 2-file probe directories — would inherit this
+        # job's slice and discover 0 of its 2 files. The argument binds to
+        # this invocation only. CI_TEST_SLICE is not in that allowlist, so
+        # it is stripped before the runner starts and cannot leak either.
         run: |
           source .venv/bin/activate
-          scripts/run_tests.sh
+          if [ -n "${CI_TEST_SLICE:-}" ]; then
+            scripts/run_tests.sh --slice "$CI_TEST_SLICE"
+          else
+            scripts/run_tests.sh
+          fi
         env:
           # This is the maximum number of test FILES that run together.
           # run_tests_parallel.py starts one pytest subprocess for each file
@@ -138,6 +172,15 @@ jobs:
           # yield an unset variable. Test selection, the command, the timeout
           # and the pass/fail rule are identical on both runners.
           HERMES_TEST_WORKERS: ${{ github.repository == 'yihangdong/hermes-agent' && '8' || '96' }}
+          # Which quarter of the suite this job runs, on the same condition
+          # as ``runs-on`` above. run_tests_parallel.py distributes the
+          # discovered files across N slices (LPT over the duration cache;
+          # with no cache every file scores the same and the split is by
+          # count). Verified at this head: the four slices partition the same
+          # 3591 discovered files 898/898/898/897 — 3591 unique, complete and
+          # disjoint, nothing dropped or repeated. Empty upstream, where the
+          # step runs the plain command and the runner does no slicing.
+          CI_TEST_SLICE: ${{ github.repository == 'yihangdong/hermes-agent' && format('{0}/4', matrix.slice) || '' }}
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
