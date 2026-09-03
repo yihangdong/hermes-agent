@@ -3200,3 +3200,474 @@ class TestRealExecutorWorkIsCharged:
             await workers.settled()
             assert await _Uncooperative._drain_stragglers(set()) == set()
             await TestGlobalDetachedCleanupBudget._quiesced()
+
+
+class TestExternalCancellationCannotReleaseLiveWork:
+    """Cancelling the wrapper is not the same as finishing the work.
+
+    Tier-1 rereview-4C's finding, ``T1R4C-F1``.  Correction 4C stopped
+    *this module* from cancelling a thread step's wrapper and parked that
+    wrapper in the ledger uncancelled, which held for exactly as long as
+    nobody else cancelled it.  But the parked object was still an ordinary
+    cancellable task, reachable by anything able to enumerate the loop's
+    tasks — the loop's own shutdown included.  One cancellation from
+    outside resolved it, the harvest watching it returned the permit, and
+    the uninterruptible call it stood for went on running while the room
+    charged for it was handed to somebody else.
+
+    So nothing below cancels through the bridge, which has no such path at
+    all.  Each falsifier reaches past it, finds the task the loop is
+    holding for a hand-off, and cancels *that* — while a real thread is
+    really blocked inside the call it wraps, released only by the test.
+    """
+
+    #: Comfortably more requests than the ceiling admits, so the bound is
+    #: reached rather than merely approached.  Matches the count the
+    #: rereviewers used.
+    SEQUENTIAL = 12
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _handoffs(record):
+        """Count thread hand-offs and keep the coroutine each one returned.
+
+        The wrapper the loop actually awaits is the task
+        ``_Deadline.bounded`` builds around that coroutine, and the bridge
+        never exposes it.  Recording the coroutine is what lets a
+        falsifier find that task among the loop's own and cancel it from
+        outside — reaching the object under test without reaching into the
+        implementation, and without weakening the hand-off, which remains
+        the genuine :func:`asyncio.to_thread`.
+        """
+        real = asyncio.to_thread
+
+        def capture(func, /, *args, **kwargs):
+            coro = real(func, *args, **kwargs)
+            record["coros"].append(coro)
+            record["threads"] += 1
+            return coro
+
+        with patch.object(asyncio, "to_thread", capture):
+            yield
+
+    @staticmethod
+    async def _cancel_wrappers(record):
+        """Cancel every wrapper still awaiting a hand-off, from outside.
+
+        This is the vector, stated exactly: a third party that can see the
+        loop's tasks cancels one the bridge deliberately never cancels.
+        The turns afterwards let the cancellation be delivered and let
+        every callback the bridge attached to that wrapper run, so an
+        early refund has happened by the time the caller asserts.
+        """
+        live = [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and task.get_coro() in record["coros"]
+        ]
+        for task in live:
+            task.cancel()
+        for _ in range(5):
+            await asyncio.sleep(0)
+        return len(live)
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _one_worker(workers, *, calls):
+        """The socket layer over an executor with exactly one thread.
+
+        A second hand-off then has nowhere to run: its work item waits in
+        the executor's queue, entered by no thread at all.  That is the
+        one state in which cancelling a wrapper really does end everything
+        the step ever was, and there the permit must come back — a ledger
+        holding capacity against work nobody will ever do would saturate
+        the bridge for good, which is the opposite failure and just as
+        forbidden.
+        """
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=1, thread_name_prefix="stagea-queued"
+        )
+        asyncio.get_running_loop().set_default_executor(executor)
+        with patch("os.stat", side_effect=_blocking_socket_stat(workers, block="preflight")):
+            with patch.object(bridge, "read_peer_uid", return_value=CONTROLLER_UID):
+                with patch.object(
+                    asyncio,
+                    "open_unix_connection",
+                    TestRealExecutorWorkIsCharged._connection(calls),
+                    create=True,
+                ):
+                    yield
+
+    @pytest.mark.asyncio
+    async def test_cancelling_a_parked_wrapper_keeps_its_permit_until_the_thread_exits(self):
+        """The finding itself, stated as the one thing that must not happen.
+
+        A real worker is blocked in the call the step handed off, the
+        exchange is over, and the wrapper is then cancelled by somebody
+        who is not the bridge.  Before this correction the ledger emptied
+        on that cancellation — permit returned, straggler forgotten —
+        while the thread went on running, which is what let a later
+        request reserve the same room.  Here the permit stays charged for
+        as long as the call is really running, and comes back on the
+        worker's own exit and on nothing else.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        record = {"coros": [], "threads": 0}
+
+        try:
+            with _Uncooperative._no_unobserved_tasks():
+                with self._handoffs(record):
+                    with TestRealExecutorWorkIsCharged._real_threads(
+                        workers, block="preflight", calls=calls
+                    ):
+                        with _Uncooperative._declared_deadlines():
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id="cancel-me"),
+                                bound=bridge._exchange_budget() + _Uncooperative.SLACK,
+                            )
+
+                            assert "socket_unavailable" in reply
+                            assert instance._inflight == 0
+                            assert await workers.reaches(1) == 1
+                            assert bridge._cleanup_charged == 1
+                            assert len(bridge._stragglers) == 1
+
+                            cancelled = await self._cancel_wrappers(record)
+                            assert cancelled == 1, (
+                                "no live wrapper was found to cancel, so the vector "
+                                "under test was never applied"
+                            )
+
+                            # Not one sample: a refund arrives on whichever
+                            # later turn the cancellation is delivered on,
+                            # so the claim is checked across a window that
+                            # outlives every turn it could arrive on.
+                            for _ in range(50):
+                                await asyncio.sleep(0.002)
+                                assert workers.live == 1, "the real worker ended on its own"
+                                assert bridge._cleanup_charged == 1, (
+                                    "capacity came back on the wrapper's cancellation "
+                                    "while the worker thread was still running"
+                                )
+                                assert len(bridge._stragglers) == 1
+                                # And nothing was started in its place: no
+                                # retry, no second request, no replacement
+                                # cleanup worker.
+                                assert (calls["connects"], calls["writes"]) == (0, 0)
+                                assert record["threads"] == 1
+
+                            await workers.settled()
+                            assert await _Uncooperative._drain_stragglers(set()) == set()
+                            assert bridge._cleanup_charged == 0, "the permit was never given back"
+                            assert workers.live == 0
+        finally:
+            await workers.settled()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+    @classmethod
+    async def _sequential(cls, block, *, expected_connects):
+        """Drive ``SEQUENTIAL`` requests, cancelling every wrapper as it parks.
+
+        The cancellation is applied after *each* request rather than once
+        at the end, because that is the shape that compounds: one early
+        refund frees room the next request takes, and the run that
+        followed reached twelve live workers against a declared cap of
+        eight.  Every invariant that has to hold during the run is
+        asserted while it is still running.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        record = {"coros": [], "threads": 0}
+        cap = bridge.MAX_DETACHED_CLEANUP_TASKS
+        admitted, refused, cancelled = 0, 0, 0
+
+        try:
+            with cls._handoffs(record):
+                with TestRealExecutorWorkIsCharged._real_threads(
+                    workers, block=block, calls=calls
+                ):
+                    with _Uncooperative._declared_deadlines():
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                        for n in range(cls.SEQUENTIAL):
+                            was = (calls["connects"], calls["writes"], record["threads"])
+                            was_live = workers.live
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"extcancel-{n}"),
+                                bound=bound,
+                            )
+                            spent = (
+                                calls["connects"] - was[0],
+                                calls["writes"] - was[1],
+                                record["threads"] - was[2],
+                            )
+
+                            if reply == bridge.refusal_text("cleanup_capacity_exhausted"):
+                                refused += 1
+                                # Nothing at all: no executor hand-off, no
+                                # connect, no write, no new live work.
+                                assert spent == (0, 0, 0), f"a refused request created {spent}"
+                                assert workers.live == was_live
+                            else:
+                                admitted += 1
+                                assert "socket_unavailable" in reply
+                                assert spent == (expected_connects, 0, expected_connects + 1)
+                                assert await workers.reaches(was_live + 1) == was_live + 1
+
+                            cancelled += await cls._cancel_wrappers(record)
+
+                            assert instance._inflight == 0, "the visible slot was not returned"
+                            assert workers.live <= cap, (
+                                f"{workers.live} live worker threads against a cap of {cap}"
+                            )
+                            assert bridge._cleanup_charged <= cap
+
+                        assert not workers.release.is_set(), "the stall was released"
+                        assert workers.live == admitted, (
+                            "every admitted request should still own one live worker"
+                        )
+                        await workers.settled()
+        finally:
+            await workers.settled()
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+        return admitted, refused, cancelled, workers
+
+    @pytest.mark.asyncio
+    async def test_twelve_sequential_cancelled_preflight_wrappers_stay_under_the_ceiling(self):
+        """Twelve requests on the preflight hand-off, each wrapper cancelled.
+
+        The rereviewer's count and the rereviewer's vector together.  Each
+        admitted request blocks one real thread that will not come back
+        and then has its wrapper cancelled from outside; the ceiling has
+        to keep binding anyway, and the requests past it have to create
+        nothing whatsoever.
+        """
+        admitted, refused, cancelled, workers = await self._sequential(
+            "preflight", expected_connects=0
+        )
+
+        assert admitted + refused == self.SEQUENTIAL
+        assert refused, "the ceiling never engaged, so nothing was bounded"
+        assert cancelled == admitted, "a parked wrapper escaped the external cancellation"
+        assert workers.peak <= bridge.MAX_DETACHED_CLEANUP_TASKS
+        assert workers.peak == admitted
+        assert workers.live == 0, "a released worker never exited"
+
+    @pytest.mark.asyncio
+    async def test_twelve_sequential_cancelled_recheck_wrappers_stay_under_the_ceiling(self):
+        """The same on the hand-off that runs with a connection already open.
+
+        Closing the preflight and leaving the post-connect identity
+        re-check open would move the finding rather than answer it, and
+        move it somewhere strictly worse, because by then a socket exists.
+        Each admitted request connects once, writes nothing, and hands off
+        twice — the preflight that returns, and the re-check that does not
+        and is then cancelled.
+        """
+        admitted, refused, cancelled, workers = await self._sequential(
+            "recheck", expected_connects=1
+        )
+
+        assert admitted + refused == self.SEQUENTIAL
+        assert refused, "the ceiling never engaged, so nothing was bounded"
+        assert cancelled == admitted, "a parked wrapper escaped the external cancellation"
+        assert workers.peak <= bridge.MAX_DETACHED_CLEANUP_TASKS
+        assert workers.peak == admitted
+        assert workers.live == 0, "a released worker never exited"
+
+    @pytest.mark.asyncio
+    async def test_a_concurrent_burst_of_cancelled_wrappers_cannot_oversubscribe(self):
+        """Racing for the last permits, with every wrapper cancelled as it parks.
+
+        Sequential saturation cannot catch a check-then-act; only requests
+        that reserve at the same moment can.  The ledger is sampled at the
+        one place capacity is ever committed, so a ceiling that was passed
+        and then recovered still fails here, and the live worker count is
+        read on every turn of the burst.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        record = {"coros": [], "threads": 0}
+        cap = bridge.MAX_DETACHED_CLEANUP_TASKS
+        samples = []
+        refusal = bridge.refusal_text("cleanup_capacity_exhausted")
+        refused, cancelled = 0, 0
+
+        try:
+            with TestGlobalDetachedCleanupBudget._ledger_samples(samples):
+                with self._handoffs(record):
+                    with TestRealExecutorWorkIsCharged._real_threads(
+                        workers, block="preflight", calls=calls
+                    ):
+                        with _Uncooperative._declared_deadlines():
+                            for burst in range(4):
+                                tasks = [
+                                    asyncio.ensure_future(
+                                        _Uncooperative._request(
+                                            instance, message_id=f"race-{burst}-{n}"
+                                        )
+                                    )
+                                    for n in range(bridge.MAX_INFLIGHT_REQUESTS)
+                                ]
+                                done, pending = await asyncio.wait(
+                                    tasks, timeout=_Uncooperative.OUTER
+                                )
+                                assert not pending, "an exchange never finished"
+                                for task in done:
+                                    if task.result() == refusal:
+                                        refused += 1
+
+                                cancelled += await self._cancel_wrappers(record)
+
+                                assert workers.live <= cap, (
+                                    f"{workers.live} live worker threads against a cap of {cap}"
+                                )
+                                assert bridge._cleanup_charged <= cap
+                                assert instance._inflight == 0
+
+                            assert refused, "the ceiling never engaged, so no race was run"
+                            assert cancelled, "no wrapper was ever cancelled"
+                            assert workers.peak <= cap
+                            assert calls["writes"] == 0
+
+            assert samples, "no reservation was ever attempted"
+            assert all(charged <= cap for _granted, charged, _live in samples), (
+                "the ceiling was oversubscribed at a reservation"
+            )
+        finally:
+            await workers.settled()
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_capacity_returns_after_the_threads_behind_cancelled_wrappers_exit(self):
+        """Recovery, on the workers' exit and on nothing before it.
+
+        A ceiling that never lifts is as wrong as one that never binds, so
+        this proves both directions with every wrapper already cancelled:
+        refused while the threads run, harvested to empty once they exit,
+        and an ordinary exchange succeeding afterwards on the same bridge.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        record = {"coros": [], "threads": 0}
+        refusal = bridge.refusal_text("cleanup_capacity_exhausted")
+
+        try:
+            with self._handoffs(record):
+                with TestRealExecutorWorkIsCharged._real_threads(
+                    workers, block="preflight", calls=calls
+                ):
+                    with _Uncooperative._declared_deadlines():
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                        replies = []
+                        for n in range(self.SEQUENTIAL):
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"back-{n}"),
+                                bound=bound,
+                            )
+                            replies.append(reply)
+                            await self._cancel_wrappers(record)
+
+                        assert replies[-1] == refusal, "the bridge never saturated"
+                        held = workers.live
+                        assert held, "nothing was actually holding the ceiling"
+                        assert bridge._cleanup_charged >= held
+
+                        # A saturated bridge whose wrappers are all gone
+                        # still refuses before it touches the executor.
+                        was = (calls["connects"], calls["writes"], record["threads"])
+                        again, _elapsed = await _Uncooperative._finished_within(
+                            _Uncooperative._request(instance, message_id="still-shut"),
+                            bound=bound,
+                        )
+                        assert again == refusal
+                        assert (calls["connects"], calls["writes"], record["threads"]) == was
+
+                        # Releasing the threads is the only thing that happens.
+                        await workers.settled()
+                        assert await _Uncooperative._drain_stragglers(set()) == set()
+                        assert workers.live == 0
+                        assert bridge._cleanup_charged == 0, "capacity did not harvest down"
+                        assert not bridge._stragglers
+
+            healthy, captured = TestExchange._connection()
+            with _socket_layer(healthy):
+                after = await _Uncooperative._request(instance, message_id="after-cancel")
+
+            assert after == "[Stage-A] ACCEPTED_TERMINAL\ndone"
+            assert len(captured) == 1
+            assert bridge._cleanup_charged == 0
+        finally:
+            await workers.settled()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_a_wrapper_cancelled_before_its_call_began_returns_its_permit(self):
+        """The other direction: room held for work nobody will ever do.
+
+        Tying the permit to the call is only correct if a call that never
+        begins releases it.  With a single-thread executor the second
+        hand-off is still queued when its wrapper is cancelled, so that
+        step ends without any worker having entered it — and its permit
+        has to come back at once, or eight such requests would saturate
+        the bridge permanently.  The first step's worker is really running
+        throughout, so the same instant that must return one permit must
+        also keep the other.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        record = {"coros": [], "threads": 0}
+
+        try:
+            with self._handoffs(record):
+                with self._one_worker(workers, calls=calls):
+                    with _Uncooperative._declared_deadlines():
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                        for name in ("runs", "queued"):
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=name),
+                                bound=bound,
+                            )
+                            assert "socket_unavailable" in reply
+
+                        assert record["threads"] == 2, "both steps must have handed off"
+                        assert await workers.reaches(1) == 1
+                        assert workers.started == 1, "the queued call ran after all"
+                        assert bridge._cleanup_charged == 2
+                        assert len(bridge._stragglers) == 2
+
+                        assert await self._cancel_wrappers(record) == 2
+
+                        # One call is running and keeps its permit; one
+                        # never began and gives its permit straight back.
+                        assert bridge._cleanup_charged == 1, (
+                            "one running call and one that never began should leave "
+                            f"exactly one permit charged, not {bridge._cleanup_charged}"
+                        )
+                        assert len(bridge._stragglers) == 1
+                        assert workers.live == 1, "the running worker was disturbed"
+
+                        # Freeing the only thread must not let the skipped
+                        # call start behind a ledger no longer holding room
+                        # for it.
+                        await workers.settled()
+                        assert await _Uncooperative._drain_stragglers(set()) == set()
+                        assert workers.started == 1, "the disowned call ran anyway"
+                        assert bridge._cleanup_charged == 0
+                        assert not bridge._stragglers
+        finally:
+            await workers.settled()
+            await TestGlobalDetachedCleanupBudget._quiesced()

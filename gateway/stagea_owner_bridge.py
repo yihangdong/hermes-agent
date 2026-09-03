@@ -249,18 +249,24 @@ def _exchange_budget() -> float:
     return 5 * _local_step_deadline() + REPLY_DEADLINE_SECONDS
 
 
-#: Steps that outlived their bound and were let go.  An abandoned task has
+#: Steps that outlived their bound and were let go.  An abandoned step has
 #: to stay reachable until it actually ends: the collector reports a task
 #: it reclaims while still pending, and reports again if nobody ever read
 #: the exception it finished with.  This set is the strong reference that
-#: makes that harvest deterministic instead of leaving it to the collector,
-#: and :func:`_harvest` is what empties it.
+#: makes that harvest deterministic instead of leaving it to the collector.
 #:
-#: An entry is the step's *work*, not a handle on it.  Where the work runs
-#: in a worker thread the entry is left uncancelled precisely so the two
-#: cannot come apart: the wrapper resolves when the thread returns and not
-#: before, so an entry disappears from here exactly when its work really
-#: ends — never while an uninterruptible call is still running.
+#: An entry is the step's *work*, and for a step whose work runs outside
+#: the loop that is emphatically not the loop's handle on it.  A coroutine
+#: step is its task: the task ends exactly when the coroutine does, so the
+#: task is both the entry and a true completion signal.  A thread step is
+#: not.  Cancelling the wrapper the loop awaits ends *the wrapper*, while
+#: the call inside the thread — which cannot be interrupted — runs on; and
+#: that cancellation need not come from this module at all, since anything
+#: able to reach a task on this loop is able to cancel it.  So a thread
+#: step is entered here as its :class:`_ThreadWork`, whose end is reported
+#: from inside the worker thread once the call has really returned.  Either
+#: way an entry disappears from here exactly when its work ends — never
+#: while an uninterruptible call is still running.
 #:
 #: Its size is bounded by a reservation, not by an argument.  The in-flight
 #: slots cannot bound it: a slot is released the moment the Owner is
@@ -269,10 +275,10 @@ def _exchange_budget() -> float:
 #: without limit.  What is bounded is this set itself.  Every entry holds a
 #: permit charged against :data:`MAX_DETACHED_CLEANUP_TASKS` *before* the
 #: exchange that created it was allowed to begin, and that permit comes
-#: back only when the task really ends, so
+#: back only when the work really ends, so
 #: ``len(_stragglers) <= _cleanup_charged <= MAX_DETACHED_CLEANUP_TASKS``
 #: holds at every instant, under any interleaving.
-_stragglers: set[asyncio.Future[Any]] = set()
+_stragglers: set[Any] = set()
 
 #: Permits currently committed: those an exchange has reserved and not yet
 #: spent, plus the one each entry in :data:`_stragglers` is holding.
@@ -316,12 +322,16 @@ def _harvest(task: asyncio.Future[Any]) -> None:
 
     Returning the permit is the other half, and it is what makes the
     ceiling a bound on *live* work rather than a lifetime quota: capacity
-    comes back exactly when the step really ends — for a step running in
-    a worker thread, when that thread's call returns, because nothing
-    cancelled the wrapper out from under it — so a stall that is
+    comes back exactly when the step really ends, so a stall that is
     eventually released cannot leave the bridge permanently saturated.
-    The permit is returned only for a task this ledger was actually
+    A permit is returned only for an entry this ledger was actually
     holding, so a harvest that runs twice cannot conjure capacity.
+
+    The task is the entry only for a step that *is* its task.  A thread
+    step is entered as its :class:`_ThreadWork` instead, and this runs on
+    that step's wrapper purely to read the outcome: the wrapper is not in
+    the ledger, so no cancellation of it — from here or from anywhere
+    else — can return a permit the running call still owns.
     """
     global _cleanup_charged
     with _cleanup_lock:
@@ -334,6 +344,107 @@ def _harvest(task: asyncio.Future[Any]) -> None:
     exc = task.exception()
     if exc is not None:
         logger.debug("[stagea] abandoned step ended with %s", type(exc).__name__)
+
+
+class _ThreadWork:
+    """The real call behind one thread step, and the signal that it ended.
+
+    ``asyncio.to_thread`` hands the loop a future over work the executor
+    owns.  Cancelling that future ends *the future*: the call inside the
+    thread cannot be interrupted and runs on regardless.  So the future is
+    not a completion signal for the work, and a ledger that refunds on it
+    hands a permit back while the worker is still live — and it need not
+    be this module that cancels, since anything able to reach a task on
+    this loop can cancel it, the loop's own shutdown included.
+
+    This is the signal instead.  :meth:`run` is what the worker actually
+    executes; its ``finally`` runs in that thread once the call has
+    returned or raised, so there is no state in which the call is still
+    running and its permit has been given back.
+
+    :meth:`run` and :meth:`disown` settle ownership of that permit with a
+    single compare-and-set under :data:`_cleanup_lock`, so exactly one of
+    them wins.  Work the executor never began — a hand-off cancelled while
+    still queued, or one the executor refused — is disowned and its permit
+    returned at once, which is why holding the permit for the work cannot
+    leave a permanently saturated bridge behind; the call is then skipped
+    rather than started behind a ledger no longer holding room for it, and
+    skipping decides nothing, because a step is only ever disowned once
+    its wrapper has resolved and nothing awaits its result.
+
+    Its state is guarded by the same lock as the ledger, taken briefly and
+    never across the call itself, so a worker thread and the loop can
+    settle it between them without a second lock or an ordering rule.
+    """
+
+    __slots__ = ("_func", "_args", "_entered", "_exited", "_disowned", "_parked")
+
+    def __init__(self, func: Callable[..., Any], args: Tuple[Any, ...]) -> None:
+        self._func = func
+        self._args = args
+        self._entered = False
+        self._exited = False
+        self._disowned = False
+        self._parked = False
+
+    def run(self) -> Any:
+        """Execute the call in the worker thread, and report its real end."""
+        with _cleanup_lock:
+            if self._disowned:
+                return None
+            self._entered = True
+        try:
+            return self._func(*self._args)
+        finally:
+            self._finish()
+
+    def _finish(self) -> None:
+        """Record the worker's exit and release what the call was holding."""
+        global _cleanup_charged
+        with _cleanup_lock:
+            self._exited = True
+            if self._parked:
+                self._parked = False
+                _stragglers.discard(self)
+                _cleanup_charged -= 1
+
+    def park(self) -> bool:
+        """Hold this step's permit against the call, or decline to.
+
+        ``False`` says the ledger has nothing left to hold — the call has
+        returned, or was disowned before it began — and the permit is the
+        caller's to give back, so a permit is credited exactly once.
+        """
+        with _cleanup_lock:
+            if self._exited or self._disowned or self._parked:
+                return False
+            self._parked = True
+            _stragglers.add(self)
+            return True
+
+    def disown(self) -> None:
+        """Give up on work the executor never began.
+
+        Runs when the wrapper has resolved, from whatever resolved it —
+        including a cancellation this module did not issue.  If the call
+        is running, or has already run, this does nothing whatsoever: the
+        permit belongs to the call, and only :meth:`_finish` may return
+        it.
+        """
+        global _cleanup_charged
+        with _cleanup_lock:
+            if self._entered or self._disowned:
+                return
+            self._disowned = True
+            if self._parked:
+                self._parked = False
+                _stragglers.discard(self)
+                _cleanup_charged -= 1
+
+    def wrapper_done(self, task: asyncio.Future[Any]) -> None:
+        """Read the wrapper's outcome; never spend the call's permit."""
+        _harvest(task)
+        self.disown()
 
 
 class _CleanupBudget:
@@ -383,7 +494,9 @@ class _CleanupBudget:
         """Return the permit of a step that ended inside its bound."""
         self._permits += 1
 
-    def abandon(self, task: asyncio.Future[Any], *, cancel: bool = True) -> bool:
+    def abandon(
+        self, task: asyncio.Future[Any], *, work: Optional["_ThreadWork"] = None
+    ) -> bool:
         """Stop waiting for a step that lost its budget, and hold its permit.
 
         Cancellation is a request, not a guarantee: an awaitable may catch
@@ -393,29 +506,39 @@ class _CleanupBudget:
         held only for harvesting, never awaited, never consulted, holding
         no in-flight slot, starting no new work and issuing no retry.
 
-        ``cancel`` is ``False`` for a step whose real work runs outside
-        the loop.  A worker thread cannot be interrupted: cancelling the
-        future the loop is awaiting ends *that future* while the call
-        inside the thread runs on, so a cancelled wrapper would hand this
-        permit back while the work it stands for is still live — the one
-        thing a bound on live work must never do.  Left uncancelled, the
-        wrapper cannot finish before the worker returns, so harvesting the
-        wrapper *is* harvesting the work, and the permit is charged for
-        the executor call's real lifetime rather than the wrapper's.
+        ``work`` is the executor call behind a thread step, and it changes
+        what is held rather than merely how.  A worker thread cannot be
+        interrupted: cancelling the future the loop awaits ends *that
+        future* while the call inside the thread runs on.  Leaving the
+        wrapper uncancelled here is therefore not enough, because the
+        wrapper stays cancellable by anyone else who can reach it, and a
+        ledger holding the wrapper would refund on that cancellation while
+        the call was still live — the one thing a bound on live work must
+        never do.  So the ledger holds the call itself, whose end is
+        reported from the worker thread, and the wrapper is watched only
+        so its outcome is read.  There is no cancellation of a thread
+        step here at all: not a flag left ``False``, but no such path.
 
         Returns:
-            ``True`` when the task was parked, and is now holding the
-            permit this step drew until it really ends; ``False`` when it
-            had already finished, so no hold is needed and the caller
+            ``True`` when the step's work was parked, and is now holding
+            the permit this step drew until it really ends; ``False`` when
+            it had already finished, so no hold is needed and the caller
             returns the permit instead.  Saying which happened here, rather
             than crediting a permit unconditionally, is what keeps the
             ledger exact: a permit is returned only by whoever drew it.
         """
+        if work is not None:
+            parked = work.park()
+            if parked or not task.done():
+                # A wrapper still to resolve is watched even when its call
+                # has already ended, so its outcome is read exactly once
+                # and no deliberate abandonment is reported as a leak.
+                task.add_done_callback(work.wrapper_done)
+            return parked
         if task.done():
             _harvest(task)
             return False
-        if cancel:
-            task.cancel()
+        task.cancel()
         with _cleanup_lock:
             _stragglers.add(task)
         task.add_done_callback(_harvest)
@@ -446,19 +569,37 @@ class _Deadline:
     def remaining(self) -> float:
         return self._expiry - time.monotonic()
 
-    def _release(self, task: asyncio.Future[Any], *, cancel: bool) -> None:
+    def _release(self, task: asyncio.Future[Any], *, work: Optional["_ThreadWork"]) -> None:
         """End a step that lost its bound, keeping the permit exact.
 
         Every permit is drawn in :meth:`bounded` and returned either here
-        or on the success path, so a permit can be neither leaked by a
-        step that overran nor conjured by one that had already finished.
-        ``cancel`` says whether asking is worth anything; see
+        or in :meth:`_settle`, so a permit can be neither leaked by a step
+        that overran nor conjured by one that had already finished.
+        ``work`` says what the permit is actually held against; see
         :meth:`_CleanupBudget.abandon`.
         """
-        if not self._cleanup.abandon(task, cancel=cancel):
+        if not self._cleanup.abandon(task, work=work):
             self._cleanup.give_back()
 
-    async def bounded(self, awaitable: Any, cap: float, *, cancellable: bool = True) -> Any:
+    def _settle(self, task: asyncio.Future[Any], *, work: Optional["_ThreadWork"]) -> None:
+        """Account for a step whose wrapper resolved inside its bound.
+
+        Resolved is not finished.  A thread step's wrapper can be resolved
+        by a cancellation from outside this module while the call it
+        stands for is still running in its worker, and that resolution
+        arrives here rather than on the timeout path — which is exactly
+        where a bound on live work would otherwise be given away.  The
+        permit follows the call either way: it is returned only when there
+        is no live work left to hold it, and parked against the work when
+        there is.
+        """
+        if work is not None and self._cleanup.abandon(task, work=work):
+            return
+        self._cleanup.give_back()
+
+    async def bounded(
+        self, awaitable: Any, cap: float, *, work: Optional["_ThreadWork"] = None
+    ) -> Any:
         """Await under the smaller of this step's cap and what is left.
 
         Once the budget is spent this raises :class:`asyncio.TimeoutError`
@@ -486,11 +627,12 @@ class _Deadline:
         legal step; were that ever untrue, refusing is the fail-closed
         answer and starting unaccounted work is not.
 
-        ``cancellable`` is ``False`` when the real work behind
-        ``awaitable`` runs outside the loop, where cancelling the wrapper
-        would end the wrapper and nothing else.  Such a step is parked
-        uncancelled instead, so its permit stays charged for as long as
-        the work is really running; see :meth:`bounded_thread`.
+        ``work`` is given when the real work behind ``awaitable`` runs
+        outside the loop, where the wrapper is not the work and cancelling
+        it would end the wrapper and nothing else.  The permit such a step
+        draws is then held against the call itself for as long as it is
+        really running, whoever resolves the wrapper and however; see
+        :meth:`bounded_thread`.
         """
         timeout = min(cap, self.remaining())
         if timeout <= 0 or not self._cleanup.take():
@@ -506,12 +648,12 @@ class _Deadline:
             # same abandonment is what keeps that teardown non-blocking;
             # work that cannot be cancelled outlives the caller whatever
             # is done here, so it stays charged rather than pretended away.
-            self._release(task, cancel=cancellable)
+            self._release(task, work=work)
             raise
         if not done:
-            self._release(task, cancel=cancellable)
+            self._release(task, work=work)
             raise asyncio.TimeoutError
-        self._cleanup.give_back()
+        self._settle(task, work=work)
         return task.result()
 
     async def bounded_thread(self, func: Callable[..., Any], /, *args: Any, cap: float) -> Any:
@@ -526,11 +668,14 @@ class _Deadline:
         than work, and a bridge already holding a thread apiece could
         start unboundedly many more.
 
-        Leaving the wrapper uncancelled is what ties the permit to the
-        work: the wrapper resolves only when the executor call returns, so
-        the harvest that gives the permit back is the worker's own exit.
-        Binding that to the one place a thread is handed off — rather than
-        to a flag each call site has to remember — is what makes it
+        What ties the permit to the work is that the ledger holds the work
+        and not the loop's handle on it.  :class:`_ThreadWork` is the call
+        the worker really runs, and it reports its own end from inside
+        that worker, so the release that gives the permit back *is* the
+        thread's exit — not the resolution of a wrapper, which anyone able
+        to reach a task on this loop may bring about at any time.  Binding
+        that to the one place a thread is handed off, rather than to
+        something each call site has to remember, is what makes it
         structural.
 
         ``asyncio.to_thread`` is read at call time, so a falsifier can
@@ -539,7 +684,8 @@ class _Deadline:
         for want of budget is closed in :meth:`bounded` before any worker
         exists.
         """
-        return await self.bounded(asyncio.to_thread(func, *args), cap, cancellable=False)
+        work = _ThreadWork(func, args)
+        return await self.bounded(asyncio.to_thread(work.run), cap, work=work)
 
 
 class BridgeError(Exception):
