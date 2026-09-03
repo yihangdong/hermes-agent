@@ -454,7 +454,7 @@ class _ThreadWork:
 
         Runs exactly once for a step that was let go: as the wrapper's
         completion callback when it had still to resolve, and directly
-        from :meth:`_CleanupBudget.abandon` when it already had.
+        from :meth:`_Deadline._release` when it already had.
         """
         _harvest(task)
         self.disown()
@@ -535,11 +535,10 @@ class _CleanupBudget:
         so its outcome is read.  There is no cancellation of a thread
         step here at all: not a flag left ``False``, but no such path.
 
-        The wrapper's outcome is read on both paths out of that watch —
-        immediately when it has already resolved, and from a single
-        completion callback when it has not — so nothing this method
-        lets go of can end up read by nobody, whoever resolved the
-        wrapper and in whichever turn.
+        A wrapper that has *already* resolved is watched by nothing here,
+        because there is nothing left to watch; reading what it carried
+        is then the caller's, and only :meth:`_Deadline._release` has a
+        step whose outcome nobody else will read.
 
         Returns:
             ``True`` when the step's work was parked, and is now holding
@@ -556,20 +555,6 @@ class _CleanupBudget:
                 # has already ended, so its outcome is read exactly once
                 # and no deliberate abandonment is reported as a leak.
                 task.add_done_callback(work.wrapper_done)
-            else:
-                # And a wrapper that has *already* resolved is read here,
-                # on the spot.  This is not the same state as the one
-                # above and is not reachable from the timeout, which by
-                # definition arrives with the wrapper unresolved; it is
-                # reachable when this exchange is cancelled from outside
-                # in the turn between the wrapper completing and the wait
-                # on it resuming, since the wait never consumes an
-                # outcome itself.  Deferring the read to a callback would
-                # leave it owed to a later turn that a cancelled — or
-                # closing — exchange cannot promise, so the same outcome
-                # is taken now, and by the same hand, so it is still
-                # taken exactly once.
-                work.wrapper_done(task)
             return parked
         if task.done():
             _harvest(task)
@@ -613,9 +598,29 @@ class _Deadline:
         that overran nor conjured by one that had already finished.
         ``work`` says what the permit is actually held against; see
         :meth:`_CleanupBudget.abandon`.
+
+        A step let go here is never awaited again, so whatever its wrapper
+        ends up carrying is read here or by nobody — unlike :meth:`_settle`,
+        whose caller goes on to read it.  ``abandon`` watches a wrapper
+        that has still to resolve; one that has *already* resolved is read
+        on the spot instead, since a callback added to it would owe that
+        read to a later turn, which a cancelled — or closing — exchange
+        cannot promise.  The two are exclusive by construction: nothing is
+        awaited between them, so the wrapper cannot resolve in between and
+        be read twice, and a parked step returns above before either.
+
+        That second state is reachable only through cancellation, never
+        through the timeout, which by definition arrives with the wrapper
+        unresolved.  :func:`asyncio.wait` reports a wrapper that completed
+        on the turn after it completed and consumes no outcome itself, so
+        an outer cancellation winning that turn arrives here with a
+        finished call, a resolved wrapper, and nothing having read it.
         """
-        if not self._cleanup.abandon(task, work=work):
-            self._cleanup.give_back()
+        if self._cleanup.abandon(task, work=work):
+            return
+        self._cleanup.give_back()
+        if work is not None and task.done():
+            work.wrapper_done(task)
 
     def _settle(self, task: asyncio.Future[Any], *, work: Optional["_ThreadWork"]) -> None:
         """Account for a step whose wrapper resolved inside its bound.
