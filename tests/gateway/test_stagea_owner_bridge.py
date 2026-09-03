@@ -3686,21 +3686,23 @@ class TestAnAbandonedThreadStepThatRaisesIsStillObserved:
     already resolved — but only through the *cancellation* path, never
     the timeout: ``asyncio.wait`` reports a wrapper that completed on the
     turn after it completed, and an outer cancellation can win that turn.
-    The coroutine branch a few lines below harvests exactly this case;
-    the thread branch dropped it.
+    ``abandon``'s coroutine branch harvests exactly that state; its
+    thread branch dropped it, and :meth:`_Deadline._release` — the one
+    caller that never looks at the wrapper again — now reads it there
+    instead.
 
     ``asyncio.wait`` reads no child's outcome, so what fell through was
     the exception the call really raised, read by nobody at all — and the
     loop reports a deliberate, correctly-accounted abandonment as ``Task
     exception was never retrieved``.  The ledger was never wrong here;
     the observation was missing, which is the whole of the finding and
-    the whole of what the falsifier below states.
+    the whole of what this falsifier states.
 
-    Nothing in it is sampled or approximated: a genuine synchronous call
+    Nothing in it is sampled or approximated.  A genuine synchronous call
     blocks a genuine worker thread and exits by *raising*, and the
-    exchange is cancelled from outside the loop's view of that wrapper
-    the instant it resolves — necessarily before ``bounded``, which
-    cannot resume until a later turn, has consumed it.
+    exchange is cancelled from outside the instant that wrapper resolves
+    — necessarily before ``bounded``, which cannot resume until a later
+    turn, has consumed it.
     """
 
     @staticmethod
