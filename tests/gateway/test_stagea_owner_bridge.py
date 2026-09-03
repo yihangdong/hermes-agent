@@ -9,6 +9,7 @@ what the bridge will do.
 import asyncio
 import concurrent.futures
 import contextlib
+import gc
 import json
 import os
 import shutil
@@ -3668,6 +3669,184 @@ class TestExternalCancellationCannotReleaseLiveWork:
                         assert workers.started == 1, "the disowned call ran anyway"
                         assert bridge._cleanup_charged == 0
                         assert not bridge._stragglers
+        finally:
+            await workers.settled()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+
+class TestAnAbandonedThreadStepThatRaisesIsStillObserved:
+    """Deep rereview-4D's finding, ``D4D-F1``.
+
+    A thread step's permit is held against the call, and the wrapper the
+    loop awaits is watched only so that call's outcome is read.  The
+    watch was conditional: :meth:`_CleanupBudget.abandon` attached it
+    when the call had been parked, or when the wrapper had still to
+    resolve, and in neither case otherwise.  The state that is neither is
+    reachable — a call that has already ended, whose wrapper is therefore
+    already resolved — but only through the *cancellation* path, never
+    the timeout: ``asyncio.wait`` reports a wrapper that completed on the
+    turn after it completed, and an outer cancellation can win that turn.
+    The coroutine branch a few lines below harvests exactly this case;
+    the thread branch dropped it.
+
+    ``asyncio.wait`` reads no child's outcome, so what fell through was
+    the exception the call really raised, read by nobody at all — and the
+    loop reports a deliberate, correctly-accounted abandonment as ``Task
+    exception was never retrieved``.  The ledger was never wrong here;
+    the observation was missing, which is the whole of the finding and
+    the whole of what the falsifier below states.
+
+    Nothing in it is sampled or approximated: a genuine synchronous call
+    blocks a genuine worker thread and exits by *raising*, and the
+    exchange is cancelled from outside the loop's view of that wrapper
+    the instant it resolves — necessarily before ``bounded``, which
+    cannot resume until a later turn, has consumed it.
+    """
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _preflight_that_raises(workers, *, calls, failures):
+        """The socket layer, with the preflight stat failing in its thread.
+
+        The stat blocks a real worker until the test releases it and then
+        raises, so the wrapper's exception was really produced inside the
+        executor rather than handed to it by a double.
+        :func:`check_socket_path` turns it into the bridge's own
+        fail-closed error, which is what a filesystem that wedges and
+        then fails really produces at this step.
+
+        The connect and peer layers are doubled as everywhere else, so
+        ``calls`` staying at zero is evidence that the cancelled exchange
+        opened no socket and wrote nothing — not merely that it had no
+        chance to.
+        """
+        real_stat = os.stat
+
+        def stat_fn(path, *args, **kwargs):
+            if str(path) != SOCKET:
+                return real_stat(path, *args, **kwargs)
+            workers.block()
+            failures["n"] += 1
+            raise OSError("the preflight stat failed inside its worker thread")
+
+        with patch("os.stat", side_effect=stat_fn):
+            with patch.object(bridge, "read_peer_uid", return_value=CONTROLLER_UID):
+                with patch.object(
+                    asyncio,
+                    "open_unix_connection",
+                    TestRealExecutorWorkIsCharged._connection(calls),
+                    create=True,
+                ):
+                    yield
+
+    @staticmethod
+    def _wrapper_of(record):
+        """The task the loop is holding for the single hand-off made here.
+
+        Found the way the external-cancellation falsifiers find it —
+        among the loop's own tasks, by the coroutine
+        :func:`asyncio.to_thread` returned — so the vector reaches the
+        object under test without reaching inside :class:`_Deadline`.
+        """
+        live = [
+            task
+            for task in asyncio.all_tasks()
+            if not task.done() and task.get_coro() in record["coros"]
+        ]
+        assert len(live) == 1, f"expected exactly one live wrapper, found {len(live)}"
+        return live[0]
+
+    @classmethod
+    async def _cancelled_the_turn_its_wrapper_failed(cls, workers, record, instance):
+        """Run the vector, and let go of both tasks before returning.
+
+        The interleaving is not sampled.  The cancellation is issued from
+        the wrapper's own completion callback, so it is necessarily
+        issued after that wrapper has resolved and before ``bounded`` —
+        which cannot resume before a later turn — has consumed it.  Both
+        orderings that produces are the state under test: either the
+        waiter ``asyncio.wait`` is holding is still pending and is
+        cancelled outright, or it has already been resolved and the
+        cancellation is delivered into the resume itself.  Either way
+        ``asyncio.wait`` raises instead of returning the completed
+        wrapper, and the release path is entered with a wrapper that is
+        already done and a call that is already over.
+
+        Neither task escapes this frame, which is the point of it: a
+        wrapper the caller still references is never finalized, and it is
+        the finalizer that reports an exception nobody read.
+        """
+        exchange = asyncio.ensure_future(
+            _Uncooperative._request(instance, message_id="raises-then-cancelled")
+        )
+        assert await workers.reaches(1) == 1, "the preflight never reached a real thread"
+        assert bridge._cleanup_charged == bridge._CLEANUP_PERMITS_PER_EXCHANGE
+        assert instance._inflight == 1
+
+        wrapper = cls._wrapper_of(record)
+        wrapper.add_done_callback(lambda _task: exchange.cancel())
+
+        workers.release.set()
+        done, _pending = await asyncio.wait({exchange}, timeout=_Uncooperative.OUTER)
+        assert done, f"the exchange was still unfinished after {_Uncooperative.OUTER}s"
+        assert exchange.cancelled(), "the outer cancellation never landed on the exchange"
+        # Deliberately not read here: reading it *is* the harvest, so a
+        # falsifier that asked what the wrapper carried would perform the
+        # very observation whose absence it exists to detect.
+        assert wrapper.done(), "the wrapper had not resolved when the exchange ended"
+        assert not wrapper.cancelled(), "the wrapper was cancelled rather than failed"
+
+    @pytest.mark.asyncio
+    async def test_a_thread_step_that_raises_is_read_when_cancellation_wins_the_resume(self):
+        """The finding itself, stated as the one thing that must not happen.
+
+        Everything the accepted ledger promises is asserted alongside it,
+        because the correction is only allowed to add an observation: the
+        call really ran and really ended, its permits came back, nothing
+        was left in the straggler set, and no socket, write or second
+        hand-off was made in place of the step that was let go.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        record = {"coros": [], "threads": 0}
+        failures = {"n": 0}
+
+        try:
+            # Anything an earlier test left uncollected is collected here,
+            # so the only unobserved task the oracle can report below is
+            # one this test created.
+            gc.collect()
+            with _Uncooperative._no_unobserved_tasks():
+                with TestExternalCancellationCannotReleaseLiveWork._handoffs(record):
+                    with self._preflight_that_raises(workers, calls=calls, failures=failures):
+                        with _Uncooperative._declared_deadlines(step=5.0, reply=5.0):
+                            await self._cancelled_the_turn_its_wrapper_failed(
+                                workers, record, instance
+                            )
+
+                        assert failures["n"] == 1, "the blocking call did not exit by raising"
+                        assert workers.started == 1, "no real worker ever entered the call"
+                        assert workers.live == 0, "the call did not really end"
+                        assert record["threads"] == 1, (
+                            "a replacement hand-off was made; observing an outcome may "
+                            "start no new work"
+                        )
+                        assert (calls["connects"], calls["writes"]) == (0, 0), (
+                            "the cancelled exchange retried or opened a second socket"
+                        )
+                        assert instance._inflight == 0
+                        assert bridge._cleanup_charged == 0, (
+                            "the exchange's permits were not all returned"
+                        )
+                        assert not bridge._stragglers
+
+                # Both tasks died with the frame that made them, so this
+                # is where an exception nobody read is reported — by the
+                # loop's own handler, from the wrapper's finalizer, while
+                # the oracle above is still watching.
+                gc.collect()
         finally:
             await workers.settled()
             await TestGlobalDetachedCleanupBudget._quiesced()

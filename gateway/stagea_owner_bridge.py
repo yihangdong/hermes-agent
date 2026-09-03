@@ -450,7 +450,12 @@ class _ThreadWork:
                 _cleanup_charged -= 1
 
     def wrapper_done(self, task: asyncio.Future[Any]) -> None:
-        """Read the wrapper's outcome; never spend the call's permit."""
+        """Read the wrapper's outcome; never spend the call's permit.
+
+        Runs exactly once for a step that was let go: as the wrapper's
+        completion callback when it had still to resolve, and directly
+        from :meth:`_CleanupBudget.abandon` when it already had.
+        """
         _harvest(task)
         self.disown()
 
@@ -530,6 +535,12 @@ class _CleanupBudget:
         so its outcome is read.  There is no cancellation of a thread
         step here at all: not a flag left ``False``, but no such path.
 
+        The wrapper's outcome is read on both paths out of that watch —
+        immediately when it has already resolved, and from a single
+        completion callback when it has not — so nothing this method
+        lets go of can end up read by nobody, whoever resolved the
+        wrapper and in whichever turn.
+
         Returns:
             ``True`` when the step's work was parked, and is now holding
             the permit this step drew until it really ends; ``False`` when
@@ -545,6 +556,20 @@ class _CleanupBudget:
                 # has already ended, so its outcome is read exactly once
                 # and no deliberate abandonment is reported as a leak.
                 task.add_done_callback(work.wrapper_done)
+            else:
+                # And a wrapper that has *already* resolved is read here,
+                # on the spot.  This is not the same state as the one
+                # above and is not reachable from the timeout, which by
+                # definition arrives with the wrapper unresolved; it is
+                # reachable when this exchange is cancelled from outside
+                # in the turn between the wrapper completing and the wait
+                # on it resuming, since the wait never consumes an
+                # outcome itself.  Deferring the read to a callback would
+                # leave it owed to a later turn that a cancelled — or
+                # closing — exchange cannot promise, so the same outcome
+                # is taken now, and by the same hand, so it is still
+                # taken exactly once.
+                work.wrapper_done(task)
             return parked
         if task.done():
             _harvest(task)
