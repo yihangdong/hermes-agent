@@ -464,8 +464,10 @@ class _CleanupBudget:
     problem afterwards.  A permit is drawn for each step that could still
     be running when its bound expires and handed straight back when that
     step finishes in time, so the ordinary path spends nothing; a permit
-    behind a step that had to be let go stays charged until :func:`_harvest`
-    sees that step actually end.
+    behind a step that had to be let go stays charged until that step's own
+    end is observed — :func:`_harvest` on the task for a coroutine step,
+    and :meth:`_ThreadWork._finish`, reported from the worker itself, for a
+    call running in a thread.
 
     The permit is taken *before* the step's task exists.  That ordering is
     what makes the ceiling mechanical rather than argued: no task that
@@ -625,9 +627,11 @@ class _Deadline:
         ``wait_for`` itself pending and carries the exchange, and the
         in-flight slot it holds, past the declared budget.
         :func:`asyncio.wait` returns at its timeout whatever the task does
-        next, so this bound holds without the peer's cooperation; the
-        task that overran is then cancelled and abandoned by
-        :meth:`_CleanupBudget.abandon` rather than waited for.
+        next, so this bound holds without the peer's cooperation; the step
+        that overran is then let go by :meth:`_CleanupBudget.abandon`
+        rather than waited for — cancelled first if it is a coroutine,
+        which cancellation can genuinely end, and not cancelled at all if
+        it is a thread, which it cannot.
 
         The task is created only once a cleanup permit is in hand, so a
         step that may have to be let go is already accounted for against
