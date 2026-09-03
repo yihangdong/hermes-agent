@@ -74,6 +74,7 @@ import os
 import socket as socket_module
 import stat
 import struct
+import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -154,6 +155,23 @@ REPLAY_TTL_SECONDS = 900.0
 REPLAY_CAPACITY = 256
 MAX_INFLIGHT_REQUESTS = 4
 
+#: The most detached cleanup steps one exchange can ever leave behind: the
+#: step that spent the budget, and the teardown that follows it.  The first
+#: abandonment ends the exchange, so nothing after those two can straggle.
+_CLEANUP_PERMITS_PER_EXCHANGE = 2
+
+#: Hard process-global ceiling on live detached cleanup work.  An abandoned
+#: step is bounded in what it may do but not in when it ends — an awaitable
+#: that never acknowledges cancellation ends when it pleases — so the
+#: *population* of them needs a bound of its own, and the four in-flight
+#: slots cannot be it: a slot is released as soon as the Owner is answered,
+#: while the task it left behind is still alive.  Every exchange therefore
+#: reserves its whole worst case against this ceiling before it opens a
+#: socket or starts a worker thread.  Four admitted exchanges reserve
+#: exactly this many, so the reservation refuses nothing until stragglers
+#: genuinely accumulate.
+MAX_DETACHED_CLEANUP_TASKS = _CLEANUP_PERMITS_PER_EXCHANGE * MAX_INFLIGHT_REQUESTS
+
 REPLY_PREFIX = "[Stage-A]"
 
 #: ``SOL_LOCAL`` / ``XUCRED_VERSION`` from the BSD socket ABI.  Python
@@ -167,6 +185,9 @@ _REFUSAL_TEXT: Dict[str, str] = {
     "request_too_large": f"the request exceeded {MAX_REQUEST_TEXT_BYTES} bytes",
     "duplicate_request": "this request was already received",
     "too_many_inflight": "too many Stage-A requests are already in flight",
+    "cleanup_capacity_exhausted": (
+        "earlier Stage-A steps have not finished releasing; no new request was started"
+    ),
     "platform_unsupported": "the local bridge is unavailable on this platform",
     "socket_unavailable": "the Stage-A controller socket is unavailable",
     "socket_not_a_socket": "the configured bridge path is not a socket",
@@ -234,25 +255,71 @@ def _exchange_budget() -> float:
 #: makes that harvest deterministic instead of leaving it to the collector,
 #: and :func:`_harvest` is what empties it.
 #:
-#: Its size is bounded by construction rather than by policy.  A straggler
-#: is only ever created from inside an in-flight exchange, and a single
-#: exchange can leave at most two behind — the step that spent the budget,
-#: and the teardown that follows it — so at most twice
-#: :data:`MAX_INFLIGHT_REQUESTS` can exist at any moment, and none of them
-#: holds an in-flight slot.
+#: Its size is bounded by a reservation, not by an argument.  The in-flight
+#: slots cannot bound it: a slot is released the moment the Owner is
+#: answered, while the step that overran is still alive, so a later request
+#: takes the freed slot and strands another straggler — sequentially,
+#: without limit.  What is bounded is this set itself.  Every entry holds a
+#: permit charged against :data:`MAX_DETACHED_CLEANUP_TASKS` *before* the
+#: exchange that created it was allowed to begin, and that permit comes
+#: back only when the task really ends, so
+#: ``len(_stragglers) <= _cleanup_charged <= MAX_DETACHED_CLEANUP_TASKS``
+#: holds at every instant, under any interleaving.
 _stragglers: set[asyncio.Future[Any]] = set()
+
+#: Permits currently committed: those an exchange has reserved and not yet
+#: spent, plus the one each entry in :data:`_stragglers` is holding.
+_cleanup_charged = 0
+
+#: The ledger above is process-global, so it is serialized by a plain lock
+#: rather than by one event loop.  A gateway running two loops in two
+#: threads would otherwise share the set and the counter without sharing
+#: what makes them a bound.  The lock is never held across an await and
+#: never re-entered, so it can neither block the loop nor deadlock.
+_cleanup_lock = threading.Lock()
+
+
+def _charge_cleanup(permits: int) -> bool:
+    """Reserve ``permits`` against the ceiling, or refuse and reserve none."""
+    global _cleanup_charged
+    with _cleanup_lock:
+        if _cleanup_charged + permits > MAX_DETACHED_CLEANUP_TASKS:
+            return False
+        _cleanup_charged += permits
+        return True
+
+
+def _refund_cleanup(permits: int) -> None:
+    """Give back permits an exchange reserved and never spent."""
+    global _cleanup_charged
+    if permits <= 0:
+        return
+    with _cleanup_lock:
+        _cleanup_charged -= permits
 
 
 def _harvest(task: asyncio.Future[Any]) -> None:
-    """Observe an abandoned step's outcome and forget it.
+    """Observe an abandoned step's outcome, forget it, and return its permit.
 
-    Reading the exception is the whole point: a task nobody reads is
+    Reading the exception is half the point: a task nobody reads is
     reported by the loop as an unhandled error, which would dress a
     deliberate, bounded abandonment up as a leak.  The outcome itself is
     discarded — the exchange that started this step already answered the
     Owner without it, and a straggler decides nothing.
+
+    Returning the permit is the other half, and it is what makes the
+    ceiling a bound on *live* work rather than a lifetime quota: capacity
+    comes back exactly when the step really ends, so a stall that is
+    eventually released cannot leave the bridge permanently saturated.
+    The permit is returned only for a task this ledger was actually
+    holding, so a harvest that runs twice cannot conjure capacity.
     """
-    _stragglers.discard(task)
+    global _cleanup_charged
+    with _cleanup_lock:
+        held = task in _stragglers
+        _stragglers.discard(task)
+        if held:
+            _cleanup_charged -= 1
     if task.cancelled():
         return
     exc = task.exception()
@@ -260,23 +327,85 @@ def _harvest(task: asyncio.Future[Any]) -> None:
         logger.debug("[stagea] abandoned step ended with %s", type(exc).__name__)
 
 
-def _detach(task: asyncio.Future[Any]) -> None:
-    """Ask a step that lost its budget to stop, and stop waiting for it.
+class _CleanupBudget:
+    """One exchange's reservation against the process-global cleanup ceiling.
 
-    Cancellation is a request, not a guarantee: an awaitable may catch
-    ``CancelledError`` and carry on, and a worker thread cannot be
-    interrupted at all.  Waiting for the acknowledgement would hand this
-    exchange's deadline to the party the deadline exists to bound.  So the
-    request is made and the task is let go — held only for harvesting,
-    never awaited, never consulted, holding no in-flight slot, starting no
-    new work and issuing no retry.
+    Reserved in full before the exchange starts, so a bridge whose earlier
+    steps have not finished letting go refuses the next request *before* it
+    opens a socket or starts a worker thread, rather than discovering the
+    problem afterwards.  A permit is drawn for each step that could still
+    be running when its bound expires and handed straight back when that
+    step finishes in time, so the ordinary path spends nothing; a permit
+    behind a step that had to be let go stays charged until :func:`_harvest`
+    sees that step actually end.
+
+    The permit is taken *before* the step's task exists.  That ordering is
+    what makes the ceiling mechanical rather than argued: no task that
+    could straggle is ever created without a permit already holding its
+    place, so the live population cannot be oversubscribed by any
+    interleaving of concurrent or sequential exchanges.
+
+    A budget belongs to one exchange and is only ever touched by that
+    exchange's own coroutine, so its permits need no lock; what is shared
+    — the straggler set and the committed counter — is exactly what
+    :data:`_cleanup_lock` covers.
     """
-    if task.done():
-        _harvest(task)
-        return
-    task.cancel()
-    _stragglers.add(task)
-    task.add_done_callback(_harvest)
+
+    __slots__ = ("_permits",)
+
+    def __init__(self, permits: int) -> None:
+        self._permits = permits
+
+    @classmethod
+    def reserve(cls) -> Optional["_CleanupBudget"]:
+        """One exchange's worst case, or ``None`` when the ceiling is reached."""
+        if not _charge_cleanup(_CLEANUP_PERMITS_PER_EXCHANGE):
+            return None
+        return cls(_CLEANUP_PERMITS_PER_EXCHANGE)
+
+    def take(self) -> bool:
+        """Claim the permit that must back one abandonable step."""
+        if self._permits <= 0:
+            return False
+        self._permits -= 1
+        return True
+
+    def give_back(self) -> None:
+        """Return the permit of a step that ended inside its bound."""
+        self._permits += 1
+
+    def abandon(self, task: asyncio.Future[Any]) -> bool:
+        """Ask a step that lost its budget to stop, and stop waiting for it.
+
+        Cancellation is a request, not a guarantee: an awaitable may catch
+        ``CancelledError`` and carry on, and a worker thread cannot be
+        interrupted at all.  Waiting for the acknowledgement would hand
+        this exchange's deadline to the party the deadline exists to
+        bound.  So the request is made and the task is let go — held only
+        for harvesting, never awaited, never consulted, holding no
+        in-flight slot, starting no new work and issuing no retry.
+
+        Returns:
+            ``True`` when the task was parked, and is now holding the
+            permit this step drew until it really ends; ``False`` when it
+            had already finished, so no hold is needed and the caller
+            returns the permit instead.  Saying which happened here, rather
+            than crediting a permit unconditionally, is what keeps the
+            ledger exact: a permit is returned only by whoever drew it.
+        """
+        if task.done():
+            _harvest(task)
+            return False
+        task.cancel()
+        with _cleanup_lock:
+            _stragglers.add(task)
+        task.add_done_callback(_harvest)
+        return True
+
+    def close(self) -> None:
+        """Release what this exchange reserved and never spent."""
+        permits, self._permits = self._permits, 0
+        _refund_cleanup(permits)
 
 
 class _Deadline:
@@ -289,13 +418,24 @@ class _Deadline:
     acknowledging cancellation; see :meth:`bounded`.
     """
 
-    __slots__ = ("_expiry",)
+    __slots__ = ("_expiry", "_cleanup")
 
-    def __init__(self, budget: float) -> None:
+    def __init__(self, budget: float, cleanup: _CleanupBudget) -> None:
         self._expiry = time.monotonic() + budget
+        self._cleanup = cleanup
 
     def remaining(self) -> float:
         return self._expiry - time.monotonic()
+
+    def _release(self, task: asyncio.Future[Any]) -> None:
+        """End a step that lost its bound, keeping the permit exact.
+
+        Every permit is drawn in :meth:`bounded` and returned either here
+        or on the success path, so a permit can be neither leaked by a
+        step that overran nor conjured by one that had already finished.
+        """
+        if not self._cleanup.abandon(task):
+            self._cleanup.give_back()
 
     async def bounded(self, awaitable: Any, cap: float) -> Any:
         """Await under the smaller of this step's cap and what is left.
@@ -316,10 +456,17 @@ class _Deadline:
         :func:`asyncio.wait` returns at its timeout whatever the task does
         next, so this bound holds without the peer's cooperation; the
         task that overran is then cancelled and abandoned by
-        :func:`_detach` rather than waited for.
+        :meth:`_CleanupBudget.abandon` rather than waited for.
+
+        The task is created only once a cleanup permit is in hand, so a
+        step that may have to be let go is already accounted for against
+        :data:`MAX_DETACHED_CLEANUP_TASKS` before it can start.  The
+        exchange reserved its whole worst case, so this cannot refuse a
+        legal step; were that ever untrue, refusing is the fail-closed
+        answer and starting unaccounted work is not.
         """
         timeout = min(cap, self.remaining())
-        if timeout <= 0:
+        if timeout <= 0 or not self._cleanup.take():
             close = getattr(awaitable, "close", None)
             if callable(close):
                 close()
@@ -331,11 +478,12 @@ class _Deadline:
             # Includes this exchange being cancelled from outside: a step
             # must never outlive the caller that started it, and the same
             # abandonment is what keeps that teardown non-blocking too.
-            _detach(task)
+            self._release(task)
             raise
         if not done:
-            _detach(task)
+            self._release(task)
             raise asyncio.TimeoutError
+        self._cleanup.give_back()
         return task.result()
 
 
@@ -985,9 +1133,25 @@ class StageAOwnerBridge:
             logger.warning("[stagea] refusing request: %d already in flight", self._inflight)
             return refusal_text("too_many_inflight")
 
+        # An exchange may leave cleanup work that outlives it, so the room
+        # for that work is taken here — before a socket is opened, a worker
+        # thread is started or a task exists — and given back below.  A
+        # bridge still holding earlier steps that will not let go refuses
+        # the Owner in the same fixed shape as any other closed door, and
+        # creates nothing.
+        cleanup = _CleanupBudget.reserve()
+        if cleanup is None:
+            logger.warning(
+                "[stagea] refusing request: detached cleanup capacity is exhausted (%d held)",
+                _cleanup_charged,
+            )
+            return refusal_text("cleanup_capacity_exhausted")
+
         self._inflight += 1
         try:
-            outcome, reply = await self._exchange(config, request_id, ref, decision.request_text)
+            outcome, reply = await self._exchange(
+                config, request_id, ref, decision.request_text, cleanup
+            )
         except BridgeError as exc:
             logger.warning("[stagea] request %s failed closed: %s", request_id, exc.code)
             return refusal_text(exc.code)
@@ -998,6 +1162,7 @@ class StageAOwnerBridge:
             return refusal_text("socket_unavailable")
         finally:
             self._inflight -= 1
+            cleanup.close()
 
         logger.info("[stagea] request %s answered: %s", request_id, outcome)
         return outcome_text(outcome, reply)
@@ -1010,6 +1175,7 @@ class StageAOwnerBridge:
         request_id: str,
         ref: str,
         request_text: str,
+        cleanup: _CleanupBudget,
     ) -> Tuple[str, str]:
         """One connection: send the request, read one reply, close.
 
@@ -1019,12 +1185,17 @@ class StageAOwnerBridge:
         misbehaves.  An await that is merely slow becomes a refusal the
         Owner is told about; an await that never returns would hold the
         slot and suppress that refusal, so none is left unbounded.
+
+        ``cleanup`` is the room already reserved for whatever this exchange
+        has to let go of.  Every abandonable step below draws from it, so
+        the steps this exchange strands are bounded by what it was admitted
+        with rather than by how many exchanges have run before it.
         """
         open_unix_connection = getattr(asyncio, "open_unix_connection", None)
         if open_unix_connection is None:
             raise BridgeError("platform_unsupported")
 
-        deadline = _Deadline(_exchange_budget())
+        deadline = _Deadline(_exchange_budget(), cleanup)
         step = _local_step_deadline()
 
         # A stat is a local call, but local is not the same as bounded: a

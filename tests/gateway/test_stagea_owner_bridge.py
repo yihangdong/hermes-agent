@@ -93,6 +93,23 @@ def _socket_layer(open_connection, *, peer_uid=CONTROLLER_UID, stat_fn=None):
                 yield
 
 
+@contextlib.contextmanager
+def _reserved_cleanup():
+    """One exchange's cleanup reservation, taken and released as ``process`` does.
+
+    :class:`bridge._Deadline` is handed the reservation its exchange was
+    admitted with, so a test that drives one directly has to hold a real
+    one.  Borrowing the module's own ledger rather than a stand-in keeps
+    these tests measuring the ceiling that ships.
+    """
+    budget = bridge._CleanupBudget.reserve()
+    assert budget is not None, "the cleanup ceiling was already exhausted"
+    try:
+        yield budget
+    finally:
+        budget.close()
+
+
 def _classify(owner=OWNER, **kwargs):
     """``classify`` with the ordinary Owner Stage-A shape as the default."""
     params: Dict[str, Any] = {
@@ -1699,9 +1716,14 @@ class TestExchangeDeadlines:
         writer = Mock()
         writer.close = Mock()
         writer.wait_closed = AsyncMock()
-        spent = bridge._Deadline(-1.0)
+        with _reserved_cleanup() as cleanup:
+            spent = bridge._Deadline(-1.0, cleanup)
 
-        await bridge._close_writer(writer, spent)
+            await bridge._close_writer(writer, spent)
+
+            # Declining to await costs no cleanup permit either: a step
+            # that never started cannot straggle.
+            assert cleanup._permits == bridge._CLEANUP_PERMITS_PER_EXCHANGE
 
         writer.close.assert_called_once_with()
         writer.wait_closed.assert_not_awaited()
@@ -2100,15 +2122,17 @@ class TestCancellationUncooperativeAwaitables:
                 raise OSError("the abandoned step failed after it was let go")
 
         before = set(bridge._stragglers)
-        deadline = bridge._Deadline(0.02)
 
         with self._no_unobserved_tasks():
-            with pytest.raises(asyncio.TimeoutError):
-                await deadline.bounded(stall_then_fail(), cap=0.02)
+            with _reserved_cleanup() as cleanup:
+                deadline = bridge._Deadline(0.02, cleanup)
 
-            assert len(set(bridge._stragglers) - before) == 1
-            state.release.set()
-            assert await self._drain_stragglers(before) == set()
+                with pytest.raises(asyncio.TimeoutError):
+                    await deadline.bounded(stall_then_fail(), cap=0.02)
+
+                assert len(set(bridge._stragglers) - before) == 1
+                state.release.set()
+                assert await self._drain_stragglers(before) == set()
 
     @pytest.mark.asyncio
     async def test_the_number_of_abandoned_steps_is_bounded(self):
@@ -2143,18 +2167,522 @@ class TestCancellationUncooperativeAwaitables:
 
         A step that completes inside its bound is returned rather than
         detached, and a step that finished just as the bound arrived is
-        read rather than parked — either way the set is where it started.
+        read rather than parked — either way the set is where it started,
+        and so is the reservation that step drew on.
         """
         before = set(bridge._stragglers)
-        deadline = bridge._Deadline(1.0)
 
         async def prompt():
             return "answered"
 
-        assert await deadline.bounded(prompt(), cap=1.0) == "answered"
-        assert set(bridge._stragglers) == before
+        with _reserved_cleanup() as cleanup:
+            deadline = bridge._Deadline(1.0, cleanup)
 
-        finished = asyncio.ensure_future(prompt())
-        await finished
-        bridge._detach(finished)
-        assert set(bridge._stragglers) == before
+            assert await deadline.bounded(prompt(), cap=1.0) == "answered"
+            assert set(bridge._stragglers) == before
+
+            finished = asyncio.ensure_future(prompt())
+            await finished
+            cleanup.abandon(finished)
+            assert set(bridge._stragglers) == before
+
+            # Nothing was spent, so an exchange of ordinary steps leaves
+            # the ceiling exactly where it found it.
+            assert cleanup._permits == bridge._CLEANUP_PERMITS_PER_EXCHANGE
+
+
+#: The adversarial doubles above are exactly what the section below needs.
+#: An alias borrows them; inheriting would re-run that whole class under a
+#: second name.
+_Uncooperative = TestCancellationUncooperativeAwaitables
+
+
+class TestGlobalDetachedCleanupBudget:
+    """The *population* of abandoned steps is bounded, not merely each exchange.
+
+    Tier-1 rereview-4A's finding.  Correction 4 stopped an uncooperative
+    step from holding one of the four in-flight slots — but ``process``
+    releases that slot the moment it answers the Owner, while the step it
+    let go is still alive.  So the slots stopped bounding anything the
+    instant the exchange ended: the next request took the freed slot and
+    stranded another straggler, sequentially, without limit.  Twelve
+    sequential requests left twelve live tasks against a source-claimed cap
+    of eight.
+
+    What these falsify is the population itself.  None of them reads the
+    source to decide: each one drives real requests through real
+    ``process`` calls and counts what the bridge actually created.
+    """
+
+    #: How many sequential requests the ceiling has to survive.  The
+    #: rereviewer used twelve; three times the ceiling is a stronger stress
+    #: and still finishes in well under a second at these deadlines.
+    SEQUENTIAL = 12
+
+    #: A hard stop on the fill loops, so a ceiling that never engages fails
+    #: an assertion instead of running forever.
+    FILL_LIMIT = 64
+
+    @staticmethod
+    async def _quiesced(*, deadline=2.0):
+        """Wait for the process-global ledger to be empty, and prove it is.
+
+        Saturation is an absolute condition, not a delta, so these tests
+        need an absolute starting point.  A predecessor that left work
+        behind surfaces here rather than silently redefining what
+        saturation means.
+        """
+        stop = time.monotonic() + deadline
+        while (bridge._stragglers or bridge._cleanup_charged) and time.monotonic() < stop:
+            await asyncio.sleep(0.01)
+        assert not bridge._stragglers, f"stragglers left over: {len(bridge._stragglers)}"
+        assert bridge._cleanup_charged == 0, f"permits left over: {bridge._cleanup_charged}"
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _counted_threads(counter):
+        """Count worker-thread hand-offs, delegating to the real one.
+
+        "Creates no new work" has to include the background kind: the
+        preflight stat and the post-connect re-stat are the only two, and
+        a refused request must make neither.
+        """
+        real = asyncio.to_thread
+
+        def counting(func, /, *args, **kwargs):
+            counter["threads"] += 1
+            return real(func, *args, **kwargs)
+
+        with patch.object(asyncio, "to_thread", counting):
+            yield
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _ledger_samples(samples):
+        """Record the ledger at every reservation, granted or refused.
+
+        An end-state assertion cannot see a cap that was briefly exceeded
+        and then recovered.  Sampling at the only place capacity is ever
+        committed can.
+        """
+        real = bridge._charge_cleanup
+
+        def sampling(permits):
+            granted = real(permits)
+            samples.append((granted, bridge._cleanup_charged, len(bridge._stragglers)))
+            return granted
+
+        with patch.object(bridge, "_charge_cleanup", sampling):
+            yield
+
+    @staticmethod
+    def _spent(calls, threads):
+        return (calls["connects"], calls["writes"], threads["threads"])
+
+    async def _sequential(self, stall_attr, accepted_fragment):
+        """Drive ``SEQUENTIAL`` distinct requests past an unreleasable stall.
+
+        Returns the tally so each caller can state its own claim about it.
+        Every per-request invariant that must hold *during* the run is
+        asserted here, while the run is still going — an end-state check
+        could not see a ceiling that was passed and then recovered.
+        """
+        instance = _Uncooperative._bridge()
+        connection, state, calls = _Uncooperative._connection(stall_attr)
+        threads = {"threads": 0}
+        admitted, refused, peak = 0, 0, 0
+
+        try:
+            with self._counted_threads(threads):
+                with _socket_layer(connection):
+                    with _Uncooperative._declared_deadlines():
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                        for n in range(self.SEQUENTIAL):
+                            before = self._spent(calls, threads)
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"seq-{n}"),
+                                bound=bound,
+                            )
+                            spent = tuple(
+                                now - was
+                                for now, was in zip(self._spent(calls, threads), before)
+                            )
+
+                            if "cleanup_capacity_exhausted" in reply:
+                                refused += 1
+                                assert reply == bridge.refusal_text("cleanup_capacity_exhausted")
+                                assert spent == (0, 0, 0), f"a refused request created {spent}"
+                            else:
+                                admitted += 1
+                                assert accepted_fragment in reply
+                                # One connect, one write, and the two
+                                # preflight stats: no retry, no second
+                                # socket request, no extra background work.
+                                assert spent == (1, 1, 2), f"an admitted request created {spent}"
+
+                            assert instance._inflight == 0, "the visible slot was not returned"
+                            peak = max(peak, len(bridge._stragglers))
+                            assert len(bridge._stragglers) <= bridge.MAX_DETACHED_CLEANUP_TASKS
+                            assert bridge._cleanup_charged <= bridge.MAX_DETACHED_CLEANUP_TASKS
+
+                        assert not state.release.is_set(), "the stall was released"
+        finally:
+            await _Uncooperative._settle(state, expected=admitted)
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await self._quiesced()
+
+        return admitted, refused, peak
+
+    # -- the population bound, proved without releasing the stall --
+
+    @pytest.mark.asyncio
+    async def test_sequential_requests_cannot_accumulate_past_twice_the_slots(self):
+        """The claim, stated in the terms the defect was found in.
+
+        Deliberately written with nothing the correction introduced: the
+        straggler set, the admitted in-flight cap and what the bridge put
+        on the socket all existed before this ceiling did.  So this fails
+        on *observed behaviour* rather than on a missing attribute — run
+        against the source it corrects, it reports twelve live detached
+        steps after twelve sequential requests, against a bound of eight.
+
+        Nothing is released before the assertion, and no request repeats a
+        message id, so nothing here is absorbed by dedupe or by the
+        in-flight cap.
+        """
+        instance = _Uncooperative._bridge()
+        connection, state, calls = _Uncooperative._connection("drain")
+        claimed = 2 * bridge.MAX_INFLIGHT_REQUESTS
+        before = set(bridge._stragglers)
+        peak = 0
+
+        try:
+            with _socket_layer(connection):
+                with _Uncooperative._declared_deadlines():
+                    bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                    for n in range(self.SEQUENTIAL):
+                        reply, _elapsed = await _Uncooperative._finished_within(
+                            _Uncooperative._request(instance, message_id=f"acc-{n}"),
+                            bound=bound,
+                        )
+
+                        assert reply.startswith(bridge.REPLY_PREFIX), "the Owner was not answered"
+                        assert instance._inflight == 0, "the visible slot was not returned"
+
+                        peak = max(peak, len(set(bridge._stragglers) - before))
+                        assert peak <= claimed, (
+                            f"{peak} live detached steps after {n + 1} sequential requests, "
+                            f"against a bound of {claimed}"
+                        )
+
+                    assert not state.release.is_set(), "the stall was released"
+                    # One socket and one frame for each request the bridge
+                    # admitted, and nothing at all for one it refused: no
+                    # retry, no second request, no replacement work.
+                    assert calls["connects"] == calls["writes"]
+                    assert 0 < calls["connects"] <= self.SEQUENTIAL
+        finally:
+            # Assertion-free: this runs on the failure path too, and the
+            # harvest claim belongs to the tests below that own it.
+            await _Uncooperative._settle(state, expected=calls["connects"])
+            await _Uncooperative._drain_stragglers(before)
+
+    @pytest.mark.asyncio
+    async def test_twelve_sequential_uncooperative_drains_stay_under_the_ceiling(self):
+        """The rereviewer's probe, as an assertion.
+
+        Twelve distinct requests, each with a ``drain()`` that absorbs
+        cancellation until this test releases it — and nothing is released
+        before the assertions.  Every request still answers the Owner and
+        gives its visible slot back; what changes is that the tasks left
+        behind stop accumulating.
+        """
+        admitted, refused, peak = await self._sequential("drain", "send_failed")
+
+        assert admitted + refused == self.SEQUENTIAL
+        assert peak <= bridge.MAX_DETACHED_CLEANUP_TASKS
+        assert refused, "twelve sequential stalls never met the ceiling"
+        # The ceiling engages one exchange's reservation early, which is
+        # the fail-closed direction: capacity is refused before it is
+        # overspent, never after.
+        assert admitted == (
+            bridge.MAX_DETACHED_CLEANUP_TASKS - bridge._CLEANUP_PERMITS_PER_EXCHANGE + 1
+        )
+        assert peak == admitted
+
+    @pytest.mark.asyncio
+    async def test_twelve_sequential_uncooperative_closes_stay_under_the_ceiling(self):
+        """The same population bound where the stall is teardown instead.
+
+        An uncooperative ``wait_closed()`` strands its step *after* the
+        reply was read and validated, so these exchanges each hand the
+        Owner an accepted terminal and still leave a task behind.  The
+        ceiling has to hold on the success path too.
+        """
+        admitted, refused, peak = await self._sequential("wait_closed", "ACCEPTED_TERMINAL")
+
+        assert admitted + refused == self.SEQUENTIAL
+        assert peak <= bridge.MAX_DETACHED_CLEANUP_TASKS
+        assert refused, "twelve sequential stalls never met the ceiling"
+        assert peak == admitted
+
+    # -- what a saturated bridge does, and does not do --
+
+    async def _saturate(self, instance, connection, threads, *, state):
+        """Fill the ceiling with unreleasable stragglers.  Returns the tally."""
+        admitted = 0
+        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+        for n in range(self.FILL_LIMIT):
+            reply, _elapsed = await _Uncooperative._finished_within(
+                _Uncooperative._request(instance, message_id=f"fill-{n}"), bound=bound
+            )
+            if "cleanup_capacity_exhausted" in reply:
+                assert not state.release.is_set(), "the stall was released"
+                return admitted
+            assert "send_failed" in reply
+            admitted += 1
+        raise AssertionError(f"the ceiling never engaged in {self.FILL_LIMIT} requests")
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_bridge_starts_no_new_work_whatsoever(self):
+        """Refusing has to happen before anything is created, not after.
+
+        Once the ceiling is reached, further admitted Owner requests must
+        produce the fixed refusal without opening a socket, writing a
+        frame, handing anything to a worker thread, or adding one more
+        entry to the set that is being bounded.
+        """
+        await self._quiesced()
+        instance = _Uncooperative._bridge()
+        connection, state, calls = _Uncooperative._connection("drain")
+        threads = {"threads": 0}
+        admitted = 0
+
+        try:
+            with self._counted_threads(threads):
+                with _socket_layer(connection):
+                    with _Uncooperative._declared_deadlines():
+                        admitted = await self._saturate(
+                            instance, connection, threads, state=state
+                        )
+                        saturated = self._spent(calls, threads)
+                        parked = set(bridge._stragglers)
+                        charged = bridge._cleanup_charged
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+
+                        for extra in range(5):
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"after-{extra}"),
+                                bound=bound,
+                            )
+
+                            assert reply == bridge.refusal_text("cleanup_capacity_exhausted")
+                            assert self._spent(calls, threads) == saturated
+                            assert set(bridge._stragglers) == parked
+                            assert bridge._cleanup_charged == charged
+                            assert instance._inflight == 0
+
+                        assert not state.release.is_set(), "the stall was released"
+                        assert len(parked) <= bridge.MAX_DETACHED_CLEANUP_TASKS
+                        assert saturated == (admitted, admitted, 2 * admitted)
+        finally:
+            await _Uncooperative._settle(state, expected=admitted)
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await self._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_capacity_comes_back_only_when_the_abandoned_steps_end(self):
+        """Saturation is not permanent, and it does not lift early.
+
+        Nothing but the stalls actually finishing gives capacity back: the
+        permits return as the tasks end and are harvested, the ledger goes
+        back to empty, and the request that was refused a moment ago now
+        completes normally through a healthy peer.  Neither the loop nor
+        the interpreter may report an unobserved task along the way.
+        """
+        await self._quiesced()
+        instance = _Uncooperative._bridge()
+        connection, state, _calls = _Uncooperative._connection("drain")
+        threads = {"threads": 0}
+
+        with _Uncooperative._no_unobserved_tasks():
+            with self._counted_threads(threads):
+                with _socket_layer(connection):
+                    with _Uncooperative._declared_deadlines():
+                        admitted = await self._saturate(
+                            instance, connection, threads, state=state
+                        )
+
+            assert admitted >= 1
+            assert len(bridge._stragglers) == admitted
+            assert bridge._cleanup_charged == admitted
+
+            # The only thing that lifts it: the abandoned steps ending.
+            await _Uncooperative._settle(state, expected=admitted)
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await self._quiesced()
+
+            # And the bridge is ordinary again — a real exchange, start to
+            # finish, through a peer that behaves.
+            healthy, captured = TestExchange._connection()
+            with _socket_layer(healthy):
+                reply = await _Uncooperative._request(instance, message_id="after-the-harvest")
+
+            assert reply == "[Stage-A] ACCEPTED_TERMINAL\ndone"
+            assert len(captured) == 1
+            assert instance._inflight == 0
+            await self._quiesced()
+
+    # -- the race --
+
+    @pytest.mark.asyncio
+    async def test_a_concurrent_burst_cannot_oversubscribe_the_ceiling(self):
+        """Interleaving cannot beat a reservation taken before the work.
+
+        Part of the ceiling is already held by earlier stragglers, then a
+        full burst of concurrent requests races for what is left.  However
+        the loop orders them, the ledger may never show more committed than
+        the ceiling allows, and whichever requests lose the race must lose
+        it closed — with nothing created.
+        """
+        await self._quiesced()
+        instance = _Uncooperative._bridge()
+        connection, state, calls = _Uncooperative._connection("drain")
+        threads = {"threads": 0}
+        samples = []
+        stranded = 3
+        admitted = 0
+
+        try:
+            with self._ledger_samples(samples):
+                with self._counted_threads(threads):
+                    with _socket_layer(connection):
+                        with _Uncooperative._declared_deadlines():
+                            bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                            for n in range(stranded):
+                                reply, _elapsed = await _Uncooperative._finished_within(
+                                    _Uncooperative._request(instance, message_id=f"pre-{n}"),
+                                    bound=bound,
+                                )
+                                assert "send_failed" in reply
+                            assert len(bridge._stragglers) == stranded
+
+                            before = self._spent(calls, threads)
+                            burst, _elapsed = await _Uncooperative._finished_within(
+                                asyncio.gather(
+                                    *(
+                                        _Uncooperative._request(instance, message_id=f"race-{n}")
+                                        for n in range(bridge.MAX_INFLIGHT_REQUESTS)
+                                    )
+                                ),
+                                bound=bound,
+                            )
+
+            assert not state.release.is_set(), "the stall was released"
+
+            refused = [r for r in burst if "cleanup_capacity_exhausted" in r]
+            accepted = [r for r in burst if "send_failed" in r]
+            admitted = stranded + len(accepted)
+
+            assert len(accepted) + len(refused) == bridge.MAX_INFLIGHT_REQUESTS
+            assert refused, "the burst never met the ceiling"
+            assert all(r == bridge.refusal_text("cleanup_capacity_exhausted") for r in refused)
+
+            # The racers that lost created nothing at all.
+            spent = tuple(now - was for now, was in zip(self._spent(calls, threads), before))
+            assert spent == (len(accepted), len(accepted), 2 * len(accepted))
+
+            # No reservation ever committed past the ceiling, at the only
+            # point where capacity is committed.
+            over = [s for s in samples if s[1] > bridge.MAX_DETACHED_CLEANUP_TASKS]
+            assert over == [], f"the ceiling was oversubscribed: {over}"
+            assert [s for s in samples if s[0]] , "no reservation was granted at all"
+            assert len(bridge._stragglers) <= bridge.MAX_DETACHED_CLEANUP_TASKS
+            assert instance._inflight == 0
+        finally:
+            await _Uncooperative._settle(state, expected=admitted)
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await self._quiesced()
+
+    # -- the ordinary path is untouched --
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_bridge_still_routes_everybody_else_normally(self):
+        """Backpressure is Stage-A's alone; it cannot reach ordinary traffic.
+
+        The ceiling is consulted only after a message has already been
+        classified as an exact Owner Stage-A request, so a saturated bridge
+        must still be invisible to everything else: a non-Owner, a group
+        message and the Owner's ordinary text all keep falling through to
+        the caller's own routing, exactly as with no bridge at all.
+        """
+        await self._quiesced()
+        instance = _Uncooperative._bridge()
+        connection, state, calls = _Uncooperative._connection("drain")
+        threads = {"threads": 0}
+        admitted = 0
+
+        try:
+            with self._counted_threads(threads):
+                with _socket_layer(connection):
+                    with _Uncooperative._declared_deadlines():
+                        admitted = await self._saturate(
+                            instance, connection, threads, state=state
+                        )
+                        saturated = self._spent(calls, threads)
+
+                        passthrough = [
+                            {"chat_type": "dm", "sender_id": OTHER, "text": "/stagea go"},
+                            {"chat_type": "group", "sender_id": OWNER, "text": "/stagea go"},
+                            {"chat_type": "dm", "sender_id": OWNER, "text": "ordinary text"},
+                        ]
+                        for n, shape in enumerate(passthrough):
+                            assert (
+                                await instance.process(
+                                    has_media=False,
+                                    conversation_key="weixin|acct|chat-1|owner-user-id",
+                                    message_id=f"ordinary-{n}",
+                                    **shape,
+                                )
+                                is None
+                            ), f"a saturated bridge consumed {shape}"
+
+                        assert self._spent(calls, threads) == saturated
+                        assert not state.release.is_set(), "the stall was released"
+        finally:
+            await _Uncooperative._settle(state, expected=admitted)
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await self._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_the_ceiling_never_engages_when_nothing_straggles(self):
+        """The reservation is inert on the path that behaves.
+
+        Four concurrent exchanges is the whole admitted concurrency, and
+        four reservations is the whole ceiling, so a bridge with no
+        stragglers can still run every slot it has.  Repeated bursts must
+        not drift the ledger upward either — a reservation that leaked
+        would show as saturation that nothing caused.
+        """
+        await self._quiesced()
+        instance = _Uncooperative._bridge()
+        healthy, captured = TestExchange._connection()
+
+        with _socket_layer(healthy):
+            for round_number in range(3):
+                burst = await asyncio.gather(
+                    *(
+                        _Uncooperative._request(
+                            instance, message_id=f"clean-{round_number}-{n}"
+                        )
+                        for n in range(bridge.MAX_INFLIGHT_REQUESTS)
+                    )
+                )
+
+                assert all(reply == "[Stage-A] ACCEPTED_TERMINAL\ndone" for reply in burst)
+                assert instance._inflight == 0
+                assert bridge._cleanup_charged == 0, "a completed exchange kept its reservation"
+                assert not bridge._stragglers
+
+        assert len(captured) == 3 * bridge.MAX_INFLIGHT_REQUESTS
+        await self._quiesced()
