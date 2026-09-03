@@ -287,8 +287,16 @@ _cleanup_charged = 0
 #: The ledger above is process-global, so it is serialized by a plain lock
 #: rather than by one event loop.  A gateway running two loops in two
 #: threads would otherwise share the set and the counter without sharing
-#: what makes them a bound.  The lock is never held across an await and
-#: never re-entered, so it can neither block the loop nor deadlock.
+#: what makes them a bound — and a thread step's end is reported from its
+#: own worker, so the parties to this lock are not all on a loop at all.
+#: It therefore also covers the entered/exited/disowned state of a
+#: :class:`_ThreadWork`, which is what lets a worker and the loop settle
+#: between them, with one lock and no ordering rule, who owns a permit.
+#:
+#: It is never held across an await, never held across the worker's call
+#: itself, never re-entered, and nothing is called out to while it is
+#: held, so it can neither block the loop, be held by a wedged worker, nor
+#: deadlock.  Every critical section under it is O(1) bookkeeping.
 _cleanup_lock = threading.Lock()
 
 
@@ -467,8 +475,9 @@ class _CleanupBudget:
 
     A budget belongs to one exchange and is only ever touched by that
     exchange's own coroutine, so its permits need no lock; what is shared
-    — the straggler set and the committed counter — is exactly what
-    :data:`_cleanup_lock` covers.
+    — the straggler set, the committed counter, and the state of any
+    :class:`_ThreadWork` in it — is exactly what :data:`_cleanup_lock`
+    covers.
     """
 
     __slots__ = ("_permits",)
