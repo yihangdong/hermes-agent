@@ -7,6 +7,7 @@ what the bridge will do.
 """
 
 import asyncio
+import concurrent.futures
 import contextlib
 import json
 import os
@@ -14,6 +15,7 @@ import shutil
 import stat
 import struct
 import tempfile
+import threading
 import time
 import warnings
 from typing import Any, Dict
@@ -2686,3 +2688,515 @@ class TestGlobalDetachedCleanupBudget:
 
         assert len(captured) == 3 * bridge.MAX_INFLIGHT_REQUESTS
         await self._quiesced()
+
+
+class _RealWorkers:
+    """Real executor work, counted from inside the worker threads.
+
+    A cancellation-cooperative coroutine cannot falsify anything about a
+    worker thread, because cancelling it ends it — which is precisely the
+    behaviour under test.  So every stall below is a genuine synchronous
+    call blocking a genuine thread on an event only the test can set,
+    reached through the genuine :func:`asyncio.to_thread`.  ``live`` is
+    therefore work that is really running, not a task that is merely
+    unfinished.
+    """
+
+    #: A blocked worker gives up eventually so a regression fails the
+    #: suite instead of wedging it.  Far above every bound asserted here.
+    ABANDON_AFTER = 10.0
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._entered = 0
+        self._exited = 0
+        self.peak = 0
+        self.release = threading.Event()
+
+    @property
+    def live(self):
+        with self._lock:
+            return self._entered - self._exited
+
+    @property
+    def started(self):
+        with self._lock:
+            return self._entered
+
+    async def reaches(self, count, *, deadline=2.0):
+        """Wait for exactly ``count`` live workers, then report what there is.
+
+        Handing work to the executor and that work reaching the first line
+        of a thread are two different instants.  Waiting for the second
+        removes a start-up race from the assertion without weakening it:
+        the caller still states an exact number, and a wrong number still
+        fails — it just is not allowed to fail because a thread was slow
+        to be born.
+        """
+        stop = time.monotonic() + deadline
+        while self.live != count and time.monotonic() < stop:
+            await asyncio.sleep(0.005)
+        return self.live
+
+    def block(self):
+        """Occupy one real worker thread until the test lets it go."""
+        with self._lock:
+            self._entered += 1
+            self.peak = max(self.peak, self._entered - self._exited)
+        try:
+            self.release.wait(self.ABANDON_AFTER)
+        finally:
+            with self._lock:
+                self._exited += 1
+
+    async def settled(self, *, deadline=5.0):
+        """Release every blocked thread and wait for each to really exit.
+
+        Cleanup, and deliberately assertion-free: it runs in a ``finally``,
+        where an assertion would mask whichever failure sent the test into
+        it.  The claims about what harvest must guarantee belong to the
+        tests that own them.
+        """
+        self.release.set()
+        stop = time.monotonic() + deadline
+        while self.live and time.monotonic() < stop:
+            await asyncio.sleep(0.01)
+        # Turns for each wrapper to resolve from the worker's thread and
+        # for its done callback to run on this loop.
+        for _ in range(3):
+            await asyncio.sleep(0)
+
+
+def _blocking_socket_stat(workers, *, block):
+    """An ``os.stat`` that blocks a real worker thread on one chosen step.
+
+    An exchange stats the socket path exactly twice: once in the preflight
+    that runs before anything is connected, and once in the post-connect
+    identity re-check that runs with a connection already open.  ``block``
+    picks which of the two blocks, so each :func:`asyncio.to_thread`
+    hand-off can be falsified on its own rather than as a pair.
+
+    A blocked worker never reaches a second stat, so counting socket-path
+    stats stays in step with the requests even as blocked work piles up:
+    under ``"preflight"`` every socket stat is a preflight, and under
+    ``"recheck"`` the odd ones are preflights that must be let through.
+    """
+    real_stat = os.stat
+    sock_st = _stat(stat.S_IFSOCK | 0o660, ino=101)
+    dir_st = _stat(0o40755, ino=202)
+    seen = {"n": 0}
+    counter_lock = threading.Lock()
+
+    def stat_fn(path, *args, **kwargs):
+        target = str(path)
+        if target == SOCKET_DIR:
+            return dir_st
+        if target != SOCKET:
+            return real_stat(path, *args, **kwargs)
+        with counter_lock:
+            seen["n"] += 1
+            nth = seen["n"]
+        if block == "preflight" or nth % 2 == 0:
+            workers.block()
+        return sock_st
+
+    return stat_fn
+
+
+class TestRealExecutorWorkIsCharged:
+    """The ceiling has to bound work, not the loop's handle on it.
+
+    ``asyncio.to_thread`` is the one step of an exchange whose real work
+    runs outside the loop.  Cancelling the future the loop is awaiting
+    ends *that future* and nothing else: the call inside the thread runs
+    on, uninterruptible, for as long as it likes.  A budget that watched
+    the future would hand capacity back while the work it stands for was
+    still running, and a bridge already holding a wedged thread apiece
+    could then start unboundedly many more — which is exactly what
+    twelve sequential requests demonstrated before this correction.
+
+    Every falsifier here blocks real threads and releases them only from
+    the test, so none of them can be satisfied by a double that ends the
+    moment it is asked to.
+    """
+
+    #: Comfortably more requests than the ceiling admits, so the bound is
+    #: reached rather than merely approached.
+    SEQUENTIAL = 12
+
+    @staticmethod
+    def _connection(calls):
+        """A peer that connects and answers; every stall is on this side."""
+
+        async def open_connection(path):
+            calls["connects"] += 1
+            reader = asyncio.StreamReader()
+            writer = Mock()
+            writer.close = Mock()
+            writer.drain = AsyncMock()
+            writer.wait_closed = AsyncMock()
+
+            def on_write(frame):
+                calls["writes"] += 1
+                request = json.loads(frame[4:].decode("utf-8"))
+                reader.feed_data(
+                    encode_frame(_reply(request["request_id"], request["conversation_ref"]))
+                )
+                reader.feed_eof()
+
+            writer.write = on_write
+            return reader, writer
+
+        return open_connection
+
+    @staticmethod
+    @contextlib.contextmanager
+    def _real_threads(workers, *, block, calls):
+        """The whole socket layer, with one step blocking a real thread.
+
+        The loop's executor is sized past everything these tests ask of it
+        first.  The default pool is ``min(32, cpu_count + 4)`` wide, so on
+        a small runner it — and not the bridge — would be what stopped the
+        thirteenth worker from running, and a ceiling that only holds
+        because the host ran out of threads is not the ceiling under test.
+        Sized this way the falsifier measures
+        :data:`bridge.MAX_DETACHED_CLEANUP_TASKS` on every host, and the
+        uncorrected module really does reach twelve live workers.
+        """
+        executor = concurrent.futures.ThreadPoolExecutor(
+            max_workers=TestRealExecutorWorkIsCharged.SEQUENTIAL + bridge.MAX_INFLIGHT_REQUESTS,
+            thread_name_prefix="stagea-falsifier",
+        )
+        asyncio.get_running_loop().set_default_executor(executor)
+        # Left installed for the rest of this test's loop, which closes it:
+        # shutting it down here would break the ordinary exchange some of
+        # these tests run *after* the stall, to show the bridge still works.
+        # Every test releases its threads in its own ``finally``, so that
+        # close has nothing to wait for.
+        with patch("os.stat", side_effect=_blocking_socket_stat(workers, block=block)):
+            with patch.object(bridge, "read_peer_uid", return_value=CONTROLLER_UID):
+                with patch.object(
+                    asyncio,
+                    "open_unix_connection",
+                    TestRealExecutorWorkIsCharged._connection(calls),
+                    create=True,
+                ):
+                    yield
+
+    @classmethod
+    async def _sequential(cls, block, *, expected_connects):
+        """Drive ``SEQUENTIAL`` distinct requests past unreleasable threads.
+
+        Every per-request invariant that has to hold *during* the run is
+        asserted here while it is still running: an end-state check could
+        not see a ceiling that was passed and then recovered, which is the
+        shape the defect actually had.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        threads = {"threads": 0}
+        cap = bridge.MAX_DETACHED_CLEANUP_TASKS
+        admitted, refused = 0, 0
+
+        try:
+            with TestGlobalDetachedCleanupBudget._counted_threads(threads):
+                with cls._real_threads(workers, block=block, calls=calls):
+                    with _Uncooperative._declared_deadlines():
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                        for n in range(cls.SEQUENTIAL):
+                            was = (calls["connects"], calls["writes"], threads["threads"])
+                            was_live = workers.live
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"thread-{n}"),
+                                bound=bound,
+                            )
+                            spent = (
+                                calls["connects"] - was[0],
+                                calls["writes"] - was[1],
+                                threads["threads"] - was[2],
+                            )
+
+                            if reply == bridge.refusal_text("cleanup_capacity_exhausted"):
+                                refused += 1
+                                # Nothing at all: no worker, no connect, no
+                                # write, and no growth in live real work.
+                                assert spent == (0, 0, 0), f"a refused request created {spent}"
+                                assert workers.live == was_live
+                            else:
+                                admitted += 1
+                                assert "socket_unavailable" in reply
+                                assert spent == (expected_connects, 0, expected_connects + 1)
+                                assert await workers.reaches(was_live + 1) == was_live + 1
+
+                            assert instance._inflight == 0, "the visible slot was not returned"
+                            # The claim, stated about work rather than about
+                            # tasks: this is what 12 sequential requests
+                            # broke, with 12 live workers against a cap of 8.
+                            assert workers.live <= cap, (
+                                f"{workers.live} live worker threads against a cap of {cap}"
+                            )
+                            assert bridge._cleanup_charged <= cap
+
+                        assert not workers.release.is_set(), "the stall was released"
+                        assert workers.live == admitted, (
+                            "every admitted request should still own one live worker"
+                        )
+                        await workers.settled()
+        finally:
+            await workers.settled()
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+        return admitted, refused, workers
+
+    @pytest.mark.asyncio
+    async def test_twelve_sequential_blocked_preflight_threads_stay_under_the_ceiling(self):
+        """The reviewer's probe, on the preflight hand-off.
+
+        Twelve distinct requests whose socket preflight blocks a real
+        thread that will not come back.  Before the correction all twelve
+        were admitted and twelve worker calls ran at once against a
+        declared cap of eight, with not one capacity refusal; the wrapper
+        each one had been charged to was cancelled and harvested while its
+        thread was still running.
+        """
+        admitted, refused, workers = await self._sequential("preflight", expected_connects=0)
+
+        assert admitted + refused == self.SEQUENTIAL
+        assert refused, "the ceiling never engaged, so nothing was bounded"
+        assert workers.peak <= bridge.MAX_DETACHED_CLEANUP_TASKS
+        assert workers.peak == admitted
+        assert workers.live == 0, "a released worker never exited"
+
+    @pytest.mark.asyncio
+    async def test_twelve_sequential_blocked_identity_rechecks_stay_under_the_ceiling(self):
+        """The same, on the hand-off that runs with a socket already open.
+
+        Bounding the preflight and leaving the post-connect re-check
+        uncharged would move the defect rather than close it, and move it
+        somewhere strictly worse: by then a connection exists.  Each
+        admitted request here connects exactly once, writes nothing, and
+        hands off twice — the preflight that returns and the re-check that
+        does not.
+        """
+        admitted, refused, workers = await self._sequential("recheck", expected_connects=1)
+
+        assert admitted + refused == self.SEQUENTIAL
+        assert refused, "the ceiling never engaged, so nothing was bounded"
+        assert workers.peak <= bridge.MAX_DETACHED_CLEANUP_TASKS
+        assert workers.peak == admitted
+        assert workers.live == 0, "a released worker never exited"
+
+    @pytest.mark.asyncio
+    async def test_a_let_go_wrapper_keeps_its_permit_while_its_thread_runs(self):
+        """Losing the wrapper must not be mistaken for the work ending.
+
+        The exchange is over, the Owner has been answered and the in-flight
+        slot is back — and the thread the exchange handed off is still
+        running.  Before the correction the ledger read empty at exactly
+        this point, which is what let the next request start another one.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+
+        try:
+            with self._real_threads(workers, block="preflight", calls=calls):
+                with _Uncooperative._declared_deadlines():
+                    reply, _elapsed = await _Uncooperative._finished_within(
+                        _Uncooperative._request(instance, message_id="one"),
+                        bound=bridge._exchange_budget() + _Uncooperative.SLACK,
+                    )
+
+                    assert "socket_unavailable" in reply
+                    assert instance._inflight == 0
+                    assert await workers.reaches(1) == 1
+
+                    # Not a single sample: the wrapper is cancelled or
+                    # resolved on some later turn of the loop, and the
+                    # refund this test forbids would happen then.  So the
+                    # claim is checked over a window that outlives every
+                    # turn the wrapper could possibly end on.
+                    for _ in range(50):
+                        await asyncio.sleep(0.002)
+                        assert workers.live == 1, "the real worker ended on its own"
+                        assert bridge._cleanup_charged >= 1, (
+                            "capacity came back while the worker thread was still running"
+                        )
+                        assert len(bridge._stragglers) >= 1
+
+                    await workers.settled()
+                    assert await _Uncooperative._drain_stragglers(set()) == set()
+                    assert bridge._cleanup_charged == 0, "the permit was never given back"
+        finally:
+            await workers.settled()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_a_saturated_bridge_hands_nothing_to_a_worker_thread(self):
+        """At the ceiling the door closes before the executor is touched.
+
+        The refusal has to come before a worker is scheduled, a socket is
+        opened, anything is written or any other background work is made —
+        otherwise "bounded" would only mean "bounded eventually".
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        threads = {"threads": 0}
+
+        try:
+            with TestGlobalDetachedCleanupBudget._counted_threads(threads):
+                with self._real_threads(workers, block="preflight", calls=calls):
+                    with _Uncooperative._declared_deadlines():
+                        bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                        n = 0
+                        while (
+                            bridge._cleanup_charged + bridge._CLEANUP_PERMITS_PER_EXCHANGE
+                            <= bridge.MAX_DETACHED_CLEANUP_TASKS
+                        ):
+                            await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"fill-{n}"),
+                                bound=bound,
+                            )
+                            n += 1
+                            assert n <= self.SEQUENTIAL, "the bridge never saturated"
+
+                        saturated = (
+                            calls["connects"],
+                            calls["writes"],
+                            threads["threads"],
+                            workers.started,
+                            bridge._cleanup_charged,
+                            len(bridge._stragglers),
+                        )
+                        assert workers.live, "nothing was actually holding the ceiling"
+
+                        for extra in range(5):
+                            reply, _elapsed = await _Uncooperative._finished_within(
+                                _Uncooperative._request(instance, message_id=f"over-{extra}"),
+                                bound=bound,
+                            )
+                            assert reply == bridge.refusal_text("cleanup_capacity_exhausted")
+                            assert instance._inflight == 0
+                            assert (
+                                calls["connects"],
+                                calls["writes"],
+                                threads["threads"],
+                                workers.started,
+                                bridge._cleanup_charged,
+                                len(bridge._stragglers),
+                            ) == saturated, "a refused request changed something"
+        finally:
+            await workers.settled()
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_capacity_comes_back_only_when_the_real_threads_exit(self):
+        """Saturation lifts on the workers' exit, and on nothing else.
+
+        A ceiling that never recovers is as wrong as one that never binds,
+        so this proves both directions: refused while the threads run,
+        harvested to empty once they exit, and an ordinary exchange
+        succeeding afterwards on the same bridge.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+
+        try:
+            with self._real_threads(workers, block="preflight", calls=calls):
+                with _Uncooperative._declared_deadlines():
+                    bound = bridge._exchange_budget() + _Uncooperative.SLACK
+                    replies = []
+                    for n in range(self.SEQUENTIAL):
+                        reply, _elapsed = await _Uncooperative._finished_within(
+                            _Uncooperative._request(instance, message_id=f"recover-{n}"),
+                            bound=bound,
+                        )
+                        replies.append(reply)
+
+                    refusal = bridge.refusal_text("cleanup_capacity_exhausted")
+                    assert replies[-1] == refusal, "the bridge never saturated"
+                    held = workers.live
+                    assert held and bridge._cleanup_charged >= held
+
+                    # Releasing the threads is the only thing that happens.
+                    await workers.settled()
+                    assert await _Uncooperative._drain_stragglers(set()) == set()
+                    assert workers.live == 0
+                    assert bridge._cleanup_charged == 0, "capacity did not harvest down"
+                    assert not bridge._stragglers
+
+            healthy, captured = TestExchange._connection()
+            with _socket_layer(healthy):
+                after = await _Uncooperative._request(instance, message_id="after-release")
+
+            assert after == "[Stage-A] ACCEPTED_TERMINAL\ndone"
+            assert len(captured) == 1
+            assert bridge._cleanup_charged == 0
+        finally:
+            await workers.settled()
+            await TestGlobalDetachedCleanupBudget._quiesced()
+
+    @pytest.mark.asyncio
+    async def test_a_concurrent_burst_cannot_oversubscribe_the_real_threads(self):
+        """Racing for the last permits must not hand out more than exist.
+
+        Sequential saturation cannot catch a check-then-act: only bursts
+        that reserve at the same moment can.  The ledger is sampled at the
+        one place capacity is ever committed, and the live worker count is
+        read on every turn, so a ceiling that was passed and then
+        recovered still fails here.
+        """
+        await TestGlobalDetachedCleanupBudget._quiesced()
+        workers = _RealWorkers()
+        instance = _Uncooperative._bridge()
+        calls = {"connects": 0, "writes": 0}
+        cap = bridge.MAX_DETACHED_CLEANUP_TASKS
+        samples = []
+        refusal = bridge.refusal_text("cleanup_capacity_exhausted")
+        refused = 0
+
+        try:
+            with TestGlobalDetachedCleanupBudget._ledger_samples(samples):
+                with self._real_threads(workers, block="preflight", calls=calls):
+                    with _Uncooperative._declared_deadlines():
+                        for burst in range(4):
+                            tasks = [
+                                asyncio.ensure_future(
+                                    _Uncooperative._request(
+                                        instance, message_id=f"burst-{burst}-{n}"
+                                    )
+                                )
+                                for n in range(bridge.MAX_INFLIGHT_REQUESTS)
+                            ]
+                            done, pending = await asyncio.wait(tasks, timeout=_Uncooperative.OUTER)
+                            assert not pending, "an exchange never finished"
+                            for task in done:
+                                if task.result() == refusal:
+                                    refused += 1
+                            assert workers.live <= cap, (
+                                f"{workers.live} live worker threads against a cap of {cap}"
+                            )
+                            assert bridge._cleanup_charged <= cap
+                            assert instance._inflight == 0
+
+                        assert refused, "the ceiling never engaged, so no race was run"
+                        assert workers.peak <= cap
+                        assert calls["writes"] == 0
+
+            assert samples, "no reservation was ever attempted"
+            assert all(charged <= cap for _granted, charged, _live in samples), (
+                "the ceiling was oversubscribed at a reservation"
+            )
+        finally:
+            await workers.settled()
+            assert await _Uncooperative._drain_stragglers(set()) == set()
+            await TestGlobalDetachedCleanupBudget._quiesced()

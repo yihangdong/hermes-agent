@@ -162,14 +162,15 @@ _CLEANUP_PERMITS_PER_EXCHANGE = 2
 
 #: Hard process-global ceiling on live detached cleanup work.  An abandoned
 #: step is bounded in what it may do but not in when it ends — an awaitable
-#: that never acknowledges cancellation ends when it pleases — so the
-#: *population* of them needs a bound of its own, and the four in-flight
-#: slots cannot be it: a slot is released as soon as the Owner is answered,
-#: while the task it left behind is still alive.  Every exchange therefore
-#: reserves its whole worst case against this ceiling before it opens a
-#: socket or starts a worker thread.  Four admitted exchanges reserve
-#: exactly this many, so the reservation refuses nothing until stragglers
-#: genuinely accumulate.
+#: that never acknowledges cancellation, or a worker thread, which cannot
+#: be asked at all, ends when it pleases — so the *population* of them
+#: needs a bound of its own, and the four in-flight slots cannot be it: a
+#: slot is released as soon as the Owner is answered, while the work it
+#: left behind is still alive.  Every exchange therefore reserves its whole
+#: worst case against this ceiling before it opens a socket or hands
+#: anything to a worker thread.  Four admitted exchanges reserve exactly
+#: this many, so the reservation refuses nothing until stragglers genuinely
+#: accumulate.
 MAX_DETACHED_CLEANUP_TASKS = _CLEANUP_PERMITS_PER_EXCHANGE * MAX_INFLIGHT_REQUESTS
 
 REPLY_PREFIX = "[Stage-A]"
@@ -255,6 +256,12 @@ def _exchange_budget() -> float:
 #: makes that harvest deterministic instead of leaving it to the collector,
 #: and :func:`_harvest` is what empties it.
 #:
+#: An entry is the step's *work*, not a handle on it.  Where the work runs
+#: in a worker thread the entry is left uncancelled precisely so the two
+#: cannot come apart: the wrapper resolves when the thread returns and not
+#: before, so an entry disappears from here exactly when its work really
+#: ends — never while an uninterruptible call is still running.
+#:
 #: Its size is bounded by a reservation, not by an argument.  The in-flight
 #: slots cannot bound it: a slot is released the moment the Owner is
 #: answered, while the step that overran is still alive, so a later request
@@ -309,7 +316,9 @@ def _harvest(task: asyncio.Future[Any]) -> None:
 
     Returning the permit is the other half, and it is what makes the
     ceiling a bound on *live* work rather than a lifetime quota: capacity
-    comes back exactly when the step really ends, so a stall that is
+    comes back exactly when the step really ends — for a step running in
+    a worker thread, when that thread's call returns, because nothing
+    cancelled the wrapper out from under it — so a stall that is
     eventually released cannot leave the bridge permanently saturated.
     The permit is returned only for a task this ledger was actually
     holding, so a harvest that runs twice cannot conjure capacity.
@@ -374,16 +383,25 @@ class _CleanupBudget:
         """Return the permit of a step that ended inside its bound."""
         self._permits += 1
 
-    def abandon(self, task: asyncio.Future[Any]) -> bool:
-        """Ask a step that lost its budget to stop, and stop waiting for it.
+    def abandon(self, task: asyncio.Future[Any], *, cancel: bool = True) -> bool:
+        """Stop waiting for a step that lost its budget, and hold its permit.
 
         Cancellation is a request, not a guarantee: an awaitable may catch
-        ``CancelledError`` and carry on, and a worker thread cannot be
-        interrupted at all.  Waiting for the acknowledgement would hand
-        this exchange's deadline to the party the deadline exists to
-        bound.  So the request is made and the task is let go — held only
-        for harvesting, never awaited, never consulted, holding no
-        in-flight slot, starting no new work and issuing no retry.
+        ``CancelledError`` and carry on.  Waiting for the acknowledgement
+        would hand this exchange's deadline to the party the deadline
+        exists to bound.  So the request is made and the task is let go —
+        held only for harvesting, never awaited, never consulted, holding
+        no in-flight slot, starting no new work and issuing no retry.
+
+        ``cancel`` is ``False`` for a step whose real work runs outside
+        the loop.  A worker thread cannot be interrupted: cancelling the
+        future the loop is awaiting ends *that future* while the call
+        inside the thread runs on, so a cancelled wrapper would hand this
+        permit back while the work it stands for is still live — the one
+        thing a bound on live work must never do.  Left uncancelled, the
+        wrapper cannot finish before the worker returns, so harvesting the
+        wrapper *is* harvesting the work, and the permit is charged for
+        the executor call's real lifetime rather than the wrapper's.
 
         Returns:
             ``True`` when the task was parked, and is now holding the
@@ -396,7 +414,8 @@ class _CleanupBudget:
         if task.done():
             _harvest(task)
             return False
-        task.cancel()
+        if cancel:
+            task.cancel()
         with _cleanup_lock:
             _stragglers.add(task)
         task.add_done_callback(_harvest)
@@ -427,17 +446,19 @@ class _Deadline:
     def remaining(self) -> float:
         return self._expiry - time.monotonic()
 
-    def _release(self, task: asyncio.Future[Any]) -> None:
+    def _release(self, task: asyncio.Future[Any], *, cancel: bool) -> None:
         """End a step that lost its bound, keeping the permit exact.
 
         Every permit is drawn in :meth:`bounded` and returned either here
         or on the success path, so a permit can be neither leaked by a
         step that overran nor conjured by one that had already finished.
+        ``cancel`` says whether asking is worth anything; see
+        :meth:`_CleanupBudget.abandon`.
         """
-        if not self._cleanup.abandon(task):
+        if not self._cleanup.abandon(task, cancel=cancel):
             self._cleanup.give_back()
 
-    async def bounded(self, awaitable: Any, cap: float) -> Any:
+    async def bounded(self, awaitable: Any, cap: float, *, cancellable: bool = True) -> Any:
         """Await under the smaller of this step's cap and what is left.
 
         Once the budget is spent this raises :class:`asyncio.TimeoutError`
@@ -464,6 +485,12 @@ class _Deadline:
         exchange reserved its whole worst case, so this cannot refuse a
         legal step; were that ever untrue, refusing is the fail-closed
         answer and starting unaccounted work is not.
+
+        ``cancellable`` is ``False`` when the real work behind
+        ``awaitable`` runs outside the loop, where cancelling the wrapper
+        would end the wrapper and nothing else.  Such a step is parked
+        uncancelled instead, so its permit stays charged for as long as
+        the work is really running; see :meth:`bounded_thread`.
         """
         timeout = min(cap, self.remaining())
         if timeout <= 0 or not self._cleanup.take():
@@ -475,16 +502,44 @@ class _Deadline:
         try:
             done, _pending = await asyncio.wait({task}, timeout=timeout)
         except BaseException:
-            # Includes this exchange being cancelled from outside: a step
-            # must never outlive the caller that started it, and the same
-            # abandonment is what keeps that teardown non-blocking too.
-            self._release(task)
+            # Includes this exchange being cancelled from outside.  The
+            # same abandonment is what keeps that teardown non-blocking;
+            # work that cannot be cancelled outlives the caller whatever
+            # is done here, so it stays charged rather than pretended away.
+            self._release(task, cancel=cancellable)
             raise
         if not done:
-            self._release(task)
+            self._release(task, cancel=cancellable)
             raise asyncio.TimeoutError
         self._cleanup.give_back()
         return task.result()
+
+    async def bounded_thread(self, func: Callable[..., Any], /, *args: Any, cap: float) -> Any:
+        """Run a blocking call in a worker thread under this exchange's budget.
+
+        The bound here protects the exchange, never the call: a thread
+        cannot be interrupted, so a wedged call goes on running whatever
+        this coroutine does.  What must not happen is that the bridge
+        stops *counting* it — the permit drawn for this step has to stay
+        charged while the call is really running, or
+        :data:`MAX_DETACHED_CLEANUP_TASKS` would bound wrappers rather
+        than work, and a bridge already holding a thread apiece could
+        start unboundedly many more.
+
+        Leaving the wrapper uncancelled is what ties the permit to the
+        work: the wrapper resolves only when the executor call returns, so
+        the harvest that gives the permit back is the worker's own exit.
+        Binding that to the one place a thread is handed off — rather than
+        to a flag each call site has to remember — is what makes it
+        structural.
+
+        ``asyncio.to_thread`` is read at call time, so a falsifier can
+        substitute the hand-off without reaching inside this class, and
+        the coroutine it returns has submitted nothing yet: a step refused
+        for want of budget is closed in :meth:`bounded` before any worker
+        exists.
+        """
+        return await self.bounded(asyncio.to_thread(func, *args), cap, cancellable=False)
 
 
 class BridgeError(Exception):
@@ -1203,10 +1258,11 @@ class StageAOwnerBridge:
         # bound protects the slot and the Owner's answer — the worker
         # thread is left to finish on its own, because a thread cannot be
         # cancelled and pretending otherwise would be the wrong claim.
+        # Not pretending is also what keeps the ceiling honest: the permit
+        # behind this step stays charged until the thread really returns.
         try:
-            preimage = await deadline.bounded(
-                asyncio.to_thread(check_socket_path, config.socket_path, config.socket_uid),
-                cap=step,
+            preimage = await deadline.bounded_thread(
+                check_socket_path, config.socket_path, config.socket_uid, cap=step
             )
         except asyncio.TimeoutError as exc:
             raise BridgeError("socket_unavailable") from exc
@@ -1233,9 +1289,8 @@ class StageAOwnerBridge:
             # been proven not to have been swapped since the preflight.
             verify_connected_peer(writer.get_extra_info("socket"), config.socket_uid)
             try:
-                await deadline.bounded(
-                    asyncio.to_thread(check_socket_identity, config.socket_path, preimage),
-                    cap=step,
+                await deadline.bounded_thread(
+                    check_socket_identity, config.socket_path, preimage, cap=step
                 )
             except asyncio.TimeoutError as exc:
                 raise BridgeError("socket_unavailable") from exc
