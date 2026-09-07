@@ -31,6 +31,7 @@ import os
 import re
 from typing import Any, Dict, List, Optional
 
+from agent import stagea_text_only
 from agent.prompt_builder import (
     DEFAULT_AGENT_IDENTITY,
     EXECUTION_GUIDANCE_MODELS,
@@ -453,6 +454,22 @@ def build_system_prompt_parts(agent: Any, system_message: Optional[str] = None) 
     # Local import to avoid pulling model_tools at module load.  Tests
     # patch ``run_agent.get_toolset_for_tool`` and similar helpers, so
     # we resolve through ``_ra()`` to honor those patches.
+    # DYHANO Stage-A text-only profile (#198 Candidate K): the source
+    # constant is the entire system message.  Nothing environmental, no
+    # memory, skills, soul, context file or timestamp may enter it, and a
+    # caller-supplied system message is refused rather than merged.
+    if stagea_text_only.is_enabled():
+        if system_message:
+            raise stagea_text_only.StageATextOnlyRefused(
+                "a caller-supplied system message is not admitted under "
+                f"{stagea_text_only.OPT_IN_ENV}={stagea_text_only.OPT_IN_VALUE}"
+            )
+        return {
+            "stable": stagea_text_only.SYSTEM_PROMPT,
+            "context": "",
+            "volatile": "",
+        }
+
     _r = _ra()
 
     # Resolve the model's context window once so context-file caps can scale

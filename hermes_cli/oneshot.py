@@ -231,6 +231,20 @@ def run_oneshot(
     # bytes reach the terminal.
     logging.disable(logging.CRITICAL)
 
+    # DYHANO Stage-A text-only profile (#198 Candidate K): under the opt-in
+    # no override is admitted.  Refused before the stderr redirect so the
+    # message reaches the terminal, and before any provider work.
+    from agent import stagea_text_only
+
+    try:
+        stagea_text_only.refuse_overrides(
+            model=model, provider=provider, toolsets=toolsets, skills=skills,
+            usage_file=usage_file,
+        )
+    except stagea_text_only.StageATextOnlyRefused as error:
+        sys.stderr.write(f"hermes -z: {error}\n")
+        return stagea_text_only.EXIT_CODE_REFUSED
+
     # --provider without --model is ambiguous: carrying the user's configured
     # model across to a different provider is usually wrong (that provider may
     # not host it), and silently picking the provider's catalog default hides
@@ -461,6 +475,16 @@ def _run_agent(
     if toolsets_list is None and use_config_toolsets:
         toolsets_list = sorted(_get_platform_tools(cfg, "cli"))
 
+    # DYHANO Stage-A text-only profile (#198 Candidate K): zero tools and a
+    # fixed output bound.  The system message is fixed by
+    # agent.system_prompt under the same opt-in.
+    from agent import stagea_text_only
+
+    stagea_text_only_max_tokens: Optional[int] = None
+    if stagea_text_only.is_enabled():
+        toolsets_list = []
+        stagea_text_only_max_tokens = stagea_text_only.MAX_TOKENS
+
     # Ensure MCP tools are discovered before building the agent.  Oneshot
     # bypasses cli.py's _prepare_agent_startup MCP background path and
     # HermesCLI._init_agent's wait — it builds AIAgent directly here, so the
@@ -475,7 +499,10 @@ def _run_agent(
         single_query=True,
     )
 
-    skills_prompt = _build_preloaded_skills_prompt(skills)
+    if stagea_text_only_max_tokens is not None:
+        skills_prompt = None
+    else:
+        skills_prompt = _build_preloaded_skills_prompt(skills)
 
     session_db = _create_session_db_for_oneshot()
     # The try spans agent construction (not just ``chat``) so the SQLite store
@@ -503,6 +530,7 @@ def _run_agent(
             credential_pool=runtime.get("credential_pool"),
             fallback_model=_fb or None,
             ephemeral_system_prompt=skills_prompt,
+            max_tokens=stagea_text_only_max_tokens,
             # Interactive callbacks are intentionally NOT wired beyond this
             # one.  In oneshot mode there's no user sitting at a terminal:
             #   - clarify  → returns a synthetic "pick a default" instruction

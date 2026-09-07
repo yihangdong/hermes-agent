@@ -168,7 +168,17 @@ def _title_language() -> str:
 
 
 def _auto_title_enabled() -> bool:
-    """Return whether automatic session title generation is enabled."""
+    """Return whether automatic session title generation is enabled.
+
+    Under the Stage-A text-only opt-in (``agent.stagea_text_only``) it is
+    always disabled: the only model-side request that run may make is its
+    single chat completion, and the title upgrade is a second model call
+    against the same endpoint.  Ordinary Hermes (opt-in absent) is unchanged.
+    """
+    from agent import stagea_text_only
+
+    if stagea_text_only.is_enabled():
+        return False
     try:
         # Lazy imports, matching _title_language(): title_generator is imported
         # from agent code paths where a module-level hermes_cli import risks

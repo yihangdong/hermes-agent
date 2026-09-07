@@ -925,6 +925,23 @@ def _reconcile_local_cached_context_length(
     return cached
 
 
+def _stagea_text_only_probe_suppressed() -> bool:
+    """Stage-A text-only opt-in (``agent.stagea_text_only``): no endpoint probes.
+
+    Under the opt-in the configured endpoint is the controller's loopback
+    relay, which admits exactly one chat-completion exchange and nothing
+    else.  Every metadata probe -- the local-server detection waterfall, the
+    local context-length query and the OpenAI-compatible ``/models`` fetch --
+    would be refused by that relay and would consume the single admitted
+    exchange, so the three probe entry points return their "nothing found"
+    value without touching the network.  Static resolution is unchanged.
+    Ordinary Hermes (opt-in absent) is unchanged: the predicate is false.
+    """
+    from agent import stagea_text_only
+
+    return stagea_text_only.is_enabled()
+
+
 def is_local_endpoint(base_url: str) -> bool:
     """Return True if base_url points to a local machine.
 
@@ -1016,6 +1033,8 @@ def detect_local_server_type(base_url: str, api_key: str = "") -> Optional[str]:
     calls (e.g. every 5-minute metadata refresh) never re-run the waterfall
     and never spray 404s at endpoints the server does not expose.
     """
+    if _stagea_text_only_probe_suppressed():
+        return None
     import httpx
 
     normalized = _normalize_base_url(base_url)
@@ -1352,6 +1371,8 @@ def fetch_endpoint_model_metadata(
     This is used for explicit custom endpoints where hardcoded global model-name
     defaults are unreliable. Results are cached in memory per base URL.
     """
+    if _stagea_text_only_probe_suppressed():
+        return {}
     normalized = _normalize_base_url(base_url)
     if not normalized or _is_openrouter_base_url(normalized):
         return {}
@@ -2010,6 +2031,8 @@ def query_ollama_num_ctx(model: str, base_url: str, api_key: str = "") -> Option
     This is the value that should be passed as ``num_ctx`` in Ollama chat
     requests to override the default 2048.
     """
+    if _stagea_text_only_probe_suppressed():
+        return None
     import httpx
 
     bare_model = _strip_provider_prefix(model)
@@ -2073,6 +2096,8 @@ def query_ollama_supports_vision(model: str, base_url: str, api_key: str = "") -
     ``model_info.*.vision.block_count`` on older servers. Returns None when
     the server is unreachable, not Ollama, or the model is unknown.
     """
+    if _stagea_text_only_probe_suppressed():
+        return None
     import httpx
 
     bare_model = _strip_provider_prefix(model)
@@ -2141,6 +2166,8 @@ def _query_ollama_api_show(model: str, base_url: str, api_key: str = "") -> Opti
     The order is flipped vs ``query_ollama_num_ctx()`` because local users
     control ``num_ctx`` themselves; hosted users can't.
     """
+    if _stagea_text_only_probe_suppressed():
+        return None
     import time as _time
 
     # Namespaced cache key: shares the TTL store with
@@ -2312,6 +2339,8 @@ def _query_local_context_length(model: str, base_url: str, api_key: str = "") ->
     persisting anything to disk (freshness across restarts is still handled by
     the reconcile logic, which probes again once the TTL expires).
     """
+    if _stagea_text_only_probe_suppressed():
+        return None
     import time as _time
 
     cache_key = (_strip_provider_prefix(model), base_url.rstrip("/"))

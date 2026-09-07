@@ -74,6 +74,13 @@ suppress_platform_ver_console()
 import os
 import sys
 
+# The argument vector exactly as the process was launched, captured before
+# any startup helper (profile-flag stripping, session-name coalescing)
+# rewrites ``sys.argv``.  The DYHANO Stage-A text-only guard below decides
+# on this vector so a stripped flag can never turn a refused invocation
+# into a bare ``-z``.
+_LAUNCH_ARGV = tuple(sys.argv[1:])
+
 # ── Startup fast-path bootstrap ─────────────────────────────────────────
 # Two lines of inline path math so ``python hermes_cli/main.py`` (script
 # mode — sys.path[0] is hermes_cli/, not the repo root) can import the
@@ -330,6 +337,28 @@ def _run_and_exit_oneshot(
     place the stdin prompt is resolved — so it is read exactly once, and a
     rejected prompt costs no provider call.
     """
+    # DYHANO Stage-A text-only profile (#198 Candidate K): under the opt-in
+    # only a bare ``-z`` (prompt on stdin, no override) may proceed.  Decided
+    # before stdin is read and before the runner is imported.
+    from agent.stagea_text_only import (
+        StageATextOnlyRefused,
+        refuse_unless_bare_oneshot_call,
+    )
+
+    try:
+        refuse_unless_bare_oneshot_call(
+            not isinstance(prompt, str),
+            model=model,
+            provider=provider,
+            toolsets=toolsets,
+            skills=skills,
+            usage_file=usage_file,
+        )
+    except StageATextOnlyRefused as refusal:
+        sys.stderr.write(f"hermes -z: {refusal}\n")
+        _exit_after_oneshot(2)
+        return
+
     if not isinstance(prompt, str):
         # ``ONESHOT_PROMPT_FROM_STDIN`` is the only non-string argparse can
         # store in this slot, so this is the bare-`-z` case. Resolving it
@@ -919,6 +948,22 @@ load_hermes_dotenv(
     project_env=PROJECT_ROOT / ".env",
     load_external_secrets=sys.argv[1:2] != ["update"],
 )
+
+# DYHANO Stage-A text-only profile (#198 Candidate K): with the opt-in in the
+# environment (the Stage-A closure renders it into the project .env loaded
+# just above) this process may only be a bare ``hermes -z``.  Every other
+# command, flag or argv prompt is refused here, before any further startup
+# work.  A no-op when the opt-in is absent.
+from agent.stagea_text_only import (  # noqa: E402
+    StageATextOnlyRefused as _StageATextOnlyRefused,
+    refuse_unless_bare_oneshot_argv as _stagea_refuse_unless_bare_oneshot_argv,
+)
+
+try:
+    _stagea_refuse_unless_bare_oneshot_argv(_LAUNCH_ARGV)
+except _StageATextOnlyRefused as _stagea_refusal:
+    sys.stderr.write(f"hermes: {_stagea_refusal}\n")
+    raise SystemExit(2)
 
 # Bridge security.redact_secrets from config.yaml → HERMES_REDACT_SECRETS env
 # var BEFORE hermes_logging imports agent.redact (which snapshots the flag at
