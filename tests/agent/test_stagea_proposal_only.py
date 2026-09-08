@@ -435,8 +435,10 @@ class TestPackagingDeclaration:
 #: an attempt never performs a real read, connect or DNS lookup.
 OBSERVER_SOURCE = r'''
 import builtins
+import io
 import json
 import os
+import pathlib
 import socket
 import sys
 
@@ -640,6 +642,9 @@ def install():
     for name in ("open",):
         _ORIGINALS[("builtins", name)] = getattr(builtins, name)
         setattr(builtins, name, _guard_path("builtins.open", getattr(builtins, name)))
+    original_io_open = io.open
+    _ORIGINALS[("io", "open")] = original_io_open
+    io.open = _guard_path("io.open", original_io_open)
     for name in ("open", "stat", "lstat", "listdir", "scandir"):
         original = getattr(os, name)
         _ORIGINALS[("os", name)] = original
@@ -691,6 +696,7 @@ try:
         # prohibited target.  Denial happens before the original call, so no
         # real read, connect or lookup occurs.
         probes = [
+            ("io.open", lambda: pathlib.Path(__file__).read_text(encoding="utf-8")),
             ("builtins.open", lambda: builtins.open("/etc/hermes/config.yaml")),
             ("os.open", lambda: os.open("/etc/hermes/config.yaml", os.O_RDONLY)),
             ("os.stat", lambda: os.stat("/etc/hermes")),
