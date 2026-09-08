@@ -159,10 +159,14 @@ class TestRequestParsing:
         ("work_item_id", "resume-me"),
         ("contract_ref", "session_id-42"),
         ("canonical_repo", "owner/api_key"),
-        ("admitted_write_set", ["docs/credential.md"]),
+        ("expected_main_sha", "keychain"),
     ])
     def test_forbidden_token_anywhere_is_refused(self, mod, field, value):
-        """A resume/provider/credential-shaped token is refused in any field."""
+        """A resume/provider/credential token is refused in a screened field.
+
+        ``admitted_write_set`` values are the controller's one exemption and
+        are covered by ``TestRequestHygieneWriteSetParity`` below.
+        """
         with pytest.raises(mod.Refusal) as caught:
             mod.parse_request(_request_bytes(**{field: value}))
         assert caught.value.code == "request.hygiene.forbidden_token"
@@ -190,34 +194,40 @@ class TestCanonicalBytes:
 
 
 class TestEnvelopeValidation:
+    #: The exact value the request carries; the validator now requires it.
+    SCHEMA = "dyhano-trusted-boundary-envelope-v1"
+
     def _envelope(self, **overrides):
         document = {
-            "schema_version": "dyhano-trusted-boundary-envelope-v1",
+            "schema_version": self.SCHEMA,
             "mutations": [{"op": "create", "path": "docs/a.md", "content": "hi"}],
         }
         document.update(overrides)
         return document
 
     def test_well_formed_envelope_is_accepted(self, mod):
-        raw = mod.validate_envelope_document(self._envelope(), 262144)
+        raw = mod.validate_envelope_document(self._envelope(), 262144, self.SCHEMA)
         assert raw.startswith(b'{"mutations":')
 
     @pytest.mark.parametrize("document,code", [
         ({"schema_version": "v"}, "envelope.top_keys"),
         ({"schema_version": "v", "mutations": [], "x": 1}, "envelope.top_keys"),
-        ({"schema_version": "v", "mutations": {}}, "envelope.mutations.type"),
-        ({"schema_version": "v", "mutations": []}, "envelope.mutations.length"),
+        ({"schema_version": "v", "mutations": {}}, "envelope.schema_version.value"),
+        ({"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": {}}, "envelope.mutations.type"),
+        ({"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": []}, "envelope.mutations.length"),
     ])
     def test_bad_top_level_is_refused(self, mod, document, code):
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(document, 262144)
+            mod.validate_envelope_document(document, 262144, self.SCHEMA)
         assert caught.value.code == code
 
     @pytest.mark.parametrize("mutation,code", [
         ({"op": "rename", "path": "a.md", "content": "x"}, "envelope.mutation.op"),
         ({"op": "create", "path": "a.md"}, "envelope.mutation.keys"),
         ({"op": "create", "path": "a.md", "content": "x", "extra": 1}, "envelope.mutation.keys"),
-        ({"op": "delete", "path": "a.md", "base_blob_sha": "s"}, None),
+        ({"op": "delete", "path": "a.md", "base_blob_sha": "b" * 40}, None),
         ({"op": "create", "path": "../escape.md", "content": "x"}, "envelope.path.segment"),
         ({"op": "create", "path": ".git/config", "content": "x"}, "envelope.path.git_dir"),
         ({"op": "create", "path": "a//b.md", "content": "x"}, "envelope.path.segment"),
@@ -228,10 +238,10 @@ class TestEnvelopeValidation:
     def test_mutation_shapes(self, mod, mutation, code):
         document = self._envelope(mutations=[mutation])
         if code is None:
-            mod.validate_envelope_document(document, 262144)
+            mod.validate_envelope_document(document, 262144, self.SCHEMA)
             return
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(document, 262144)
+            mod.validate_envelope_document(document, 262144, self.SCHEMA)
         assert caught.value.code == code
 
     def test_duplicate_paths_are_refused(self, mod):
@@ -240,7 +250,7 @@ class TestEnvelopeValidation:
             {"op": "create", "path": "docs/a.md", "content": "2"},
         ])
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(document, 262144)
+            mod.validate_envelope_document(document, 262144, self.SCHEMA)
         assert caught.value.code == "envelope.paths.collide"
 
     def test_prefix_colliding_paths_are_refused(self, mod):
@@ -249,26 +259,28 @@ class TestEnvelopeValidation:
             {"op": "create", "path": "docs/a.md", "content": "2"},
         ])
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(document, 262144)
+            mod.validate_envelope_document(document, 262144, self.SCHEMA)
         assert caught.value.code == "envelope.paths.collide"
 
     def test_too_many_files_is_refused(self, mod):
         mutations = [{"op": "create", "path": "d/f%d.md" % i, "content": "x"}
                      for i in range(mod.MAX_ENVELOPE_FILES + 1)]
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(self._envelope(mutations=mutations), 262144)
+            mod.validate_envelope_document(
+                self._envelope(mutations=mutations), 262144, self.SCHEMA)
         assert caught.value.code == "envelope.mutations.length"
 
     def test_oversize_file_content_is_refused(self, mod):
         mutation = {"op": "create", "path": "d/f.md",
                     "content": "x" * (mod.MAX_FILE_CONTENT_BYTES + 1)}
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(self._envelope(mutations=[mutation]), 262144)
+            mod.validate_envelope_document(
+                self._envelope(mutations=[mutation]), 262144, self.SCHEMA)
         assert caught.value.code == "envelope.mutation.content.length"
 
     def test_envelope_over_the_request_cap_is_refused(self, mod):
         with pytest.raises(mod.Refusal) as caught:
-            mod.validate_envelope_document(self._envelope(), 8)
+            mod.validate_envelope_document(self._envelope(), 8, self.SCHEMA)
         assert caught.value.code == "envelope.length"
 
 
@@ -1131,3 +1143,358 @@ class TestC14RealInstalledExecutable:
         assert completed.returncode != 0
         assert completed.stdout == b""
         assert b"argv.not_frozen_tail" in completed.stderr
+
+
+class _ScriptedAgent:
+    """A local stand-in for the *conversation* surface and nothing else.
+
+    The real ``AIAgent`` factory, its resolved surface and its isolation are
+    settled by the C14 subprocess controls above, which stub nothing.  These
+    controls need only a scripted reply so the producer's own validation,
+    framing and exit path can be driven through the real ``main``.
+    """
+
+    def __init__(self, text):
+        self.text = text
+        self.calls = 0
+
+    def run_conversation(self, prompt, system_message=None):
+        self.calls += 1
+        return {"response": self.text}
+
+
+class TestRequestHygieneWriteSetParity:
+    """F1 -- the controller exempts admitted_write_set VALUES, nothing else."""
+
+    LAWFUL_PATHS = ["src/token.py", "docs/provider-notes.md", "auth/session.md"]
+
+    #: Every request field carrying a screened string.  ``schema_version`` is
+    #: excluded because its exact-value check refuses first,
+    #: ``max_envelope_bytes`` is an int, and ``admitted_write_set`` is the one
+    #: field whose value the controller exempts.
+    SCREENED_STRING_FIELDS = (
+        "action_id", "decision_id", "action_intent", "kernel_version",
+        "work_item_id", "contract_ref", "work_contract_fingerprint",
+        "canonical_repo", "canonical_branch_ref", "expected_main_sha",
+        "envelope_schema_version",
+    )
+
+    def test_lawful_repository_paths_are_admitted(self, mod):
+        document = mod.parse_request(
+            _request_bytes(admitted_write_set=self.LAWFUL_PATHS))
+        assert document["admitted_write_set"] == self.LAWFUL_PATHS
+
+    def test_every_forbidden_substring_is_lawful_inside_a_write_set_path(self, mod):
+        """The exemption must cover the whole token list, not a sample."""
+        for token in mod.FORBIDDEN_REQUEST_TOKENS:
+            path = "src/%s.py" % token
+            document = mod.parse_request(_request_bytes(admitted_write_set=[path]))
+            assert document["admitted_write_set"] == [path], token
+
+    def test_the_same_substrings_are_still_refused_in_another_value(self, mod):
+        """The exemption is scoped to the field, never to the string."""
+        for token in mod.FORBIDDEN_REQUEST_TOKENS:
+            with pytest.raises(mod.Refusal) as caught:
+                mod.parse_request(_request_bytes(work_item_id="src/%s.py" % token))
+            assert caught.value.code == "request.hygiene.forbidden_token", token
+
+    @pytest.mark.parametrize("field", SCREENED_STRING_FIELDS)
+    def test_every_other_scalar_value_is_still_screened(self, mod, field):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.parse_request(_request_bytes(**{field: "carries-api_key-here"}))
+        assert caught.value.code == "request.hygiene.forbidden_token"
+
+    def test_a_non_exempt_list_value_is_still_screened(self, mod):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.parse_request(_request_bytes(contract_ref=["ref-1", "bearer-x"]))
+        assert caught.value.code == "request.hygiene.forbidden_token"
+
+    def test_keys_are_screened_even_when_a_value_is_exempt(self, mod):
+        document = dict(VALID_REQUEST, admitted_write_set=["src/token.py"])
+        document["client_secret"] = ""
+        with pytest.raises(mod.Refusal) as caught:
+            mod._screen_request_hygiene(document)
+        assert caught.value.code == "request.hygiene.forbidden_token"
+
+    def test_a_near_miss_key_does_not_inherit_the_exemption(self, mod):
+        with pytest.raises(mod.Refusal) as caught:
+            mod._screen_request_hygiene({"admitted_write_set_provider": []})
+        assert caught.value.code == "request.hygiene.forbidden_token"
+
+    def test_the_clean_request_survives_the_same_screen_that_refuses_a_key(self, mod):
+        """Positive and key-surface negative over one and the same document."""
+        document = dict(VALID_REQUEST, admitted_write_set=self.LAWFUL_PATHS)
+        mod._screen_request_hygiene(document)
+        with pytest.raises(mod.Refusal) as caught:
+            mod._screen_request_hygiene(dict(document, netrc_path="x"))
+        assert caught.value.code == "request.hygiene.forbidden_token"
+
+    def test_field_closure_is_not_weakened_by_the_exemption(self, mod):
+        document = dict(VALID_REQUEST, admitted_write_set=["src/token.py"],
+                        extra="x")
+        with pytest.raises(mod.Refusal) as caught:
+            mod.parse_request(json.dumps(document).encode("utf-8"))
+        assert caught.value.code == "request.fields"
+
+    def test_the_exemption_does_not_reach_envelope_path_authority(self, mod):
+        document = {
+            "schema_version": VALID_REQUEST["envelope_schema_version"],
+            "mutations": [{"op": "create", "path": ".git/token.py",
+                           "content": "x"}],
+        }
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                document, 262144, VALID_REQUEST["envelope_schema_version"])
+        assert caught.value.code == "envelope.path.git_dir"
+
+
+class TestEnvelopeSchemaAgreement:
+    """F2 -- the envelope schema must equal the request-carried value."""
+
+    SCHEMA = "dyhano-trusted-boundary-envelope-v1"
+
+    def _document(self, schema):
+        return {
+            "schema_version": schema,
+            "mutations": [{"op": "create", "path": "docs/a.md", "content": "hi"}],
+        }
+
+    def test_the_matching_schema_is_accepted(self, mod):
+        raw = mod.validate_envelope_document(
+            self._document(self.SCHEMA), 262144, self.SCHEMA)
+        assert b'"schema_version":"dyhano-trusted-boundary-envelope-v1"' in raw
+
+    @pytest.mark.parametrize("schema", [
+        "dyhano-trusted-boundary-envelope-v2", "", "v1",
+        "DYHANO-TRUSTED-BOUNDARY-ENVELOPE-V1",
+        "dyhano-trusted-boundary-envelope-v1 ",
+    ])
+    def test_a_different_schema_value_is_refused(self, mod, schema):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(schema), 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.schema_version.value"
+
+    @pytest.mark.parametrize("schema", [1, None, True, ["x"], {"a": 1}])
+    def test_a_non_string_schema_value_is_refused(self, mod, schema):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(schema), 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.schema_version.type"
+
+    def test_the_expected_schema_is_required_and_has_no_default(self, mod):
+        """A default would silently divorce the check from the request."""
+        with pytest.raises(TypeError):
+            mod.validate_envelope_document(self._document(self.SCHEMA), 262144)
+
+    @pytest.mark.parametrize("expected", [None, "", 1, b"x"])
+    def test_an_unusable_expected_schema_refuses_rather_than_passes(self, mod, expected):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(self.SCHEMA), 262144, expected)
+        assert caught.value.code == "envelope.schema_version.expected"
+
+    def test_the_check_follows_the_request_not_a_frozen_constant(self, mod):
+        """Whatever the request names is the authority, in both directions."""
+        other = "dyhano-trusted-boundary-envelope-v2"
+        assert mod.validate_envelope_document(self._document(other), 262144, other)
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(self.SCHEMA), 262144, other)
+        assert caught.value.code == "envelope.schema_version.value"
+
+    def test_top_key_closure_still_runs_before_the_value_check(self, mod):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                {"schema_version": self.SCHEMA}, 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.top_keys"
+
+
+class TestBaseBlobShaGrammar:
+    """F2 -- replace/delete carry exactly 40 lowercase hex characters."""
+
+    SCHEMA = "dyhano-trusted-boundary-envelope-v1"
+    VALID_SHA = "0123456789abcdef" * 2 + "01234567"
+
+    BAD_LENGTHS = ("", "a" * 39, "a" * 41, "abc", "0" * 64)
+    BAD_GRAMMARS = ("A" * 40, "0123456789ABCDEF" * 2 + "01234567", "g" * 40,
+                    "a" * 39 + "Z", "a" * 39 + "-", "a" * 39 + " ")
+    BAD_TYPES = (None, 40, True, ["a" * 40], {"sha": "a" * 40}, b"a" * 40)
+
+    def _document(self, mutation):
+        return {"schema_version": self.SCHEMA, "mutations": [mutation]}
+
+    def _mutation(self, op, sha):
+        if op == "replace":
+            return {"op": "replace", "path": "docs/a.md",
+                    "base_blob_sha": sha, "content": "x"}
+        return {"op": "delete", "path": "docs/a.md", "base_blob_sha": sha}
+
+    def test_a_lowercase_sha40_replace_is_accepted(self, mod):
+        raw = mod.validate_envelope_document(
+            self._document(self._mutation("replace", self.VALID_SHA)),
+            262144, self.SCHEMA)
+        assert self.VALID_SHA.encode("ascii") in raw
+
+    def test_a_lowercase_sha40_delete_is_accepted(self, mod):
+        raw = mod.validate_envelope_document(
+            self._document(self._mutation("delete", self.VALID_SHA)),
+            262144, self.SCHEMA)
+        assert self.VALID_SHA.encode("ascii") in raw
+
+    @pytest.mark.parametrize("op", ["replace", "delete"])
+    @pytest.mark.parametrize("sha", BAD_LENGTHS)
+    def test_a_wrong_length_sha_is_refused(self, mod, op, sha):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(self._mutation(op, sha)), 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.mutation.base_blob_sha.length"
+
+    @pytest.mark.parametrize("op", ["replace", "delete"])
+    @pytest.mark.parametrize("sha", BAD_GRAMMARS)
+    def test_a_non_lowercase_hex_sha_is_refused(self, mod, op, sha):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(self._mutation(op, sha)), 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.mutation.base_blob_sha.grammar"
+
+    @pytest.mark.parametrize("op", ["replace", "delete"])
+    @pytest.mark.parametrize("sha", BAD_TYPES)
+    def test_a_non_string_sha_is_refused(self, mod, op, sha):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(self._mutation(op, sha)), 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.mutation.base_blob_sha.type"
+
+    def test_create_still_has_no_base_blob_sha_key(self, mod):
+        """Key closure is unchanged: a hash is not admitted onto create."""
+        mutation = {"op": "create", "path": "docs/a.md", "content": "x",
+                    "base_blob_sha": "a" * 40}
+        with pytest.raises(mod.Refusal) as caught:
+            mod.validate_envelope_document(
+                self._document(mutation), 262144, self.SCHEMA)
+        assert caught.value.code == "envelope.mutation.keys"
+
+
+class TestProducerFailsBeforeEmitting:
+    """F2 -- no framing line and no EXIT_OK for a defective envelope."""
+
+    SCHEMA = "dyhano-trusted-boundary-envelope-v1"
+    VALID_SHA = "0123456789abcdef" * 2 + "01234567"
+
+    BAD_ENVELOPES = [
+        ("wrong-schema",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v2",
+          "mutations": [{"op": "create", "path": "docs/a.md", "content": "x"}]},
+         "envelope.schema_version.value"),
+        ("nonstring-schema",
+         {"schema_version": 7,
+          "mutations": [{"op": "create", "path": "docs/a.md", "content": "x"}]},
+         "envelope.schema_version.type"),
+        ("empty-sha",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": [{"op": "delete", "path": "docs/a.md",
+                         "base_blob_sha": ""}]},
+         "envelope.mutation.base_blob_sha.length"),
+        ("short-sha",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": [{"op": "delete", "path": "docs/a.md",
+                         "base_blob_sha": "a" * 39}]},
+         "envelope.mutation.base_blob_sha.length"),
+        ("long-sha",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": [{"op": "replace", "path": "docs/a.md",
+                         "base_blob_sha": "a" * 41, "content": "x"}]},
+         "envelope.mutation.base_blob_sha.length"),
+        ("uppercase-sha",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": [{"op": "replace", "path": "docs/a.md",
+                         "base_blob_sha": "A" * 40, "content": "x"}]},
+         "envelope.mutation.base_blob_sha.grammar"),
+        ("nonhex-sha",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": [{"op": "delete", "path": "docs/a.md",
+                         "base_blob_sha": "z" * 40}]},
+         "envelope.mutation.base_blob_sha.grammar"),
+        ("nonstring-sha",
+         {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+          "mutations": [{"op": "replace", "path": "docs/a.md",
+                         "base_blob_sha": None, "content": "x"}]},
+         "envelope.mutation.base_blob_sha.type"),
+    ]
+
+    def _drive(self, mod, monkeypatch, capsys, envelope, request_bytes=None):
+        """Run the real ``main`` over a scripted conversation reply.
+
+        Only the conversation is scripted: argv, request parsing, envelope
+        validation, framing and the exit status stay the program's own.
+        Construction and the resolved surface are settled by the C14
+        subprocess controls, which stub nothing, so standing them down here
+        narrows these controls to the F2 boundary.
+        """
+        agent = _ScriptedAgent(json.dumps(envelope))
+        raw = _request_bytes() if request_bytes is None else request_bytes
+        monkeypatch.setattr(mod, "_read_stdin_bounded", lambda: raw)
+        monkeypatch.setattr(mod, "build_reduced_agent", lambda: (agent, 0))
+        monkeypatch.setattr(mod, "verify_reduced_surface", lambda constructed: {})
+        status = mod.main(["-z"])
+        return status, capsys.readouterr(), agent
+
+    def test_a_valid_envelope_still_produces_exactly_one_framed_line(
+            self, mod, monkeypatch, capsys):
+        envelope = {"schema_version": self.SCHEMA, "mutations": [
+            {"op": "replace", "path": "docs/a.md",
+             "base_blob_sha": self.VALID_SHA, "content": "hi"}]}
+        status, captured, agent = self._drive(mod, monkeypatch, capsys, envelope)
+        assert status == mod.EXIT_OK
+        assert agent.calls == 1
+        lines = captured.out.splitlines()
+        assert len(lines) == 1
+        assert lines[0].startswith(mod.FRAMING_PREFIX)
+        assert json.loads(lines[0][len(mod.FRAMING_PREFIX):]) == envelope
+
+    def test_a_valid_delete_envelope_is_framed_and_exits_ok(
+            self, mod, monkeypatch, capsys):
+        envelope = {"schema_version": self.SCHEMA, "mutations": [
+            {"op": "delete", "path": "docs/a.md",
+             "base_blob_sha": self.VALID_SHA}]}
+        status, captured, _ = self._drive(mod, monkeypatch, capsys, envelope)
+        assert status == mod.EXIT_OK
+        assert captured.out.startswith(mod.FRAMING_PREFIX)
+
+    @pytest.mark.parametrize("label,envelope,code", BAD_ENVELOPES)
+    def test_no_framed_output_and_no_exit_ok_for_a_defective_envelope(
+            self, mod, monkeypatch, capsys, label, envelope, code):
+        status, captured, agent = self._drive(mod, monkeypatch, capsys, envelope)
+        assert status == mod.EXIT_REFUSED, label
+        assert status != mod.EXIT_OK, label
+        assert captured.out == "", label
+        assert mod.FRAMING_PREFIX not in captured.out, label
+        assert code in captured.err, (label, captured.err)
+        assert agent.calls == 1, label
+
+    @pytest.mark.parametrize("label,envelope,code", BAD_ENVELOPES)
+    def test_run_proposal_refuses_the_same_defects_directly(
+            self, mod, label, envelope, code):
+        agent = _ScriptedAgent(json.dumps(envelope))
+        with pytest.raises(mod.Refusal) as caught:
+            mod.run_proposal(agent, dict(VALID_REQUEST))
+        assert caught.value.code == code, label
+
+    def test_the_producer_follows_the_requests_envelope_schema_version(
+            self, mod, monkeypatch, capsys):
+        """The request names the schema; the producer must not name its own."""
+        other = "dyhano-trusted-boundary-envelope-v2"
+        raw = _request_bytes(envelope_schema_version=other)
+        matching = {"schema_version": other, "mutations": [
+            {"op": "create", "path": "docs/a.md", "content": "x"}]}
+        status, captured, _ = self._drive(mod, monkeypatch, capsys, matching, raw)
+        assert status == mod.EXIT_OK
+        assert captured.out.startswith(mod.FRAMING_PREFIX)
+
+        stale = {"schema_version": self.SCHEMA, "mutations": [
+            {"op": "create", "path": "docs/a.md", "content": "x"}]}
+        status, captured, _ = self._drive(mod, monkeypatch, capsys, stale, raw)
+        assert status == mod.EXIT_REFUSED
+        assert captured.out == ""
+        assert "envelope.schema_version.value" in captured.err

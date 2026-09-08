@@ -268,11 +268,21 @@ def parse_request(raw):
 def _screen_request_hygiene(document):
     """Refuse a request carrying a resume/provider/credential-shaped token.
 
-    Mirrors ``dyhano_stage_a.proposal.assert_request_hygiene``: the screen
-    runs over keys and string values so neither side can smuggle one in.
+    Mirrors ``dyhano_stage_a.proposal.assert_request_hygiene`` exactly: every
+    key is screened, and so is every value except the one field the
+    controller itself exempts.  ``admitted_write_set`` carries kernel
+    contract truth -- path patterns already bounded by the envelope path
+    grammar -- and screening its members would falsely refuse ordinary
+    repository paths such as ``src/token.py`` or ``docs/provider-notes.md``.
+    The exemption is value-scoped: that key is screened like every other, and
+    every other field's scalar and list values keep being screened.
     """
+    # dyhano_stage_a.proposal._UNSCREENED_REQUEST_FIELDS -- values only.
+    unscreened_fields = frozenset(("admitted_write_set",))
     screened = list(document)
-    for value in document.values():
+    for key, value in document.items():
+        if key in unscreened_fields:
+            continue
         if type(value) is str:
             screened.append(value)
         elif type(value) is list:
@@ -300,18 +310,35 @@ def canonical_dumps(value):
     ).encode("ascii")
 
 
-def validate_envelope_document(document, max_envelope_bytes):
+def validate_envelope_document(document, max_envelope_bytes,
+                               expected_schema_version):
     """Prove an envelope well-formed and return its canonical bytes.
 
     Producer-side only.  The controller re-decides grammar, canonical byte
     identity, path closure and admission with the frozen parser and the
     kernel's own predicate; this refuses to *emit* something already known
     to be malformed rather than shipping it for the boundary to reject.
+
+    ``expected_schema_version`` is required and deliberately carries no
+    default: its only authority is the ``envelope_schema_version`` the
+    controller put in this request, and a default would silently divorce
+    the check from the request the envelope is answering.
     """
     if type(document) is not dict:
         _refuse("envelope.shape")
     if set(document) != ENVELOPE_TOP_KEYS:
         _refuse("envelope.top_keys")
+    # Frozen ``parse_envelope_bytes`` proves the schema value before it reads
+    # the mutations container, and refuses every other value outright, so
+    # emitting one would spend the single bounded attempt on a certain
+    # rejection at the controller's boundary.
+    if type(expected_schema_version) is not str or not expected_schema_version:
+        _refuse("envelope.schema_version.expected")
+    schema_version = document["schema_version"]
+    if type(schema_version) is not str:
+        _refuse("envelope.schema_version.type")
+    if schema_version != expected_schema_version:
+        _refuse("envelope.schema_version.value")
     mutations = document["mutations"]
     if type(mutations) is not list:
         _refuse("envelope.mutations.type")
@@ -335,8 +362,18 @@ def validate_envelope_document(document, max_envelope_bytes):
                 _refuse("envelope.mutation.content.type")
             if len(content.encode("utf-8")) > MAX_FILE_CONTENT_BYTES:
                 _refuse("envelope.mutation.content.length")
-        if "base_blob_sha" in mutation and type(mutation["base_blob_sha"]) is not str:
-            _refuse("envelope.mutation.base_blob_sha.type")
+        if "base_blob_sha" in mutation:
+            # Present exactly for replace/delete -- the key closure says so.
+            base_blob_sha = mutation["base_blob_sha"]
+            if type(base_blob_sha) is not str:
+                _refuse("envelope.mutation.base_blob_sha.type")
+            # Frozen ``validation.require_sha40``: exactly 40 characters from
+            # 0123456789abcdef.  Uppercase hex is a different string to the
+            # parser, so refuse it here rather than emit a certain reject.
+            if len(base_blob_sha) != 40:
+                _refuse("envelope.mutation.base_blob_sha.length")
+            if not all(c in "0123456789abcdef" for c in base_blob_sha):
+                _refuse("envelope.mutation.base_blob_sha.grammar")
         seen_segments.append(segments)
 
     # Duplicate and prefix-collision closure: two mutations may not name the
@@ -524,7 +561,9 @@ def run_proposal(agent, request):
     except ValueError:
         _refuse("attempt.result.json")
     return validate_envelope_document(
-        document, int(request["max_envelope_bytes"])
+        document,
+        int(request["max_envelope_bytes"]),
+        request["envelope_schema_version"],
     )
 
 
