@@ -188,8 +188,9 @@ class StageATextOnlyRefusal(RuntimeError):
     """Stage-A refused to run, or refused to keep running.
 
     ``code`` is drawn from a closed vocabulary so a caller can branch on the
-    reason without parsing prose.  Neither the prompt nor any upstream field
-    is interpolated into the message.
+    reason without parsing prose.  The prompt is never interpolated into the
+    message, and neither is the upstream base URL, provider or model; a
+    numeric bound may appear so the caller can see which one was violated.
     """
 
     #: Closed refusal vocabulary.
@@ -332,6 +333,12 @@ def assert_text_only_surface(agent: Any, upstream: StageAUpstream) -> None:
     if getattr(agent, "load_soul_identity", None) is not False:
         raise StageATextOnlyRefusal(
             "CONTEXT_INHERITANCE", "load_soul_identity is not False"
+        )
+    # ``agent_init`` stores this one as ``bool(skip_background_review)``, so an
+    # agent that quietly kept the auxiliary review turn is visible here.
+    if getattr(agent, "skip_background_review", None) is not True:
+        raise StageATextOnlyRefusal(
+            "CONTEXT_INHERITANCE", "skip_background_review is not True"
         )
 
     if getattr(agent, "_memory_store", None) is not None:

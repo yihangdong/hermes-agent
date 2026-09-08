@@ -60,6 +60,7 @@ class RecordingAgent:
         self.max_tokens = UPSTREAM.max_tokens
         self.skip_context_files = True
         self.load_soul_identity = False
+        self.skip_background_review = True
         self._memory_store = None
         self._memory_manager = None
         self._tool_snapshot_generation = 0
@@ -419,6 +420,22 @@ def test_empty_prompt_fails_closed(armed, prompt):
 # ---------------------------------------------------------------------------
 
 
+def test_a_refusal_never_carries_the_prompt_or_the_endpoint(armed):
+    """Refusal details are safe to log: no request text, no endpoint identity."""
+    agent = RecordingAgent(tools=[ACTION_CAPABLE_TOOL])
+
+    with pytest.raises(StageATextOnlyRefusal) as excinfo:
+        run_stage_a_proposal(
+            "a secret-looking Stage-A request", UPSTREAM, agent_factory=Factory(agent)
+        )
+
+    message = str(excinfo.value)
+    assert "secret-looking" not in message
+    assert UPSTREAM.base_url not in message
+    assert UPSTREAM.model not in message
+    assert UPSTREAM.provider not in message
+
+
 def test_verifier_accepts_the_compliant_shape():
     """Positive control for the mutation table below."""
     assert_text_only_surface(RecordingAgent(), UPSTREAM) is None
@@ -435,6 +452,7 @@ def test_verifier_accepts_the_compliant_shape():
         ({"max_tokens": 999999}, "POLICY_NOT_APPLIED"),
         ({"skip_context_files": False}, "CONTEXT_INHERITANCE"),
         ({"load_soul_identity": True}, "CONTEXT_INHERITANCE"),
+        ({"skip_background_review": False}, "CONTEXT_INHERITANCE"),
         ({"_memory_store": object()}, "MEMORY_INHERITANCE"),
         ({"_memory_manager": object()}, "MEMORY_INHERITANCE"),
     ],
