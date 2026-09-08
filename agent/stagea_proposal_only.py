@@ -134,14 +134,33 @@ MAX_ENVELOPE_PATH_SEGMENTS = 16
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# The reduced capability policy.
+# The reduced capability policy and the one dedicated route.
 #
-# Deliberately literal and deliberately empty.  Note there is no provider,
-# model, endpoint, base_url or credential here: the program supplies none
-# of those and never will.  Whatever transport the child reaches is the
-# deployment's configured one, which keeps this program free of any
-# provider or credential selector.
+# Deliberately literal.  The three route names below are not a provider or
+# model *selector*: they name the single dedicated managed Stage-A route
+# this program may speak on, fixed in source so the identity that reaches
+# request shaping is bound before the first request instead of being left
+# empty and filled in later by ambient routing.  There is still no
+# endpoint, URL, header, method, proxy, credential or fallback here -- the
+# deployment declares this route's endpoint and key under that provider
+# name, and the program refuses whatever the factory resolved if it is
+# anything other than that route.
 # ─────────────────────────────────────────────────────────────────────────
+
+#: The dedicated managed Stage-A route.  ``init_agent`` copies these into
+#: ``agent.model`` / ``agent.provider`` / ``agent.api_mode`` and asks the
+#: central router for *this* provider by name, so the resolved endpoint is
+#: the dedicated route's own rather than an ``auto`` chain's pick whose
+#: resolved model the accepted caller discards.
+STAGEA_ROUTE_MODEL = "stagea-proposal-only"
+STAGEA_ROUTE_PROVIDER = "stagea-local-relay"
+STAGEA_ROUTE_API_MODE = "chat_completions"
+
+#: Wire schemes an OpenAI-compatible Stage-A route may resolve to.  Not a
+#: URL policy -- the deployment owns the endpoint -- only a refusal of a
+#: resolved identity that is no HTTP endpoint at all (empty, or a virtual
+#: ``moa://``-style facade).
+STAGEA_ROUTE_URL_SCHEMES = ("http://", "https://")
 
 #: An empty *selection*, never ``None``.  ``model_tools`` tests
 #: ``enabled_toolsets is not None``, so ``None`` means "every toolset".
@@ -434,7 +453,17 @@ def frame_envelope(envelope_bytes):
 # ─────────────────────────────────────────────────────────────────────────
 
 def build_reduced_agent():
-    """Construct the real ``AIAgent`` through its default factory path.
+    """Construct the real ``AIAgent`` on the dedicated Stage-A route.
+
+    The three route names are passed to the unchanged factory instead of
+    being left empty.  Passing them is what makes the accepted
+    no-explicit-credentials path ask the central router for *this* provider
+    by name rather than run the ``auto`` chain and then discard the model
+    it resolved -- which is how an empty model identity reached request
+    shaping.  Nothing here supplies a URL, header, key or fallback: the
+    deployment still owns the endpoint and credential, and
+    :func:`verify_route_identity` refuses if what came back is not exactly
+    this route.
 
     Returns ``(agent, attempted_egress)``.  ``run_agent`` is imported here
     rather than at module scope so importing this module stays cheap and
@@ -446,7 +475,9 @@ def build_reduced_agent():
         with guard, contextlib.redirect_stdout(captured):
             from run_agent import AIAgent
             agent = AIAgent(
-                model="",
+                model=STAGEA_ROUTE_MODEL,
+                provider=STAGEA_ROUTE_PROVIDER,
+                api_mode=STAGEA_ROUTE_API_MODE,
                 max_iterations=REDUCED_MAX_ITERATIONS,
                 enabled_toolsets=REDUCED_ENABLED_TOOLSETS,
                 skip_context_files=True,
@@ -510,6 +541,70 @@ def verify_reduced_surface(agent):
     if not surface["skip_background_review"]:
         _refuse("reduced.background_review.enabled")
     return surface
+
+
+def describe_route_identity(agent):
+    """Read the *resolved* route identity off the constructed object.
+
+    Same rule as :func:`describe_resolved_surface`: every value is read back
+    from the agent -- and from the client the factory actually built --
+    never from the arguments passed in.  ``model`` is what the request
+    builder puts on the wire for every API-mode branch; ``api_mode`` and
+    ``base_url`` pick the transport and the endpoint it posts to.
+    """
+    client = getattr(agent, "client", None)
+    client_base_url = getattr(client, "base_url", None)
+    return {
+        "model": getattr(agent, "model", None),
+        "provider": getattr(agent, "provider", None),
+        "requested_provider": getattr(agent, "requested_provider", None),
+        "api_mode": getattr(agent, "api_mode", None),
+        "base_url": getattr(agent, "base_url", None),
+        "client_base_url": (None if client_base_url is None
+                            else str(client_base_url)),
+        "fallback_activated": bool(getattr(agent, "_fallback_activated", False)),
+    }
+
+
+def verify_route_identity(agent):
+    """Refuse unless the resolved identity is exactly the dedicated route.
+
+    Runs before the first conversation, so a run that would otherwise emit a
+    request carrying an empty model, an ambiently resolved provider, a
+    substituted API mode or an init-time fallback route refuses instead of
+    speaking to it.  Every comparison is exact: no prefix match, no case
+    folding, no default.
+
+    The base URL is the deployment's to declare, so it is verified by
+    provenance and agreement rather than a pinned literal: the router was
+    asked for the dedicated provider by name, the resolved endpoint must be
+    a real non-empty HTTP endpoint, and the object used for request shaping
+    and the client that will carry the request must name the same one.
+    """
+    identity = describe_route_identity(agent)
+    if identity["fallback_activated"]:
+        _refuse("route.fallback.activated")
+    if identity["model"] != STAGEA_ROUTE_MODEL:
+        _refuse("route.model.mismatch")
+    if identity["provider"] != STAGEA_ROUTE_PROVIDER:
+        _refuse("route.provider.mismatch")
+    if identity["requested_provider"] != STAGEA_ROUTE_PROVIDER:
+        # A differing *requested* provider means the effective route was
+        # canonicalized or re-pointed after this program named it.
+        _refuse("route.requested_provider.mismatch")
+    if identity["api_mode"] != STAGEA_ROUTE_API_MODE:
+        _refuse("route.api_mode.mismatch")
+    base_url = identity["base_url"]
+    if type(base_url) is not str or not base_url:
+        _refuse("route.base_url.absent")
+    if not base_url.lower().startswith(STAGEA_ROUTE_URL_SCHEMES):
+        _refuse("route.base_url.scheme")
+    client_base_url = identity["client_base_url"]
+    if type(client_base_url) is not str or not client_base_url:
+        _refuse("route.client.absent")
+    if client_base_url.rstrip("/") != base_url.rstrip("/"):
+        _refuse("route.client.base_url_mismatch")
+    return identity
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -597,6 +692,9 @@ def main(argv=None):
             # established.  Fail closed instead.
             _refuse("construction.egress_attempted")
         verify_reduced_surface(agent)
+        # Bind-then-verify, before the first conversation: an empty or
+        # ambiently resolved identity must refuse rather than be sent.
+        verify_route_identity(agent)
 
         line = frame_envelope(run_proposal(agent, request))
     except Refusal as refusal:

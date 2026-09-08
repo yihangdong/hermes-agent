@@ -1428,15 +1428,21 @@ class TestProducerFailsBeforeEmitting:
 
         Only the conversation is scripted: argv, request parsing, envelope
         validation, framing and the exit status stay the program's own.
-        Construction and the resolved surface are settled by the C14
-        subprocess controls, which stub nothing, so standing them down here
-        narrows these controls to the F2 boundary.
+        Construction, the resolved surface and the resolved route identity
+        are settled by the C14 subprocess controls and the offline
+        transport controls at the end of this file, which stub nothing
+        below the HTTP send, so standing them down here narrows these
+        controls to the F2 boundary.
         """
         agent = _ScriptedAgent(json.dumps(envelope))
         raw = _request_bytes() if request_bytes is None else request_bytes
         monkeypatch.setattr(mod, "_read_stdin_bounded", lambda: raw)
         monkeypatch.setattr(mod, "build_reduced_agent", lambda: (agent, 0))
         monkeypatch.setattr(mod, "verify_reduced_surface", lambda constructed: {})
+        # Same stand-down, same reason, for the route-identity gate: a
+        # scripted conversation surface carries no resolved route, and the
+        # real binding is proven by the offline transport controls below.
+        monkeypatch.setattr(mod, "verify_route_identity", lambda constructed: {})
         status = mod.main(["-z"])
         return status, capsys.readouterr(), agent
 
@@ -1498,3 +1504,384 @@ class TestProducerFailsBeforeEmitting:
         assert status == mod.EXIT_REFUSED
         assert captured.out == ""
         assert "envelope.schema_version.value" in captured.err
+
+
+# =========================================================================
+# F-1 -- the REAL first proposal turn, observed at the transport boundary
+# =========================================================================
+
+#: The dedicated route the test-local relay configuration declares.  Written
+#: out here rather than imported, so these controls compare the resolved
+#: identity against the configuration and not against the producer's own
+#: constant.
+RELAY_MODEL = "stagea-proposal-only"
+RELAY_PROVIDER = "stagea-local-relay"
+RELAY_API_MODE = "chat_completions"
+RELAY_BASE_URL = "http://127.0.0.1:18731/v1"
+
+#: The exact block of ``OBSERVER_SOURCE`` that stands ``run_conversation``
+#: down.  C14 needs it -- it proves construction never reaches a
+#: conversation.  These controls need the opposite, so exactly this block is
+#: swapped for the instrument below and nothing else changes.
+_RUN_CONVERSATION_DENIAL = '''    def _counted_run_conversation(self, *args, **kwargs):
+        STATE["run_conversation"] += 1
+        raise Denied("run_conversation must not be reached in these controls")
+
+    run_agent.AIAgent.run_conversation = _counted_run_conversation
+'''
+
+#: Offline transport instrument: it sits at ``httpx.Client.send`` -- below
+#: the agent, the conversation loop, the request builder and the transport,
+#: and above the socket the observer already denies and counts.  Every field
+#: asserted from it is a field a provider would have received, and the call
+#: is answered from memory so nothing is contacted.  ``run_conversation`` is
+#: only counted and snapshotted, never replaced.
+_PROPOSAL_TURN_INSTRUMENT = r'''    import datetime
+
+    import httpx
+
+    STATE["requests"] = []
+    STATE["route_identity"] = None
+
+    OFFLINE_ENVELOPE = json.dumps(
+        {"schema_version": "dyhano-trusted-boundary-envelope-v1",
+         "mutations": [{"op": "create", "path": "docs/a.md", "content": "hi"}]},
+        sort_keys=True, separators=(",", ":"))
+
+    def _offline_reply(request, body):
+        model = body.get("model") or ""
+        if body.get("stream"):
+            chunks = [
+                {"id": "stagea-offline", "object": "chat.completion.chunk",
+                 "created": 0, "model": model,
+                 "choices": [{"index": 0, "finish_reason": None,
+                              "delta": {"role": "assistant",
+                                        "content": OFFLINE_ENVELOPE}}]},
+                {"id": "stagea-offline", "object": "chat.completion.chunk",
+                 "created": 0, "model": model,
+                 "choices": [{"index": 0, "finish_reason": "stop",
+                              "delta": {}}]},
+            ]
+            payload = "".join("data: %s\n\n" % json.dumps(c) for c in chunks)
+            payload += "data: [DONE]\n\n"
+            response = httpx.Response(
+                200, request=request,
+                headers={"content-type": "text/event-stream"},
+                content=payload.encode("utf-8"))
+        else:
+            response = httpx.Response(200, request=request, json={
+                "id": "stagea-offline", "object": "chat.completion",
+                "created": 0, "model": model,
+                "choices": [{"index": 0, "finish_reason": "stop",
+                             "message": {"role": "assistant",
+                                         "content": OFFLINE_ENVELOPE}}],
+                "usage": {"prompt_tokens": 0, "completion_tokens": 0,
+                          "total_tokens": 0}})
+        try:
+            response.elapsed = datetime.timedelta(0)
+        except Exception:
+            pass
+        return response
+
+    def _capture_send(original):
+        def send(self, request, *args, **kwargs):
+            try:
+                raw = request.content
+            except Exception:
+                raw = b""
+            try:
+                body = json.loads(raw.decode("utf-8"))
+            except Exception:
+                body = None
+            STATE["requests"].append({
+                "method": request.method,
+                "url": str(request.url),
+                "header_names": sorted({n.lower() for n in request.headers}),
+                "body": body if isinstance(body, dict) else {},
+                "body_parsed": isinstance(body, dict),
+            })
+            return _offline_reply(request, body if isinstance(body, dict) else {})
+        return send
+
+    httpx.Client.send = _capture_send(httpx.Client.send)
+
+    _real_run_conversation = run_agent.AIAgent.run_conversation
+
+    def _observed_run_conversation(self, *args, **kwargs):
+        import agent.stagea_proposal_only as _program
+
+        STATE["run_conversation"] += 1
+        STATE["route_identity"] = _program.describe_route_identity(self)
+        return _real_run_conversation(self, *args, **kwargs)
+
+    run_agent.AIAgent.run_conversation = _observed_run_conversation
+'''
+
+PROPOSAL_TURN_OBSERVER_SOURCE = OBSERVER_SOURCE.replace(
+    _RUN_CONVERSATION_DENIAL, _PROPOSAL_TURN_INSTRUMENT)
+
+
+class TestProposalTurnObserverComposition:
+    """A drifted observer must fail loudly, not silently no-op."""
+
+    def test_exactly_one_denial_block_is_swapped_for_the_instrument(self):
+        assert OBSERVER_SOURCE.count(_RUN_CONVERSATION_DENIAL) == 1
+        assert PROPOSAL_TURN_OBSERVER_SOURCE != OBSERVER_SOURCE
+        assert _RUN_CONVERSATION_DENIAL not in PROPOSAL_TURN_OBSERVER_SOURCE
+        assert "httpx.Client.send = _capture_send" in PROPOSAL_TURN_OBSERVER_SOURCE
+        assert "ALWAYS_PROHIBITED" in PROPOSAL_TURN_OBSERVER_SOURCE
+        assert "_guard_network" in PROPOSAL_TURN_OBSERVER_SOURCE
+        assert 'program.main(["-z"])' in PROPOSAL_TURN_OBSERVER_SOURCE
+
+
+class TestRealProposalTurnRouteIdentity:
+    """The real first proposal request, captured offline.
+
+    Nothing in the turn is scripted: the real entrypoint reads the real
+    request, the real factory builds the real ``AIAgent`` on the dedicated
+    route, and the real ``run_conversation`` shapes the real request.  Only
+    the HTTP send is answered from memory, so this is the first-request
+    identity transition itself, not a stand-in for it.
+    """
+
+    def _run(self, tmp_path):
+        root = _hermetic_root(tmp_path)
+        _write_relay_config(root, hardened=True)
+        completed, report = _run_observed(
+            root, "main", stdin=_request_bytes(),
+            script=PROPOSAL_TURN_OBSERVER_SOURCE)
+        assert report is not None, completed.stderr.decode()[-2000:]
+        assert report.get("error") is None, report.get("error")
+        return completed, report
+
+    def test_exactly_one_request_reaches_the_transport_boundary(self, tmp_path):
+        _, report = self._run(tmp_path)
+        assert report["run_conversation"] == 1
+        assert len(report["requests"]) == 1, report["requests"]
+        assert report["requests"][0]["body_parsed"] is True
+
+    def test_the_first_request_carries_the_exact_nonempty_model(self, tmp_path):
+        """F-1 directly: an empty ``model`` used to go on the wire here."""
+        _, report = self._run(tmp_path)
+        body = report["requests"][0]["body"]
+        assert body.get("model") == RELAY_MODEL
+        assert body.get("model") not in (None, "")
+
+    def test_the_first_request_goes_to_the_dedicated_route_endpoint(self, tmp_path):
+        _, report = self._run(tmp_path)
+        entry = report["requests"][0]
+        assert entry["method"] == "POST"
+        assert entry["url"].startswith(RELAY_BASE_URL + "/"), entry["url"]
+        assert entry["url"].endswith("/chat/completions"), entry["url"]
+
+    def test_the_resolved_identity_at_the_turn_is_the_dedicated_route(self, tmp_path):
+        _, report = self._run(tmp_path)
+        identity = report["route_identity"]
+        assert identity is not None, "the turn never started"
+        assert identity["model"] == RELAY_MODEL
+        assert identity["provider"] == RELAY_PROVIDER
+        assert identity["requested_provider"] == RELAY_PROVIDER
+        assert identity["api_mode"] == RELAY_API_MODE
+        assert identity["fallback_activated"] is False
+        assert identity["base_url"].rstrip("/") == RELAY_BASE_URL
+        assert identity["client_base_url"].rstrip("/") == RELAY_BASE_URL
+
+    def test_the_first_request_declares_no_tools(self, tmp_path):
+        _, report = self._run(tmp_path)
+        body = report["requests"][0]["body"]
+        assert body.get("tools") in (None, []), body.get("tools")
+        assert body.get("functions") in (None, [])
+        assert not body.get("tool_choice")
+
+    def test_the_first_request_is_the_producers_own_bounded_prompt(self, tmp_path):
+        _, report = self._run(tmp_path)
+        messages = report["requests"][0]["body"]["messages"]
+        assert messages
+        roles = {message.get("role") for message in messages}
+        assert roles <= {"system", "developer", "user"}, roles
+        joined = "\n".join(
+            message.get("content") if isinstance(message.get("content"), str)
+            else json.dumps(message.get("content"))
+            for message in messages)
+        assert "You produce exactly one Stage-A mutation envelope" in joined
+        assert "Stage-A proposal request:" in joined
+        assert '"action_id":"act-0001"' in joined
+        assert "Produce the envelope now." in joined
+
+    def test_no_auxiliary_provider_account_or_plugin_request_is_made(self, tmp_path):
+        _, report = self._run(tmp_path)
+        urls = [entry["url"] for entry in report["requests"]]
+        assert len(urls) == 1, urls
+        assert report["network"] == [], report["network"]
+        _assert_no_prohibited_access(report)
+
+    def test_nothing_left_the_process_during_the_whole_turn(self, tmp_path):
+        _, report = self._run(tmp_path)
+        assert report["network"] == []
+        assert report["prohibited"] == []
+        assert report["fired"], "no monitored class fired at all"
+
+    def test_the_offline_turn_emits_exactly_one_framed_proposal_line(self, tmp_path):
+        completed, report = self._run(tmp_path)
+        assert report["exit_code"] == 0, completed.stderr.decode()[-2000:]
+        lines = completed.stdout.decode("utf-8").splitlines()
+        assert len(lines) == 1, lines
+        prefix = "DYHANO-STAGE-A-PROPOSAL-V1 "
+        assert lines[0].startswith(prefix)
+        assert json.loads(lines[0][len(prefix):]) == {
+            "schema_version": "dyhano-trusted-boundary-envelope-v1",
+            "mutations": [{"op": "create", "path": "docs/a.md",
+                           "content": "hi"}]}
+
+
+class _RouteClient:
+    def __init__(self, base_url):
+        self.base_url = base_url
+
+
+class _RouteAgent:
+    """Exercises the route verifier only; it never stands in for the factory.
+
+    It also carries a fully reduced surface so ``main`` reaches the route
+    gate instead of refusing earlier for an unrelated reason.
+    """
+
+    def __init__(self, **attributes):
+        defaults = {
+            "model": RELAY_MODEL, "provider": RELAY_PROVIDER,
+            "requested_provider": RELAY_PROVIDER, "api_mode": RELAY_API_MODE,
+            "base_url": RELAY_BASE_URL, "client": _RouteClient(RELAY_BASE_URL),
+            "_fallback_activated": False,
+            "tools": [], "valid_tool_names": set(), "enabled_toolsets": [],
+            "max_iterations": 1, "_memory_enabled": False,
+            "_memory_manager": None, "_memory_store": None,
+            "load_soul_identity": False, "skip_context_files": True,
+            "skip_background_review": True,
+        }
+        defaults.update(attributes)
+        for key, value in defaults.items():
+            setattr(self, key, value)
+        self.calls = 0
+
+    def run_conversation(self, prompt, system_message=None):
+        self.calls += 1
+        return {"response": json.dumps({
+            "schema_version": VALID_REQUEST["envelope_schema_version"],
+            "mutations": [{"op": "create", "path": "docs/a.md",
+                           "content": "hi"}]})}
+
+
+class TestRouteIdentityVerifier:
+    """The verifier reads the RESOLVED identity and fails closed."""
+
+    def test_accepts_exactly_the_dedicated_route(self, mod):
+        identity = mod.verify_route_identity(_RouteAgent())
+        assert identity["model"] == mod.STAGEA_ROUTE_MODEL
+        assert identity["provider"] == mod.STAGEA_ROUTE_PROVIDER
+        assert identity["api_mode"] == mod.STAGEA_ROUTE_API_MODE
+
+    def test_the_producer_names_the_same_route_the_deployment_declares(self, mod):
+        assert mod.STAGEA_ROUTE_MODEL == RELAY_MODEL
+        assert mod.STAGEA_ROUTE_PROVIDER == RELAY_PROVIDER
+        assert mod.STAGEA_ROUTE_API_MODE == RELAY_API_MODE
+
+    def test_the_route_names_are_nonempty_and_carry_no_endpoint_or_secret(self, mod):
+        names = (mod.STAGEA_ROUTE_MODEL, mod.STAGEA_ROUTE_PROVIDER,
+                 mod.STAGEA_ROUTE_API_MODE)
+        for value in names:
+            assert isinstance(value, str)
+            assert value and value.strip() == value
+        joined = " ".join(names).lower()
+        for token in ("http://", "https://", "api_key", "apikey", "token",
+                      "secret", "bearer", "password", "credential"):
+            assert token not in joined, token
+
+    @pytest.mark.parametrize("attributes,code", [
+        ({"_fallback_activated": True}, "route.fallback.activated"),
+        ({"model": ""}, "route.model.mismatch"),
+        ({"model": None}, "route.model.mismatch"),
+        ({"model": "gpt-4o"}, "route.model.mismatch"),
+        ({"model": "stagea-proposal-only "}, "route.model.mismatch"),
+        ({"provider": ""}, "route.provider.mismatch"),
+        ({"provider": "auto"}, "route.provider.mismatch"),
+        ({"requested_provider": "openrouter"},
+         "route.requested_provider.mismatch"),
+        ({"api_mode": ""}, "route.api_mode.mismatch"),
+        ({"api_mode": "codex_responses"}, "route.api_mode.mismatch"),
+        ({"base_url": ""}, "route.base_url.absent"),
+        ({"base_url": None}, "route.base_url.absent"),
+        ({"base_url": "moa://local", "client": _RouteClient("moa://local")},
+         "route.base_url.scheme"),
+        ({"client": None}, "route.client.absent"),
+        ({"client": _RouteClient("http://127.0.0.1:18731/v2")},
+         "route.client.base_url_mismatch"),
+    ])
+    def test_refuses_every_identity_that_is_not_the_dedicated_route(
+            self, mod, attributes, code):
+        with pytest.raises(mod.Refusal) as caught:
+            mod.verify_route_identity(_RouteAgent(**attributes))
+        assert caught.value.code == code
+
+    def test_the_exact_finding_shape_is_refused(self, mod):
+        """F-1's own shape: empty model, empty provider, no base URL."""
+        with pytest.raises(mod.Refusal) as caught:
+            mod.verify_route_identity(_RouteAgent(
+                model="", provider="", requested_provider="",
+                base_url="", client=None))
+        assert caught.value.code == "route.model.mismatch"
+
+    def test_describe_reads_the_object_not_the_arguments(self, mod):
+        identity = mod.describe_route_identity(_RouteAgent(model="other-model"))
+        assert identity["model"] == "other-model"
+        assert identity["client_base_url"] == RELAY_BASE_URL
+        assert identity["fallback_activated"] is False
+
+    def test_a_missing_attribute_is_refused_rather_than_defaulted(self, mod):
+        class _Bare:
+            pass
+
+        with pytest.raises(mod.Refusal) as caught:
+            mod.verify_route_identity(_Bare())
+        assert caught.value.code == "route.model.mismatch"
+
+
+class TestMainBindsTheRouteBeforeTheFirstConversation:
+    """Ordering control only: the gate runs before any conversation starts.
+
+    These script the conversation surface, so they are NOT coverage of the
+    first-request identity transition -- ``TestRealProposalTurnRouteIdentity``
+    above is, and it stubs nothing below the HTTP send.
+    """
+
+    def _drive(self, mod, monkeypatch, agent):
+        monkeypatch.setattr(mod, "_read_stdin_bounded", lambda: _request_bytes())
+        monkeypatch.setattr(mod, "build_reduced_agent", lambda: (agent, 0))
+        return mod.main(["-z"])
+
+    @pytest.mark.parametrize("attributes,code", [
+        ({"model": ""}, "route.model.mismatch"),
+        ({"provider": ""}, "route.provider.mismatch"),
+        ({"api_mode": "codex_responses"}, "route.api_mode.mismatch"),
+        ({"base_url": ""}, "route.base_url.absent"),
+        ({"client": None}, "route.client.absent"),
+        ({"_fallback_activated": True}, "route.fallback.activated"),
+    ])
+    def test_every_route_defect_fails_closed_before_the_first_request(
+            self, mod, monkeypatch, capsys, attributes, code):
+        agent = _RouteAgent(**attributes)
+        status = self._drive(mod, monkeypatch, agent)
+        captured = capsys.readouterr()
+        assert status == mod.EXIT_REFUSED
+        assert agent.calls == 0
+        assert captured.out == ""
+        assert code in captured.err
+
+    def test_the_gate_is_not_a_blanket_refusal(self, mod, monkeypatch, capsys):
+        """Positive control: the dedicated route still runs its one turn."""
+        agent = _RouteAgent()
+        status = self._drive(mod, monkeypatch, agent)
+        captured = capsys.readouterr()
+        assert status == mod.EXIT_OK
+        assert agent.calls == 1
+        assert captured.out.startswith(mod.FRAMING_PREFIX)
+        assert len(captured.out.splitlines()) == 1
