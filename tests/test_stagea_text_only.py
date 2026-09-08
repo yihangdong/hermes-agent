@@ -62,6 +62,7 @@ class RecordingAgent:
         self.load_soul_identity = False
         self._memory_store = None
         self._memory_manager = None
+        self._tool_snapshot_generation = 0
         self.closed = False
         self.conversations = []
         self.response = "PROPOSAL: do the thing, then have someone check it."
@@ -454,6 +455,42 @@ def test_a_noncompliant_agent_never_reaches_the_model(armed, override, code):
     assert factory.calls, "the refusal must come from the resolved agent, not the args"
     assert agent.conversations == [], "no model call may happen after a refusal"
     assert agent.closed is True, "the refused agent must still be released"
+
+
+def test_the_accepted_late_binding_rebuild_keeps_the_surface_empty():
+    """The surface is verified once at construction — the rebuild must agree.
+
+    ``tools.mcp_tool.refresh_agent_mcp_tools`` re-derives an already-built
+    agent's tool snapshot from the live registry: MCP servers that connect
+    after the build, ``/reload-mcp``, the late-binding thread, the
+    between-turns prologue. It reuses the agent's own ``enabled_toolsets``, so
+    the empty selection has to survive it. If it did not, an agent verified at
+    construction could regain tools before its single model call.
+    """
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    agent = RecordingAgent()
+
+    added = refresh_agent_mcp_tools(agent, quiet_mode=True)
+
+    assert added == set()
+    assert agent.tools == []
+    assert agent.valid_tool_names == set()
+    assert_text_only_surface(agent, UPSTREAM) is None
+
+
+def test_the_late_binding_rebuild_would_have_repopulated_an_absent_selection():
+    """Positive control for the test above: the rebuild really does rebuild."""
+    from tools.mcp_tool import refresh_agent_mcp_tools
+
+    agent = RecordingAgent(enabled_toolsets=None)
+
+    refresh_agent_mcp_tools(agent, quiet_mode=True)
+
+    assert agent.valid_tool_names, "an absent selection should rebuild to a full surface"
+    with pytest.raises(StageATextOnlyRefusal) as excinfo:
+        assert_text_only_surface(agent, UPSTREAM)
+    assert excinfo.value.code == "TOOL_SURFACE_PRESENT"
 
 
 def test_action_capable_tool_names_are_reported_on_refusal(armed):
