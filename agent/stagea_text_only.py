@@ -164,8 +164,13 @@ STAGE_A_TEXT_ONLY_POLICY: Mapping[str, Any] = MappingProxyType(
     }
 )
 
-#: The only system message a Stage-A run may carry.  Deliberately a constant:
-#: a caller-supplied system message would be another ambient-instruction seam.
+#: The only *caller-supplied* system message a Stage-A run may carry.
+#: Deliberately a constant with no injection seam --- a caller-chosen system
+#: message would be another ambient-instruction source.  ``system_prompt.py``
+#: appends it to Hermes' own base identity and guidance rather than replacing
+#: them; what this policy removes from that prompt is SOUL.md, the AGENTS.md
+#: chain, project rules, the skills index, the memory snapshot and the user
+#: profile (see ``skip_context_files`` / ``load_soul_identity`` / ``skip_memory``).
 STAGE_A_SYSTEM_PROMPT = (
     "You are answering a Stage-A request in proposal-only mode.\n"
     "\n"

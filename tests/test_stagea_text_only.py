@@ -353,6 +353,19 @@ def test_default_factory_targets_the_accepted_agent():
     assert "AIAgent(**kwargs)" in source
 
 
+def test_no_session_store_is_wired():
+    """Leaving the session store unset keeps auxiliary titling off the path.
+
+    ``agent/turn_context.py`` calls ``title_generator.maybe_auto_title`` at the
+    start of a turn, and that helper returns immediately on a falsy
+    ``session_db``. ``agent_init`` never creates one by itself
+    (``agent._session_db = session_db``), so not passing one is what keeps the
+    auxiliary title model call from firing --- unlike the accepted oneshot
+    path, which builds a SessionDB explicitly.
+    """
+    assert "session_db" not in stage_a_agent_kwargs(UPSTREAM)
+
+
 def test_source_supplies_no_endpoint_or_model_default():
     """F1: source binds the shape, runtime supplies the value."""
     for field in ("base_url", "model", "provider", "max_tokens"):
