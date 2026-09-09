@@ -1133,6 +1133,59 @@ def _release_compression_admission(_future=None) -> None:
             _compress_admitted_count -= 1
 
 
+class _CompressionAdmissionTicket:
+    """Exactly-once handle on ONE admitted compression job's slot.
+
+    The slot is freed by whichever of the future's done-callback or the host's
+    settled-future reclamation runs first; the loser is a no-op. The flag test
+    and the decrement both happen under ``_compress_admission_lock``, so one
+    admitted future can never release two slots (and never fewer than one).
+    """
+
+    __slots__ = ("_released",)
+
+    def __init__(self) -> None:
+        self._released = False
+
+    def release(self, _future=None) -> None:
+        """Free this job's slot at most once (done-callback signature)."""
+        global _compress_admitted_count
+        with _compress_admission_lock:
+            if self._released:
+                return
+            self._released = True
+            if _compress_admitted_count > 0:
+                _compress_admitted_count -= 1
+
+
+def _admit_compression_job() -> Optional[_CompressionAdmissionTicket]:
+    """Reserve one bounded slot, returning its exactly-once ticket or None."""
+    if not _try_admit_compression_job():
+        return None
+    return _CompressionAdmissionTicket()
+
+
+def _reclaim_settled_admission(admission, future) -> bool:
+    """Return a SETTLED future's admission slot without awaiting its callback.
+
+    Deep F1: a standard ``Future`` becomes FINISHED and wakes its waiters
+    BEFORE ``_invoke_callbacks()`` runs, so a woken host can observe
+    ``done() is True`` while ``_CompressionAdmissionTicket.release`` has not
+    yet returned this attempt's slot. With the other three slots occupied that
+    stale count refused the one permitted fallback as ``pool_saturated``.
+
+    This is reclamation, not oversubscription: it fires ONLY for a future that
+    has already settled (result, raise or pre-start cancellation), i.e. whose
+    callable has returned, so at most ``_COMPRESS_EXECUTOR_MAX_WORKERS``
+    UNFINISHED jobs stay admitted. The cap, the fail-closed refusal and the
+    no-stale-queue contract are unchanged, and the pending callback no-ops.
+    """
+    if admission is None or not future.done():
+        return False
+    admission.release()
+    return True
+
+
 def _get_compress_timeout_executor():
     """Return the process-wide compress-timeout DaemonThreadPoolExecutor."""
     global _compress_timeout_executor
@@ -1558,7 +1611,8 @@ def run_compress_context_with_progress_timeout(
     # slot is occupied. A queued job would silently wait out its whole budget
     # without starting and stay eligible to run as a stale cancelled job when
     # a worker recovers. Fail fast: continue without compression this cycle.
-    if not _try_admit_compression_job():
+    admission = _admit_compression_job()
+    if admission is None:
         logger.warning(
             "Context compression pool saturated (%d workers busy) — "
             "refusing new compression this cycle and continuing without "
@@ -1610,9 +1664,11 @@ def run_compress_context_with_progress_timeout(
             propagate_context_to_thread(_fence_gated_worker), fence
         )
     except BaseException:
-        _release_compression_admission()
+        admission.release()
         raise
-    future.add_done_callback(_release_compression_admission)
+    # Exactly-once release: whichever of this callback or the host's settled
+    # future reclamation runs first frees the slot; the other becomes a no-op.
+    future.add_done_callback(admission.release)
     wait_started = attempt_epoch
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
@@ -1826,6 +1882,13 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        # Deep F1: this future can be FINISHED (and this host already woken)
+        # BEFORE its admission done-callback runs, so the shared counter may
+        # still hold THIS attempt's slot. With the other three slots occupied
+        # that spuriously refuses the one permitted fallback as saturated.
+        # Reclaim our own slot here — exactly once, and only for an already
+        # settled future, so the four-job cap and fail-closed saturation hold.
+        _reclaim_settled_admission(admission, future)
         # The durable lease is free again (above), so a fallback attempt can
         # acquire it immediately. Run it BEFORE on_timeout: that callback
         # records the summary-failure cooldown, which would make the retry's

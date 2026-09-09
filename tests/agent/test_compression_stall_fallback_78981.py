@@ -271,6 +271,174 @@ def test_fallback_that_also_stalls_degrades_after_one_attempt():
 
 
 # ---------------------------------------------------------------------------
+# Deep F1: a FINISHED primary must not hold its slot against the one fallback
+# ---------------------------------------------------------------------------
+
+
+class _CallbackWithheldFuture:
+    """Future proxy that withholds the wrapper's admission done-callback.
+
+    ``Future.set_result``/``set_exception`` mark the future FINISHED and wake
+    its waiters BEFORE ``_invoke_callbacks()`` runs, so a woken host can
+    legitimately observe ``done() is True`` while the admission slot is still
+    held. Withholding the callback pins that schedule deterministically (a
+    strictly worse lag than any real one) instead of racing for it.
+    """
+
+    def __init__(self, future, withheld):
+        self._future = future
+        self._withheld = withheld
+
+    def add_done_callback(self, fn):
+        self._withheld.append(fn)
+
+    def __getattr__(self, name):
+        return getattr(self._future, name)
+
+
+class _CallbackWithheldExecutor:
+    def __init__(self, executor, withheld):
+        self._executor = executor
+        self._withheld = withheld
+
+    def submit(self, fn, *args, **kwargs):
+        return _CallbackWithheldFuture(
+            self._executor.submit(fn, *args, **kwargs), self._withheld
+        )
+
+
+class _StallsUntilHostGivesUpWorker:
+    """Primary that streams progress, then FINISHES the instant the host has
+    stopped waiting; the fallback attempt commits a real summary."""
+
+    def __init__(self, compressed):
+        self.compressed = compressed
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.finished = threading.Event()
+        self.attempts = 0
+        self.admitted_at_start = []
+        self.fifth_admissions = []
+        self._lock = threading.Lock()
+
+    def __call__(self, fence: CompressionCommitFence):
+        with self._lock:
+            self.attempts += 1
+            attempt = self.attempts
+        with cc._compress_admission_lock:
+            self.admitted_at_start.append(cc._compress_admitted_count)
+        # A fifth job must never be admissible while four are admitted.
+        extra = cc._try_admit_compression_job()
+        self.fifth_admissions.append(extra)
+        if extra:
+            cc._release_compression_admission()
+        if attempt == 1:
+            self.entered.set()
+            # Continuous progress keeps the idle budget alive so only the
+            # TOTAL ceiling expires; the host releases this worker once it has
+            # stopped waiting, settling the future with its callback withheld.
+            while not self.release.wait(timeout=0.02):
+                fence.touch_progress()
+            self.finished.set()
+            return ([{"role": "assistant", "content": "late"}], "late-prompt")
+        if not fence.begin_commit():
+            return ([{"role": "assistant", "content": "cancelled"}], "cancelled")
+        try:
+            return (self.compressed, "summarized-prompt")
+        finally:
+            fence.finish_commit()
+
+
+def test_finished_primary_slot_is_reclaimed_for_the_one_fallback():
+    """The single fallback must survive FINISHED-before-callback at capacity.
+
+    With the other three slots occupied, a host that woke on the primary's
+    FINISHED future while its admission callback was still pending read a
+    stale count of four and refused the one permitted fallback as
+    ``pool_saturated`` — the fallback opportunity was lost with no fifth job
+    ever running.
+    """
+    original = [{"role": "user", "content": "keep-me"}]
+    compressed = [{"role": "user", "content": "summary of earlier turns"}]
+    worker = _StallsUntilHostGivesUpWorker(compressed)
+    timeouts = []
+    withheld = []
+    cap = cc._COMPRESS_EXECUTOR_MAX_WORKERS
+    others = 0
+
+    def _host_stopped_waiting(_total_exhausted, _progress_observed):
+        # Host-side barrier: the wait loop has already ended here, so the
+        # primary settles strictly before the teardown join and the fallback.
+        assert worker.entered.wait(timeout=5)
+        worker.release.set()
+        assert worker.finished.wait(timeout=5)
+
+    real_executor = cc._get_compress_timeout_executor
+    try:
+        # Precondition (existing drain idiom): start from an idle pool.
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with cc._compress_admission_lock:
+                if cc._compress_admitted_count == 0:
+                    break
+            time.sleep(0.02)
+        with cc._compress_admission_lock:
+            assert cc._compress_admitted_count == 0, "pool did not drain"
+        # Occupy the other three slots: the counter is the contended
+        # resource, so no real peer worker is needed to model them.
+        for _ in range(cap - 1):
+            assert cc._try_admit_compression_job()
+            others += 1
+
+        with patch.object(
+            cc,
+            "_get_compress_timeout_executor",
+            lambda: _CallbackWithheldExecutor(real_executor(), withheld),
+        ), _patch_chain([CHAIN_ENTRY]):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=worker,
+                messages=original,
+                system_prompt_fallback="degraded-prompt",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                on_timeout=lambda *args: timeouts.append(args),
+                on_timeout_cause=_host_stopped_waiting,
+            )
+
+        assert worker.attempts == 2, (
+            "the one permitted fallback was refused while the settled "
+            "primary's admission callback was still pending"
+        )
+        assert msgs == compressed and prompt == "summarized-prompt"
+        assert not timeouts, "a recovered fallback is not a degrade"
+        assert worker.admitted_at_start == [cap, cap], (
+            "the cap must hold and the settled primary's slot must be "
+            "reclaimed before the fallback is admitted"
+        )
+        assert worker.fifth_admissions == [False, False], (
+            "a fifth compression job was admitted"
+        )
+        assert len(withheld) == 2, "one admission callback per admitted future"
+        # Exactly-once: the primary's withheld callback is a no-op (the host
+        # already reclaimed that slot); only the fallback's slot is freed.
+        for callback in withheld:
+            callback(None)
+        withheld.clear()
+        with cc._compress_admission_lock:
+            assert cc._compress_admitted_count == others, (
+                "one admitted future released more than one slot"
+            )
+    finally:
+        worker.release.set()
+        for callback in withheld:
+            callback(None)
+        for _ in range(others):
+            cc._release_compression_admission()
+    with cc._compress_admission_lock:
+        assert cc._compress_admitted_count == 0
+
+
+# ---------------------------------------------------------------------------
 # Route resolution: a chain entry becomes an explicit summary route
 # ---------------------------------------------------------------------------
 
