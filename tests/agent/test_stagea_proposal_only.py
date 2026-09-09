@@ -176,6 +176,32 @@ def test_task_config_must_be_non_secret_and_pinned(tmp_path):
         MODEL, BASE_URL, PROVIDER)
 
 
+def test_task_config_is_read_through_the_accepted_config_api(
+        tmp_path, monkeypatch):
+    """The producer's only config.yaml read is the accepted primitive."""
+    import hermes_cli.config as hermes_config
+
+    root = make_root(tmp_path)
+    seen = []
+    accepted = hermes_config.read_user_config_raw
+
+    def recording(config_path=None):
+        seen.append(config_path)
+        return accepted(config_path)
+
+    monkeypatch.setattr(hermes_config, "read_user_config_raw", recording)
+    assert sp.read_task_config(root) == {"model": dict(ROUTE)}
+    assert seen == [root / "config.yaml"]
+
+
+def test_run_refuses_when_loader_is_not_bound_to_task_root(tmp_path):
+    """Without the active override the loader is not this task's config."""
+    root = make_root(tmp_path)
+    with pytest.raises(sp.ProposalRefusal) as refusal:
+        sp.run(root, REQUEST)
+    assert refusal.value.code == "config.loader_path"
+
+
 def test_real_construction_is_offline_and_route_consistent(live):
     token = sp.activate_config_root(live.root)
     try:

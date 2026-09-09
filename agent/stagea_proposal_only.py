@@ -142,17 +142,20 @@ def screen_no_credential(node, depth=0):
 
 
 def read_task_config(root):
-    """Read and screen the non-secret config document in the task root."""
-    import yaml
+    """Screen the task root's non-secret config through the accepted API."""
+    from hermes_cli.config import read_user_config_raw
 
     path = root / "config.yaml"
     need(stat.S_ISREG(_owned_private_stat(path, "config").st_mode),
          "config.not_regular_file")
     try:
-        document = yaml.safe_load(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, yaml.YAMLError):
+        document = read_user_config_raw(path)
+    except Exception:
+        # The accepted primitive raises on an unreadable or unparseable
+        # file and collapses a missing or non-mapping document to {}, which
+        # the emptiness check below refuses instead of screening blindly.
         raise ProposalRefusal("config.unreadable") from None
-    need(isinstance(document, dict), "config.not_mapping")
+    need(isinstance(document, dict) and document, "config.not_mapping")
     screen_no_credential(document)
     return document
 
@@ -325,8 +328,13 @@ def validate_envelope(raw):
 def run(root, request_bytes):
     """One bounded proposal attempt under an already-active config root."""
     document = parse_request(request_bytes)
-    from hermes_cli.config import load_config_readonly
+    from hermes_cli.config import get_config_path, load_config_readonly
 
+    # The accepted loader must already be bound to this task root, so the
+    # screened document and the loaded route are the same file: the
+    # context-local home override owns config identity here.
+    need(Path(get_config_path()) == root / "config.yaml",
+         "config.loader_path")
     route = resolve_route(load_config_readonly())
     need(resolve_route(read_task_config(root)) == route,
          "config.loader_mismatch")
