@@ -1653,16 +1653,31 @@ def run_compress_context_with_progress_timeout(
             return messages, ""
         return worker(worker_fence)
 
-    # One monotonic attempt epoch (#97488): the fence ceiling, the fence idle
-    # clock and this host's elapsed-time accounting all start HERE, after the
-    # local lazy setup above. Budgets are unchanged; only their origin is.
-    attempt_epoch = fence.begin_attempt(ceiling)
     # Bare pool workers start with an empty ContextVar map; propagate the
-    # parent conversation/approval context into the worker.
+    # parent conversation/approval context into the worker. This capture runs
+    # on the HOST thread and is NOT a constant-time wrapper lookup: it copies
+    # the current Context and lazily imports the terminal approval/sudo
+    # callback API (tools/thread_context.py). Building it AFTER the epoch
+    # charged that cold local setup to the provider attempt, so a cold host
+    # could exhaust the ceiling before the supplied primary ever entered
+    # (_CompressionWorkerPreStartExpiry). It is therefore the LAST piece of
+    # host-side submission setup and completes BEFORE the epoch is armed.
     try:
-        future = executor.submit(
-            propagate_context_to_thread(_fence_gated_worker), fence
-        )
+        submit_target = propagate_context_to_thread(_fence_gated_worker)
+    except BaseException:
+        # No future exists yet to carry the done-callback release, so this
+        # ticket is freed here — exactly once, as on every other exit.
+        admission.release()
+        raise
+
+    # One monotonic attempt epoch (#97488): the fence ceiling, the fence idle
+    # clock and this host's elapsed-time accounting all start HERE, after ALL
+    # local host-side submission setup above — executor acquisition, bounded
+    # admission AND the context wrapper/callback capture. Budgets are
+    # unchanged; only their origin is.
+    attempt_epoch = fence.begin_attempt(ceiling)
+    try:
+        future = executor.submit(submit_target, fence)
     except BaseException:
         admission.release()
         raise

@@ -85,6 +85,49 @@ def _slow_pool_setup(delay: float):
     return patch.object(cc, "_get_compress_timeout_executor", _slow)
 
 
+def _slow_context_capture(delay: float, *, done: threading.Event, threads: list):
+    """Make the ACTUAL host-side context wrapper/callback capture slow.
+
+    ``propagate_context_to_thread`` is resolved from ``tools.thread_context``
+    at call time and runs on the HOST thread: it copies the current Context
+    and lazily imports the terminal approval/sudo callback API. On a cold
+    process that is not a constant-time lookup — it is local submission setup
+    that must finish BEFORE the attempt epoch is armed. The real helper is
+    still built and used (only its cost is modelled), and
+    ``tools/thread_context.py`` itself is untouched.
+    """
+    import tools.thread_context as thread_context
+
+    real = thread_context.propagate_context_to_thread
+
+    def _slow(target):
+        wrapper = real(target)
+        time.sleep(delay)
+        threads.append(threading.current_thread())
+        done.set()
+        return wrapper
+
+    return patch.object(thread_context, "propagate_context_to_thread", _slow)
+
+
+class _EpochOrderingFence(CompressionCommitFence):
+    """Record whether host-side setup was complete when the epoch was armed.
+
+    No budget is altered and nothing is inferred from wall clock:
+    ``begin_attempt`` samples an event the capture control sets as it
+    returns, so the ordering claim is decided by happens-before.
+    """
+
+    def __init__(self, setup_done: threading.Event) -> None:
+        super().__init__()
+        self._setup_done = setup_done
+        self.setup_done_at_epoch: bool | None = None
+
+    def begin_attempt(self, total_ceiling_seconds: float) -> float:
+        self.setup_done_at_epoch = self._setup_done.is_set()
+        return super().begin_attempt(total_ceiling_seconds)
+
+
 class _ScheduledFence(CompressionCommitFence):
     """Fence double that makes this file's scheduling preconditions explicit.
 
@@ -418,6 +461,116 @@ class TestCommonAttemptEpoch:
         assert worker_done.is_set(), "cooperative worker was not joined"
         assert msgs == [{"role": "user", "content": "keep"}]
         assert prompt in ("fallback", "late")
+        assert fence._retain_cancelled_lock_until_worker_done is False
+
+    def test_context_capture_delay_before_the_epoch_still_admits_the_worker(
+        self,
+    ):
+        """The host-side context wrapper/callback capture is LOCAL submission
+        setup, so the common attempt epoch must be armed after it.
+
+        The control blocks the ACTUAL ``propagate_context_to_thread`` seam —
+        not the executor getter — for longer than the whole (unchanged, tiny)
+        ceiling. With the epoch armed after that capture, the supplied primary
+        still enters and is never refused by the fence-gated pre-start check.
+        With the reverse order the fence deadline is already exceeded when the
+        worker starts: ``setup_done_at_epoch`` is False and the worker never
+        runs. The ordering itself is decided by happens-before (an event
+        sampled inside ``begin_attempt``), not by wall-clock scheduling.
+        """
+        original = [{"role": "user", "content": "keep"}]
+        entered = threading.Event()
+        worker_done = threading.Event()
+        setup_done = threading.Event()
+        released = threading.Event()
+        captured_on: list = []
+        releases: list = []
+        pre_start_refusals: list = []
+
+        class _CountingTicket(cc._CompressionAdmissionTicket):
+            """The real ticket; records only EFFECTIVE (first) releases."""
+
+            __slots__ = ()
+
+            def release(self, _future=None) -> None:
+                already_released = self._released
+                super().release(_future)
+                if not already_released and self._released:
+                    releases.append(True)
+                    released.set()
+
+        def _counting_admit():
+            # The unchanged bounded cap still decides admission; only the
+            # ticket instance is instrumented.
+            if not cc._try_admit_compression_job():
+                return None
+            return _CountingTicket()
+
+        real_outcome = cc._settled_worker_outcome
+
+        def _record_outcome(future):
+            outcome = real_outcome(future)
+            if outcome is not None and outcome[0] == "not_started":
+                pre_start_refusals.append(outcome[1])
+            return outcome
+
+        def cooperative_worker(fence: CompressionCommitFence):
+            entered.set()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if fence.is_cancelled:
+                    break
+                fence.touch_progress()
+                time.sleep(0.01)
+            worker_done.set()
+            return (original, "late")
+
+        fence = _EpochOrderingFence(setup_done)
+        started = time.monotonic()
+        with patch.object(cc, "_admit_compression_job", _counting_admit):
+            with patch.object(cc, "_settled_worker_outcome", _record_outcome):
+                with _slow_context_capture(
+                    0.35, done=setup_done, threads=captured_on
+                ):
+                    msgs, prompt = run_compress_context_with_progress_timeout(
+                        worker=cooperative_worker,
+                        messages=original,
+                        system_prompt_fallback="fallback",
+                        idle_timeout_seconds=0.1,
+                        total_ceiling_seconds=0.2,
+                        fence=fence,
+                        stall_fallback=False,
+                    )
+        elapsed = time.monotonic() - started
+        # Precondition: the blocked seam really is the host-side capture.
+        assert captured_on == [threading.current_thread()], (
+            "the control did not block the host-side context capture"
+        )
+        # The ordering claim itself.
+        assert fence.setup_done_at_epoch is True, (
+            "the attempt epoch was armed BEFORE host-side context "
+            "wrapper/callback capture finished, so cold local setup is still "
+            "charged to the provider attempt"
+        )
+        assert not pre_start_refusals, (
+            "the supplied primary was refused before start: local setup "
+            "consumed the attempt ceiling"
+        )
+        assert entered.is_set(), (
+            "worker never entered: host-side context capture ahead of the "
+            "attempt epoch consumed the whole ceiling"
+        )
+        assert elapsed >= 0.5, (
+            "the ceiling must be charged from the post-setup epoch, not from "
+            "the start of host-side context capture"
+        )
+        assert worker_done.wait(timeout=5), "cooperative worker never exited"
+        assert msgs == [{"role": "user", "content": "keep"}]
+        assert prompt in ("fallback", "late")
+        # Unchanged contracts: exactly-once admission-ticket release, and no
+        # lease retention once the cancelled worker provably exited.
+        assert released.wait(timeout=5), "admission ticket was never released"
+        assert releases == [True], "admission ticket was released twice"
         assert fence._retain_cancelled_lock_until_worker_done is False
 
     def test_worker_thrown_timeout_error_is_a_completed_outcome(self):
