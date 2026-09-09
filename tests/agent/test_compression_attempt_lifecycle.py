@@ -36,6 +36,7 @@ from agent.conversation_compression import (
     _claim_compressor_attempt,
     compress_context,
     compression_blocked_transiently,
+    compression_skipped_due_to_lock,
     run_compress_context_with_progress_timeout,
 )
 from hermes_state import SessionDB
@@ -821,3 +822,171 @@ class TestTransientBlockIsNotExhaustion:
         mock_agent = MagicMock()
         # MagicMock auto-attributes are truthy but not str.
         assert compression_blocked_transiently(mock_agent) is False
+
+
+class _AttemptOwnershipCompressor:
+    """Attribute holder — the ownership helpers touch nothing else."""
+
+
+class TestGenerationOwnershipRequiresDurableOwnership:
+    """#198 F1 ownership algebra — recorded claims only, no schedule.
+
+    Each case is a pure function of the claims taken, so the ownership rule
+    itself is pinned instead of a sampled interleaving: no thread, sleep,
+    retry or timing tolerance is involved.
+    """
+
+    def test_retired_contender_stops_superseding_the_current_owner(self):
+        compressor = _AttemptOwnershipCompressor()
+        owner = _claim_compressor_attempt(compressor)
+        contender = _claim_compressor_attempt(compressor)
+        # F1 shape: the newer claim ALONE invalidated the durable owner.
+        assert not cc._compressor_attempt_is_current(compressor, owner)
+        assert cc._retire_compressor_attempt(compressor, contender) is True
+        assert cc._compressor_attempt_is_current(compressor, owner), (
+            "a contender that never became the durable owner must not "
+            "invalidate the real lock holder (#198 F1)"
+        )
+        assert not cc._compressor_attempt_is_current(compressor, contender), (
+            "the retired loser must sit out, not regain authority"
+        )
+        # Not a rollback: the monotonic counter never moves backwards.
+        assert compressor._compression_attempt_generation == contender
+
+    def test_consecutive_retirements_collapse_onto_the_owner(self):
+        compressor = _AttemptOwnershipCompressor()
+        owner = _claim_compressor_attempt(compressor)
+        first = _claim_compressor_attempt(compressor)
+        second = _claim_compressor_attempt(compressor)
+        # Two overlapping contenders both lose the lock the owner holds, and
+        # retire in the reverse of their claim order.
+        assert cc._retire_compressor_attempt(compressor, second) is True
+        assert cc._retire_compressor_attempt(compressor, first) is True
+        assert cc._compressor_attempt_is_current(compressor, owner), (
+            "a chain of lock losers must not invalidate the lock holder"
+        )
+        assert not cc._compressor_attempt_is_current(compressor, first)
+        assert not cc._compressor_attempt_is_current(compressor, second)
+        assert compressor._compression_attempt_generation == second
+
+    def test_admitted_successor_keeps_authority_over_a_stale_primary(self):
+        compressor = _AttemptOwnershipCompressor()
+        primary = _claim_compressor_attempt(compressor)
+        contender = _claim_compressor_attempt(compressor)
+        # A genuinely admitted successor (stall-fallback) takes authority,
+        # and only afterwards does the losing contender retire.
+        successor = _claim_compressor_attempt(compressor)
+        assert cc._retire_compressor_attempt(compressor, contender) is True
+        assert cc._compressor_attempt_is_current(compressor, successor), (
+            "retiring a lock loser must never demote the admitted successor"
+        )
+        assert not cc._compressor_attempt_is_current(compressor, primary), (
+            "a detached stale primary must stay superseded (#96634/#97488)"
+        )
+        # The detached primary's late restore must still no-op.
+        compressor._previous_summary = "successor state"
+        cc._restore_compressor_attempt_state(
+            compressor,
+            {"_previous_summary": "stale primary state"},
+            attempt_generation=primary,
+        )
+        assert compressor._previous_summary == "successor state", (
+            "a stale primary rolled successor-owned state back (#96634)"
+        )
+
+    def test_disabled_guard_is_never_retired(self):
+        compressor = _AttemptOwnershipCompressor()
+        # Generation 0 = tracking unavailable (slotted third party).
+        assert cc._retire_compressor_attempt(compressor, 0) is False
+        assert cc._compressor_attempt_is_current(compressor, 0) is True
+
+
+class TestFailedLockContenderCannotInvalidateTheOwner:
+    """#198 F1 end-to-end: the loser of the durable lock must sit out.
+
+    The overlap is linearized by construction — the contender runs to
+    completion on the owner's own thread, at the exact point where the owner
+    holds the durable lease and has a valid candidate in hand — so the
+    interleaving is fixed, not sampled. No budget, sleep or retry is used.
+    """
+
+    def test_contender_that_loses_the_lock_leaves_the_owner_committable(
+        self, tmp_path: Path
+    ):
+        db, agent = _build_agent(tmp_path, "GEN_LOCK_OWNER")
+        live = _messages()
+        original = copy.deepcopy(live)
+        for message in original:
+            db.append_message(
+                "GEN_LOCK_OWNER", message["role"], message["content"]
+            )
+        compressor = agent.context_compressor
+        generations: list[int] = []
+        contender: list[tuple] = []
+
+        def compress_with_overlapping_contender(messages, **_kwargs):
+            # The owner holds the durable lease here and is about to hand
+            # back a valid candidate.
+            generations.append(
+                int(getattr(compressor, "_compression_attempt_generation", 0))
+            )
+            assert db.get_compression_lock_holder("GEN_LOCK_OWNER"), (
+                "precondition: the owner must hold the durable lease while "
+                "its summary runs"
+            )
+            # A NEWER overlapping entrypoint on the SAME agent/compressor
+            # (automatic + manual /compress overlap, run_agent.py) claims the
+            # shared generation and then loses the durable lock.
+            contender_live = copy.deepcopy(original)
+            contender_out, _contender_prompt = compress_context(
+                agent,
+                contender_live,
+                "sys",
+                approx_tokens=500_000,
+                force=True,
+            )
+            contender.append(
+                (
+                    contender_out is contender_live,
+                    contender_live == original,
+                    compression_skipped_due_to_lock(agent),
+                )
+            )
+            generations.append(
+                int(getattr(compressor, "_compression_attempt_generation", 0))
+            )
+            return [{"role": "assistant", "content": "owner summary"}]
+
+        compressor.compress = compress_with_overlapping_contender
+        out, _prompt = compress_context(
+            agent, live, "sys", approx_tokens=500_000
+        )
+        # Precondition: the contender really claimed a NEWER generation than
+        # the lock owner — the exact F1 ordering.
+        assert len(generations) == 2 and generations[1] > generations[0] > 0, (
+            "the contender did not advance the shared attempt generation"
+        )
+        # Precondition: the contender reached durable-lock contention (not a
+        # breaker/cooldown no-op) and sat out with its transcript unchanged.
+        assert contender == [(True, True, True)], (
+            "the overlapping attempt did not sit out through the "
+            "lock-contended path"
+        )
+        # The finding itself: the lock LOSER must not make the lock WINNER
+        # discard a healthy candidate (both attempts no-oped before this).
+        assert out != original, (
+            "the durable lock holder discarded its valid candidate because a "
+            "failed contender had claimed the generation first (#198 F1)"
+        )
+        assert any(
+            isinstance(message, dict)
+            and message.get("content") == "owner summary"
+            for message in out
+        )
+        assert len(out) < len(original)
+        # The owner remained eligible to commit — and did.
+        assert agent._last_compaction_in_place is True
+        durable = db.get_messages_as_conversation("GEN_LOCK_OWNER")
+        assert 0 < len(durable) < len(original), (
+            "the owner's compaction never reached durable state"
+        )

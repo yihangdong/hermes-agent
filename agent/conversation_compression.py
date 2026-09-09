@@ -448,15 +448,86 @@ def _claim_compressor_attempt(compressor: Any) -> int:
         return generation
 
 
+# Claims retired by their OWN attempt (#198 F1). The generation is claimed
+# BEFORE durable-lock acquisition, so an attempt can advance the shared
+# counter and then discover that another path is the real per-session
+# compression owner. Such an attempt ran no summary and wrote no
+# compressor-owned state, so its claim must stop counting — otherwise the
+# lock LOSER supersedes the lock WINNER and both passes no-op.
+_COMPRESSOR_RETIRED_ATTEMPTS_FIELD = "_compression_retired_attempt_generations"
+
+
+def _effective_compressor_attempt_generation(compressor: Any) -> int:
+    """Newest claim on *compressor* that its own attempt did not retire.
+
+    Callers must hold ``_COMPRESSOR_ATTEMPT_LOCK``. The monotonic counter is
+    never rolled back; the walk only skips generations whose claimant proved
+    it never became the session's durable compression owner (see
+    :func:`_retire_compressor_attempt`), so it stops at the newest claim that
+    can still own compressor state.
+    """
+    generation = int(getattr(compressor, "_compression_attempt_generation", 0) or 0)
+    retired = getattr(compressor, _COMPRESSOR_RETIRED_ATTEMPTS_FIELD, None)
+    if not isinstance(retired, set):
+        return generation
+    while generation > 0 and generation in retired:
+        generation -= 1
+    return generation
+
+
+def _retire_compressor_attempt(compressor: Any, generation: int) -> bool:
+    """Give up a claim whose attempt never became the durable lock owner.
+
+    #198 F1: an overlapping attempt claims this compressor before it tries to
+    acquire the durable per-session lock. When it LOSES that lock it returns
+    the caller's messages unchanged through the ``lock_contended`` path,
+    having run no summary and mutated no compressor-owned state — yet its
+    newer claim used to classify the actual lock holder as
+    ``attempt_superseded``, so the holder discarded a healthy candidate and
+    both overlapping passes no-oped. The loser therefore retires its claim
+    here: it sits out, and the real owner stays eligible to commit.
+
+    Deliberately NOT a rollback of ``_compression_attempt_generation``: the
+    counter stays monotonic, so a genuinely admitted successor/fallback that
+    claimed after this generation keeps its authority and a detached, stale
+    primary can still never restore or commit over newer work. Only the
+    retiring attempt's own generation is recorded, which is why an older
+    attempt can never be resurrected over a newer real owner.
+
+    Returns True when the retirement was recorded. The retired set holds one
+    small int per attempt that lost this compressor's durable lock, so it is
+    bounded by observed lock contention on this compressor instance.
+    """
+    if not generation:
+        # Generation 0 means ownership tracking is unavailable on this
+        # compressor (slotted/frozen third party) and the guard is disabled
+        # for EVERY attempt on it, so there is nothing to retire.
+        return False
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        retired = getattr(compressor, _COMPRESSOR_RETIRED_ATTEMPTS_FIELD, None)
+        if not isinstance(retired, set):
+            retired = set()
+        retired.add(int(generation))
+        try:
+            setattr(compressor, _COMPRESSOR_RETIRED_ATTEMPTS_FIELD, retired)
+        except Exception:
+            # Same all-or-nothing compatibility rule as the claim itself: a
+            # compressor that rejects the setattr rejected the claim too.
+            return False
+        return True
+
+
 def _compressor_attempt_is_current(compressor: Any, generation: int) -> bool:
-    """True when *generation* still owns the compressor (or guard disabled)."""
+    """True when *generation* still owns the compressor (or guard disabled).
+
+    A claim retired by its own attempt (a contender that never became the
+    session's durable compression owner) does not supersede anyone, so the
+    current durable lock holder stays current (#198 F1).
+    """
     if not generation:
         return True
     with _COMPRESSOR_ATTEMPT_LOCK:
-        return (
-            int(getattr(compressor, "_compression_attempt_generation", 0) or 0)
-            == generation
-        )
+        return _effective_compressor_attempt_generation(compressor) == generation
 
 
 def _install_compression_cancelled_check(
@@ -599,7 +670,7 @@ def _restore_compressor_attempt_state(
     # have claimed first, which the entry check already rejects.
     with _COMPRESSOR_ATTEMPT_LOCK:
         if attempt_generation is not None and attempt_generation and (
-            int(getattr(compressor, "_compression_attempt_generation", 0) or 0)
+            _effective_compressor_attempt_generation(compressor)
             != attempt_generation
         ):
             logger.warning(
@@ -3744,6 +3815,16 @@ def compress_context(
                 _lock_sid, existing,
             )
             _lock_holder = None  # don't release a lock we don't own
+            # F1 (#198): this attempt claimed the compressor attempt
+            # generation BEFORE trying to own the durable lock, and it lost —
+            # another path is the real owner. It ran no summary and wrote no
+            # compressor-owned state, so retire the claim: a lock loser must
+            # not make the lock winner discard its candidate. The monotonic
+            # counter is NOT rolled back, so a genuinely admitted
+            # successor/fallback keeps its authority over a stale primary.
+            _retire_compressor_attempt(
+                agent.context_compressor, _attempt_generation
+            )
             # Signal to callers that this no-op is due to a concurrent lock,
             # not a genuine "nothing to compress" or aux-model failure.
             # Manual /compress callers can surface a clear status message
