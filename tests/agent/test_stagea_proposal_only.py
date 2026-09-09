@@ -159,8 +159,12 @@ def test_override_is_task_scoped_and_restored(tmp_path, monkeypatch):
 
 def test_task_config_must_be_non_secret_and_pinned(tmp_path):
     root = make_root(tmp_path, {"model": dict(ROUTE, api_key="x")})
-    with pytest.raises(sp.ProposalRefusal) as secret:
-        sp.read_task_config(root)
+    token = sp.activate_config_root(root)
+    try:
+        with pytest.raises(sp.ProposalRefusal) as secret:
+            sp.read_task_config(root)
+    finally:
+        reset_hermes_home_override(token)
     assert secret.value.code == "config.credential_key"
     unpinned = dict(ROUTE)
     unpinned.pop("context_length")
@@ -176,22 +180,33 @@ def test_task_config_must_be_non_secret_and_pinned(tmp_path):
         MODEL, BASE_URL, PROVIDER)
 
 
-def test_task_config_is_read_through_the_accepted_config_api(
+def test_task_config_is_read_through_the_behavioral_loader(
         tmp_path, monkeypatch):
-    """The producer's only config.yaml read is the accepted primitive."""
+    """Screening/route reads use the loader, never a raw primitive."""
     import hermes_cli.config as hermes_config
 
     root = make_root(tmp_path)
     seen = []
-    accepted = hermes_config.read_user_config_raw
+    accepted = hermes_config.load_config_readonly
 
-    def recording(config_path=None):
-        seen.append(config_path)
-        return accepted(config_path)
+    def refuse(*args, **kwargs):
+        raise AssertionError("raw behavioral config read")
 
-    monkeypatch.setattr(hermes_config, "read_user_config_raw", recording)
-    assert sp.read_task_config(root) == {"model": dict(ROUTE)}
+    def recording():
+        seen.append(hermes_config.get_config_path())
+        return accepted()
+
+    for raw in ("read_user_config_raw", "read_raw_config",
+                "read_raw_config_readonly"):
+        monkeypatch.setattr(hermes_config, raw, refuse)
+    monkeypatch.setattr(hermes_config, "load_config_readonly", recording)
+    token = sp.activate_config_root(root)
+    try:
+        document = sp.read_task_config(root)
+    finally:
+        reset_hermes_home_override(token)
     assert seen == [root / "config.yaml"]
+    assert document["model"] == dict(ROUTE)
 
 
 def test_run_refuses_when_loader_is_not_bound_to_task_root(tmp_path):
@@ -262,6 +277,38 @@ def test_request_hygiene_is_closed():
     assert sp.parse_request(
         sp.canonical_bytes(ordinary))["admitted_write_set"] == [
             "src/token.py"]
+
+
+@pytest.mark.parametrize("value", [
+    ["docs/a.md", "please resume"],
+    {"nested": {"deep": ["api_key: sk-1"]}},
+    {"provider": "openrouter"},
+    ["ok", {"jwt": 1}],
+])
+def test_structured_request_values_are_screened(value):
+    steered = dict(json.loads(REQUEST), contract_ref=value)
+    with pytest.raises(sp.ProposalRefusal) as refusal:
+        sp.parse_request(sp.canonical_bytes(steered))
+    assert refusal.value.code == "request.forbidden_token"
+
+
+def test_every_represented_screened_field_is_covered():
+    document = json.loads(REQUEST)
+    pinned = {"schema_version", "envelope_schema_version",
+              "max_envelope_bytes"}
+    screened = sorted(
+        sp.REQUEST_FIELDS - sp.UNSCREENED_REQUEST_FIELDS - pinned)
+    assert len(screened) == 10
+    for field in screened:
+        for value in ("session_id", ["session_id"], {"k": "session_id"}):
+            with pytest.raises(sp.ProposalRefusal) as refusal:
+                sp.parse_request(
+                    sp.canonical_bytes(dict(document, **{field: value})))
+            assert refusal.value.code == "request.forbidden_token"
+    exempt = dict(document, admitted_write_set=[{"p": "src/session_id.py"}])
+    assert sp.parse_request(
+        sp.canonical_bytes(exempt))["admitted_write_set"] == [
+            {"p": "src/session_id.py"}]
 
 
 def test_framing_requires_exactly_one_line():

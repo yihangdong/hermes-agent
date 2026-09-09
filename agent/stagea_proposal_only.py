@@ -128,35 +128,43 @@ def activate_config_root(root):
     return token
 
 
-def screen_no_credential(node, depth=0):
-    """Refuse a task config carrying credential-shaped material."""
+def screen_no_credential(node, default=None, depth=0):
+    """Refuse credential-shaped material this task root contributes.
+
+    The behavioral loader answers with Hermes' shipped defaults merged
+    in, so a subtree still equal to its default is that skeleton and not
+    task material: only what this root actually contributes is screened.
+    """
     need(depth <= 8, "config.depth")
     if isinstance(node, dict):
+        base = default if isinstance(default, dict) else {}
         for key, value in node.items():
+            if key in base and base[key] == value:
+                continue
             need(not any(t in str(key).lower() for t in CREDENTIAL_KEY_TOKENS),
                  "config.credential_key")
-            screen_no_credential(value, depth + 1)
+            screen_no_credential(value, base.get(key), depth + 1)
     elif isinstance(node, (list, tuple)):
         for item in node:
-            screen_no_credential(item, depth + 1)
+            screen_no_credential(item, None, depth + 1)
 
 
 def read_task_config(root):
-    """Screen the task root's non-secret config through the accepted API."""
-    from hermes_cli.config import read_user_config_raw
+    """Screen this task root's config through the accepted loader."""
+    from hermes_cli.config import (DEFAULT_CONFIG, get_config_path,
+                                   load_config_readonly)
 
     path = root / "config.yaml"
     need(stat.S_ISREG(_owned_private_stat(path, "config").st_mode),
          "config.not_regular_file")
-    try:
-        document = read_user_config_raw(path)
-    except Exception:
-        # The accepted primitive raises on an unreadable or unparseable
-        # file and collapses a missing or non-mapping document to {}, which
-        # the emptiness check below refuses instead of screening blindly.
-        raise ProposalRefusal("config.unreadable") from None
+    # Behavioral truth only: the accepted loader must already be bound to
+    # this exact task config path.  An unreadable or unparseable file
+    # degrades to the shipped defaults, whose empty route section
+    # resolve_route refuses.
+    need(Path(get_config_path()) == path, "config.loader_path")
+    document = load_config_readonly()
     need(isinstance(document, dict) and document, "config.not_mapping")
-    screen_no_credential(document)
+    screen_no_credential(document, DEFAULT_CONFIG)
     return document
 
 
@@ -181,6 +189,23 @@ def resolve_route(config):
     return model, base_url, provider
 
 
+def _screened_strings(value, depth=0):
+    """Every string a non-exempt request value carries, at any depth."""
+    need(depth <= 8, "request.depth")
+    if isinstance(value, dict):
+        out = []
+        for key, item in value.items():
+            out.append(str(key))
+            out.extend(_screened_strings(item, depth + 1))
+        return out
+    if isinstance(value, (list, tuple)):
+        out = []
+        for item in value:
+            out.extend(_screened_strings(item, depth + 1))
+        return out
+    return [value if isinstance(value, str) else str(value)]
+
+
 def parse_request(raw):
     """F1: a closed, hygienic projection of the frozen kernel action."""
     need(type(raw) is bytes and 0 < len(raw) <= MAX_ENVELOPE_BYTES,
@@ -200,9 +225,8 @@ def parse_request(raw):
     screened = []
     for key in sorted(document):
         screened.append(key)
-        if key not in UNSCREENED_REQUEST_FIELDS and isinstance(
-                document[key], str):
-            screened.append(document[key])
+        if key not in UNSCREENED_REQUEST_FIELDS:
+            screened.extend(_screened_strings(document[key]))
     lowered = "\n".join(screened).lower()
     for token in FORBIDDEN_REQUEST_TOKENS:
         need(token not in lowered, "request.forbidden_token")
@@ -328,16 +352,10 @@ def validate_envelope(raw):
 def run(root, request_bytes):
     """One bounded proposal attempt under an already-active config root."""
     document = parse_request(request_bytes)
-    from hermes_cli.config import get_config_path, load_config_readonly
-
-    # The accepted loader must already be bound to this task root, so the
-    # screened document and the loaded route are the same file: the
-    # context-local home override owns config identity here.
-    need(Path(get_config_path()) == root / "config.yaml",
-         "config.loader_path")
-    route = resolve_route(load_config_readonly())
-    need(resolve_route(read_task_config(root)) == route,
-         "config.loader_mismatch")
+    # One behavioral config read: read_task_config proves the accepted
+    # loader is bound to this root, screens what the root contributes,
+    # and hands back the document this route is resolved from.
+    route = resolve_route(read_task_config(root))
     agent = build_agent(*route)
     kwargs = build_request_kwargs(agent, document)
     return validate_envelope(extract_framed(
