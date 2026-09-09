@@ -990,3 +990,181 @@ class TestFailedLockContenderCannotInvalidateTheOwner:
         assert 0 < len(durable) < len(original), (
             "the owner's compaction never reached durable state"
         )
+
+
+class _DurableCooldownStore:
+    """SessionDB stand-in for the three durable-cooldown rollback APIs.
+
+    Only the methods the rollback path reaches are implemented, so the control
+    stays hermetic at that API boundary: it records the durable write ORDER and
+    the surviving row, and depends on no storage schema or workflow.
+    """
+
+    def __init__(self, row):
+        self.row = dict(row)
+        self.writes: list[str] = []
+
+    def restore_compression_failure_cooldown_row(self, session_id, state):
+        self.writes.append("rollback")
+        self.row = dict(state)
+
+    def record_compression_failure_cooldown(self, session_id, deadline, error):
+        self.writes.append("successor")
+        self.row = {"until": deadline, "error": error}
+
+    def clear_compression_failure_cooldown(self, session_id):
+        self.writes.append("clear")
+        self.row = {}
+
+
+class _StaleRollbackCompressor:
+    """Attribute holder bound to a durable store; no provider or plugin."""
+
+    def __init__(self, store, session_id):
+        self._session_db = store
+        self._session_id = session_id
+
+
+class TestStaleRollbackCannotOverwriteAnAdmittedSuccessor:
+    """#198 F1: ownership check and durable rollback are ONE ordered step.
+
+    Fixed interleaving, no sleep, retry or timing tolerance: the stale primary
+    parks INSIDE its authority check (after it passed, before the durable
+    write), then the successor admits, claims and writes the authoritative
+    cooldown row. The primary is released by the first of two causally
+    guaranteed events -- the successor finishing its write (the unordered
+    shape) or the successor's claim actually WAITING on this compressor's
+    rollback ordering (the corrected shape) -- so both shapes run to
+    completion without a timeout and the assertion, not the schedule, decides.
+    """
+
+    def test_successor_owned_durable_cooldown_survives_a_stale_rollback(
+        self, monkeypatch
+    ):
+        original_row = {"until": 11.0, "error": "primary-original"}
+        store = _DurableCooldownStore(original_row)
+        compressor = _StaleRollbackCompressor(store, "STALE_ROLLBACK")
+        primary = _claim_compressor_attempt(compressor)
+
+        primary_parked = threading.Event()
+        release_primary = threading.Event()
+        successor_at_claim = threading.Event()
+        may_release_primary = threading.Event()
+        real_lock = threading.RLock()
+
+        class _OrderingObserver:
+            """Observes the correction's per-compressor rollback mutex."""
+
+            def acquire(self, *args, **kwargs):
+                if real_lock.acquire(blocking=False):
+                    return True
+                # A claim is really WAITING on an in-flight durable rollback.
+                may_release_primary.set()
+                real_lock.acquire()
+                return True
+
+            def release(self):
+                real_lock.release()
+
+        observer = _OrderingObserver()
+        monkeypatch.setattr(
+            cc,
+            "_compressor_durable_rollback_lock",
+            lambda _compressor: observer,
+            raising=False,
+        )
+
+        real_is_current = cc._compressor_attempt_is_current
+
+        def parking_is_current(target, generation):
+            current = real_is_current(target, generation)
+            if generation == primary and not primary_parked.is_set():
+                primary_parked.set()
+                release_primary.wait()
+            return current
+
+        monkeypatch.setattr(
+            cc, "_compressor_attempt_is_current", parking_is_current
+        )
+
+        successor_generation: list[int] = []
+
+        def successor_body():
+            successor_at_claim.set()
+            successor_generation.append(_claim_compressor_attempt(compressor))
+            store.record_compression_failure_cooldown(
+                "STALE_ROLLBACK", 99.0, "successor-authoritative"
+            )
+            may_release_primary.set()
+
+        def primary_body():
+            cc._restore_compressor_attempt_state(
+                compressor,
+                {
+                    "_summary_failure_cooldown_until": 11.0,
+                    "_last_summary_error": "primary-original",
+                    "_previous_summary": "stale primary state",
+                },
+                durable_cooldown_authoritative=True,
+                durable_cooldown_state=dict(original_row),
+                attempt_generation=primary,
+            )
+
+        primary_thread = threading.Thread(target=primary_body)
+        successor_thread = threading.Thread(target=successor_body)
+        primary_thread.start()
+        primary_parked.wait()
+        # Precondition: the primary passed its ownership check and has NOT
+        # written durable state yet -- exactly the F1 window.
+        assert store.writes == []
+        successor_thread.start()
+        successor_at_claim.wait()
+        may_release_primary.wait()
+        release_primary.set()
+        primary_thread.join()
+        successor_thread.join()
+
+        assert successor_generation and successor_generation[0] > primary, (
+            "precondition: the successor must have been admitted with a newer "
+            "generation than the detached primary"
+        )
+        assert "successor" in store.writes
+        assert store.writes[-1] == "successor", (
+            "a detached stale primary's durable cooldown rollback landed "
+            "AFTER an admitted successor's authoritative write (#198 F1)"
+        )
+        assert store.row == {
+            "until": 99.0,
+            "error": "successor-authoritative",
+        }, (
+            "successor-owned durable cooldown state was rolled back to the "
+            "stale primary's pre-attempt row (#198 F1)"
+        )
+
+    def test_rollback_without_a_successor_still_restores(self):
+        store = _DurableCooldownStore(
+            {"until": 0.0, "error": "cleared-by-summary"}
+        )
+        compressor = _StaleRollbackCompressor(store, "NO_SUCCESSOR")
+        compressor._previous_summary = "post-summary state"
+        compressor._summary_failure_cooldown_until = 0.0
+        generation = _claim_compressor_attempt(compressor)
+        original_row = {"until": 42.0, "error": "pre-attempt"}
+        cc._restore_compressor_attempt_state(
+            compressor,
+            {
+                "_summary_failure_cooldown_until": 42.0,
+                "_last_summary_error": "pre-attempt",
+                "_previous_summary": "pre-attempt state",
+            },
+            durable_cooldown_authoritative=True,
+            durable_cooldown_state=original_row,
+            attempt_generation=generation,
+        )
+        # No successor was admitted: the legitimate pre-commit cancellation
+        # must still restore BOTH the authoritative durable row and the safe
+        # in-memory snapshot, unchanged by the new ordering.
+        assert store.writes == ["rollback"]
+        assert store.row == original_row
+        assert compressor._previous_summary == "pre-attempt state"
+        assert compressor._summary_failure_cooldown_until == 42.0

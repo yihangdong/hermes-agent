@@ -426,6 +426,50 @@ def _snapshot_compressor_attempt_state(compressor: Any) -> dict[str, Any]:
 
 _COMPRESSOR_ATTEMPT_LOCK = threading.Lock()
 
+# Per-compressor mutex ordering a durable cooldown ROLLBACK against a NEW
+# claim (#198 F1). ``threading.RLock`` is a factory, so the concrete type is
+# captured once for the isinstance guard below -- a mock compressor's
+# auto-created attribute must never be mistaken for a real lock.
+_COMPRESSOR_ROLLBACK_LOCK_TYPE = type(threading.RLock())
+_COMPRESSOR_DURABLE_ROLLBACK_LOCK_FIELD = "_compression_durable_rollback_lock"
+
+
+def _compressor_durable_rollback_lock(compressor: Any) -> Optional[Any]:
+    """Per-compressor mutex serializing durable rollback with new claims.
+
+    #198 F1: ``_restore_compressor_attempt_state`` checked attempt ownership
+    and then performed the authoritative durable cooldown write with NO lock
+    held, so a detached stale primary that had already passed the check could
+    overwrite the row an admitted stall-fallback successor wrote; the second
+    check protected only the in-memory ``setattr`` loop. The check and the
+    durable write must therefore be ONE step, ordered against
+    :func:`_claim_compressor_attempt`, which takes this same mutex.
+
+    Stored on the COMPRESSOR instance, never module-global: attempts on
+    unrelated sessions use different compressors, hence different mutexes, and
+    are never serialized by this. Created under ``_COMPRESSOR_ATTEMPT_LOCK``
+    so racing attempts cannot install two different locks; that global lock is
+    always RELEASED before this one is acquired, so the only order in the
+    module is rollback mutex -> ``_COMPRESSOR_ATTEMPT_LOCK``, never the
+    reverse. Re-entrant, so a nested restore on one thread cannot self-lock.
+
+    Returns ``None`` when the compressor cannot carry the attribute -- the
+    same all-or-nothing slotted/frozen third-party rule that disables the
+    generation guard itself, leaving that legacy path exactly as it was.
+    """
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        existing = getattr(
+            compressor, _COMPRESSOR_DURABLE_ROLLBACK_LOCK_FIELD, None
+        )
+        if isinstance(existing, _COMPRESSOR_ROLLBACK_LOCK_TYPE):
+            return existing
+        created = threading.RLock()
+        try:
+            setattr(compressor, _COMPRESSOR_DURABLE_ROLLBACK_LOCK_FIELD, created)
+        except Exception:
+            return None
+        return created
+
 
 def _claim_compressor_attempt(compressor: Any) -> int:
     """Claim the compressor for a new attempt; returns its generation id.
@@ -433,7 +477,30 @@ def _claim_compressor_attempt(compressor: Any) -> int:
     Monotonic per compressor instance. Any restore or cancelled-check
     mutation stamped with an OLDER generation becomes a no-op, so a
     detached, late-unwinding attempt cannot clobber its successor's state.
+
+    #198 F1: admission also waits out an in-flight durable cooldown rollback
+    on THIS compressor, which is what makes "check ownership, then write
+    durable state" atomic with respect to this claim. The section waited on
+    is one SessionDB cooldown restore/record/clear plus the in-memory
+    snapshot restore -- no provider, plugin, network or otherwise unbounded
+    callback runs inside it. A claim is taken at ``compress_context`` entry,
+    BEFORE durable session-lock acquisition and before any fence boundary, so
+    a waiting claimant holds no lease, no fence lock and no attempt lock, and
+    holds nothing the rollback needs; with the single order rollback mutex ->
+    ``_COMPRESSOR_ATTEMPT_LOCK`` there is no inversion and no deadlock.
     """
+    rollback_lock = _compressor_durable_rollback_lock(compressor)
+    if rollback_lock is not None:
+        rollback_lock.acquire()
+    try:
+        return _claim_compressor_attempt_locked(compressor)
+    finally:
+        if rollback_lock is not None:
+            rollback_lock.release()
+
+
+def _claim_compressor_attempt_locked(compressor: Any) -> int:
+    """Advance the monotonic claim counter under the attempt lock."""
     with _COMPRESSOR_ATTEMPT_LOCK:
         generation = int(getattr(compressor, "_compression_attempt_generation", 0) or 0) + 1
         try:
@@ -563,6 +630,53 @@ def _clear_compression_cancelled_check_if_owner(
 
 
 def _restore_compressor_attempt_state(
+    compressor: Any,
+    snapshot: dict[str, Any],
+    *,
+    durable_cooldown_authoritative: Optional[bool] = None,
+    durable_cooldown_state: Optional[dict[str, Any]] = None,
+    attempt_generation: Optional[int] = None,
+) -> None:
+    """Order the whole rollback against new claims, then restore (#198 F1).
+
+    The ownership check and the authoritative durable cooldown write below
+    used to be separated by no lock at all: a detached stale primary could
+    pass the check, an admitted stall-fallback successor could claim and write
+    its own authoritative cooldown row, and the primary could then overwrite
+    it -- the post-write generation check saw the staleness but could not undo
+    the durable mutation. A second unlocked pre-write check would not close
+    that: it only shrinks the window. Holding this compressor's rollback mutex
+    across BOTH the check and the durable write (see
+    :func:`_compressor_durable_rollback_lock`) makes them one step against
+    :func:`_claim_compressor_attempt`, which takes the same mutex: either the
+    successor claims first, and the check now rejects the rollback outright,
+    or the rollback completes first and the successor's later durable write is
+    the final state. Successor-owned durable state cannot be rolled back
+    either way, and a rollback with NO successor still runs exactly as before.
+
+    Bounded critical section: one SessionDB cooldown restore/record/clear, a
+    snapshot deepcopy and the attribute writes. No provider, plugin, network
+    or unbounded callback is invoked while it is held, the only lock taken
+    inside it is ``_COMPRESSOR_ATTEMPT_LOCK`` (never the reverse order), and
+    the mutex is per compressor, so unrelated sessions are not serialized.
+    """
+    rollback_lock = _compressor_durable_rollback_lock(compressor)
+    if rollback_lock is not None:
+        rollback_lock.acquire()
+    try:
+        _restore_compressor_attempt_state_inner(
+            compressor,
+            snapshot,
+            durable_cooldown_authoritative=durable_cooldown_authoritative,
+            durable_cooldown_state=durable_cooldown_state,
+            attempt_generation=attempt_generation,
+        )
+    finally:
+        if rollback_lock is not None:
+            rollback_lock.release()
+
+
+def _restore_compressor_attempt_state_inner(
     compressor: Any,
     snapshot: dict[str, Any],
     *,
