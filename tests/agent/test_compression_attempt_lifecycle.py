@@ -85,44 +85,165 @@ def _slow_pool_setup(delay: float):
     return patch.object(cc, "_get_compress_timeout_executor", _slow)
 
 
+class _ScheduledFence(CompressionCommitFence):
+    """Fence double that makes this file's scheduling preconditions explicit.
+
+    The production wrapper is untouched: only the values this test hands the
+    host are controlled, and every configured budget is left exactly as is.
+
+    * the host's FIRST idle sample blocks until the supplied worker is
+      provably inside its loop, so no timeout branch can be classified
+      against a worker that never ran;
+    * ``deadline_exceeded`` is never true before entry, so the fence-gated
+      pre-start refusal (``_CompressionWorkerPreStartExpiry``) and a
+      pending-future cancellation cannot masquerade as a teardown; after
+      entry it is the real value;
+    * ``stale_progress_seconds=None`` reports continuous progress, so the
+      idle window cannot expire and the TOTAL ceiling is the only branch the
+      host can reach. A value ``>= idle`` reproduces the uncontrolled stale
+      sample instead (falsifier only);
+    * ``hold_inside_ceiling`` shifts ONLY the elapsed-time origin handed back
+      to the host, so its total term cannot win the classification race
+      (falsifier only; the fence's own deadline stays armed at the configured
+      ceiling, and the host's degrade log then reports a negative elapsed
+      reading — that is the control, not a production miscount).
+    """
+
+    def __init__(
+        self,
+        entered: threading.Event,
+        *,
+        stale_progress_seconds: float | None = None,
+        hold_inside_ceiling: float = 0.0,
+    ) -> None:
+        super().__init__()
+        self._entered = entered
+        self._stale_progress_seconds = stale_progress_seconds
+        self._hold_inside_ceiling = hold_inside_ceiling
+        self.entry_observed = False
+
+    def begin_attempt(self, total_ceiling_seconds: float) -> float:
+        epoch = super().begin_attempt(total_ceiling_seconds)
+        return epoch + self._hold_inside_ceiling
+
+    @property
+    def deadline_exceeded(self) -> bool:
+        if self._hold_inside_ceiling or not self._entered.is_set():
+            return False
+        return super().deadline_exceeded
+
+    def seconds_since_progress(self) -> float:
+        if not self.entry_observed:
+            # Barrier, not a sleep: the host cannot evaluate a timeout branch
+            # until the supplied worker has entered. The bound only turns a
+            # hang into a loud failure.
+            if not self._entered.wait(timeout=5.0):
+                raise AssertionError(
+                    "supplied worker never entered — the timeout branch "
+                    "would have been classified against a worker that "
+                    "never ran"
+                )
+            self.entry_observed = True
+        if self._stale_progress_seconds is not None:
+            return self._stale_progress_seconds
+        return 0.0
+
+
+def _cooperative_worker(entered, joined, worker_done, original):
+    """Build the cooperative worker with an EXPLICIT unwind handshake.
+
+    Same shape as before — poll the poison fence between provider phases,
+    then take real time to unwind — except the unwind is ordered against the
+    host's own teardown instead of a wall-clock guess: the worker returns
+    only after the host has entered ``_join_cancelled_worker``. A host
+    WITHOUT the bounded-grace join therefore still returns first (the #97488
+    sabotage check), and a host WITH it observes an exit that its own
+    bounded grace caused.
+    """
+
+    def cooperative_worker(fence: CompressionCommitFence):
+        entered.set()
+        deadline = time.monotonic() + 5.0
+        while time.monotonic() < deadline:
+            if fence.is_cancelled:
+                break
+            fence.touch_progress()
+            time.sleep(0.01)
+        joined.wait(timeout=5.0)
+        worker_done.set()
+        return (original, "late")
+
+    return cooperative_worker
+
+
 class TestWorkerTeardownOnCeiling:
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —
         the sabotage check for this test is removing the
         `_join_cancelled_worker` call, which makes
-        `worker_done.is_set()` False when the host returns."""
+        `worker_done.is_set()` False when the host returns.
+
+        Both preconditions the assertion depends on are PROVED here instead
+        of inferred from 0.1/0.2s wall-clock scheduling: the fence blocks the
+        host's first idle sample until the worker is inside its loop, and it
+        reports continuous progress so the host can only classify the TOTAL
+        ceiling (the idle path deliberately skips the join). The recorded
+        join proves the worker was still LIVE when the existing bounded grace
+        reaped it, so a pending cancellation, a pre-start expiry or an
+        already-settled future cannot pass this test. The falsifier below
+        exercises the uncontrolled schedule.
+        """
         original = [{"role": "user", "content": "keep"}]
+        entered = threading.Event()
+        joined = threading.Event()
         worker_done = threading.Event()
+        causes: list[tuple] = []
+        join_calls: list[tuple] = []
+        real_join = cc._join_cancelled_worker
 
-        def cooperative_worker(fence: CompressionCommitFence):
-            # Continuous progress (the #97488 'last progress 0.0s ago'
-            # shape) so only the TOTAL ceiling expires; poll the poison
-            # fence like the production worker does between provider phases.
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if fence.is_cancelled:
-                    break
-                fence.touch_progress()
-                time.sleep(0.01)
-            # Cooperative-but-not-instant exit: the unwind after seeing the
-            # poison takes real time (rollback, telemetry). Long enough that
-            # a host WITHOUT the bounded-grace join returns first; far
-            # inside the 5s grace for a host WITH it.
-            time.sleep(0.08)
-            worker_done.set()
-            return (original, "late")
+        def _record_join(future, grace_seconds):
+            # Sampled BEFORE the worker is released: a not-done future here
+            # is proof the join faced a live worker, not a settled one.
+            join_calls.append((future.done(), grace_seconds))
+            joined.set()
+            outcome = real_join(future, grace_seconds)
+            join_calls[-1] += (outcome,)
+            return outcome
 
-        fence = CompressionCommitFence()
-        msgs, prompt = run_compress_context_with_progress_timeout(
-            worker=cooperative_worker,
-            messages=original,
-            system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.2,
-            fence=fence,
-            stall_fallback=False,
+        fence = _ScheduledFence(entered)
+        with patch.object(cc, "_join_cancelled_worker", _record_join):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=_cooperative_worker(
+                    entered, joined, worker_done, original
+                ),
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                fence=fence,
+                on_timeout_cause=lambda exhausted, progressed: causes.append(
+                    (exhausted, progressed)
+                ),
+                stall_fallback=False,
+            )
+        # Precondition: the worker entered before any branch was classified.
+        assert entered.is_set() and fence.entry_observed
+        # Precondition: the host took the TOTAL-ceiling branch, so the join
+        # branch — not the idle skip-join branch — is the one under test.
+        assert len(causes) == 1 and causes[0][0], (
+            "host did not reach the total-ceiling branch — the teardown "
+            "assertion below would have had no precondition"
         )
+        # Precondition: exactly one join, against a still-running worker,
+        # inside the UNCHANGED bounded grace.
+        assert len(join_calls) == 1
+        assert join_calls[0][0] is False, (
+            "the join observed an already-settled future — pending "
+            "cancellation or pre-start expiry, not a live teardown"
+        )
+        assert join_calls[0][1] <= cc._CANCELLED_WORKER_TEARDOWN_GRACE_SECONDS
+        assert join_calls[0][2] is True, "the live worker was not reaped"
         # The bounded-grace join must have reaped the cooperative worker
         # BEFORE the host returned.
         assert worker_done.is_set(), (
@@ -136,6 +257,71 @@ class TestWorkerTeardownOnCeiling:
         assert prompt in ("fallback", "late")
         # Teardown proved quiescence, so the lease must NOT stay retained.
         assert fence._retain_cancelled_lock_until_worker_done is False
+
+    def test_falsifier_uncontrolled_idle_sample_never_reaches_the_join(self):
+        """Falsifier for the control above — NOT a production defect.
+
+        Remove the progress control (report a stale idle sample while the
+        host is still inside its ceiling — the exact unchanged schedule the
+        failed run could not rule out) and production deliberately takes the
+        idle path, which SKIPS the bounded-grace join. The teardown assertion
+        above then has nothing to stand on: that is how a wall-clock version
+        of it can fail while production teardown is correct — what is missing
+        is the precondition, not the join. Nothing here asserts
+        ``worker_done``; that is precisely the quantity this schedule leaves
+        unguaranteed.
+        """
+        original = [{"role": "user", "content": "keep"}]
+        entered = threading.Event()
+        joined = threading.Event()
+        worker_done = threading.Event()
+        causes: list[tuple] = []
+        join_calls: list[float] = []
+        real_join = cc._join_cancelled_worker
+
+        def _record_join(future, grace_seconds):
+            join_calls.append(grace_seconds)
+            joined.set()
+            return real_join(future, grace_seconds)
+
+        fence = _ScheduledFence(
+            entered,
+            stale_progress_seconds=0.25,
+            hold_inside_ceiling=30.0,
+        )
+        try:
+            with patch.object(cc, "_join_cancelled_worker", _record_join):
+                msgs, prompt = run_compress_context_with_progress_timeout(
+                    worker=_cooperative_worker(
+                        entered, joined, worker_done, original
+                    ),
+                    messages=original,
+                    system_prompt_fallback="fallback",
+                    idle_timeout_seconds=0.1,
+                    total_ceiling_seconds=0.2,
+                    fence=fence,
+                    on_timeout_cause=lambda exhausted, progressed: (
+                        causes.append((exhausted, progressed))
+                    ),
+                    stall_fallback=False,
+                )
+            # The worker ran: this is the idle-stall classification, not a
+            # pre-start expiry and not a pending-future cancellation.
+            assert entered.is_set()
+            assert len(causes) == 1 and not causes[0][0], (
+                "control removed: the host must classify an idle stall here"
+            )
+            assert join_calls == [], (
+                "the idle path intentionally skips the bounded-grace join, "
+                "so the teardown precondition is simply absent"
+            )
+            # Production is unchanged and still correct on this path.
+            assert fence.is_cancelled
+            assert msgs is original and prompt == "fallback"
+            assert fence._retain_cancelled_lock_until_worker_done is False
+        finally:
+            joined.set()
+            worker_done.wait(timeout=5)
 
     def test_uninterruptible_worker_is_orphaned_with_lease_retained(self):
         """A worker stuck in an uninterruptible provider call is orphaned:
