@@ -8478,6 +8478,197 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
             "error": error,
         }
 
+    # ── Session-scoped compression cooldown OWNERSHIP (#198 F1) ──
+    #
+    # The cooldown columns are keyed by session_id, but the compressor objects
+    # that mutate them are per AIAgent instance, and Hermes supports several
+    # agents sharing one session_id. The idle-timeout path deliberately
+    # releases a stale worker's lease so a NEW compressor can take the session
+    # while the old provider is still blocked, so "am I the current lock
+    # holder?" cannot qualify a late rollback: the successor may write its own
+    # row AND release its lease before the stale worker resumes.
+    #
+    # Each lease-owning attempt therefore stamps an ownership TOKEN for the
+    # session before capturing the row it may later restore, and the restore is
+    # refused unless that token is still the session's current one — compared
+    # inside the SAME write transaction as the UPDATE.
+    #
+    # The token is an unforgeable per-lease nonce, never a counter and never a
+    # cooldown VALUE: a successor that happens to write byte-identical visible
+    # values still owns a DIFFERENT token, so ownership can never collapse into
+    # value equality (no ABA). It lives in ``state_meta`` — outside the
+    # ``compression_locks`` row that release deletes — so the fact survives the
+    # successor's own release. Losing the row cannot resurrect a stale owner: an
+    # absent or rewritten token compares unequal and the restore is refused
+    # (fail closed). Like ``conversation_generations``, these rows must NEVER be
+    # swept or cascaded: deleting one lets a later attempt mint a token that a
+    # still-detached attempt may already be holding.
+    _COMPRESSION_COOLDOWN_OWNER_META_PREFIX = "compression_cooldown_owner:"
+
+    @classmethod
+    def _compression_cooldown_owner_key(cls, session_id: str) -> str:
+        return f"{cls._COMPRESSION_COOLDOWN_OWNER_META_PREFIX}{session_id}"
+
+    def begin_compression_cooldown_ownership(
+        self,
+        session_id: str,
+    ) -> Dict[str, Any]:
+        """Take cooldown ownership of ``session_id`` and snapshot its row.
+
+        One transaction: mint this attempt's ownership token and read the exact
+        cooldown columns it may later have to restore. Atomic by construction,
+        so the returned ``owner_token`` describes exactly the returned row.
+
+        Returns the ``get_compression_failure_cooldown_row`` mapping plus
+        ``owner_token``. Callers pass the whole mapping back to
+        :meth:`restore_compression_failure_cooldown_row_for_owner`.
+        """
+        if not session_id:
+            return {
+                "session_exists": False,
+                "cooldown_until": None,
+                "error": None,
+                "owner_token": None,
+            }
+        key = self._compression_cooldown_owner_key(session_id)
+        token = os.urandom(16).hex()
+
+        def _do(conn):
+            conn.execute(
+                "INSERT INTO state_meta (key, value) VALUES (?, ?) "
+                "ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                (key, token),
+            )
+            row = conn.execute(
+                "SELECT compression_failure_cooldown_until, "
+                "compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if row is None:
+                return {
+                    "session_exists": False,
+                    "cooldown_until": None,
+                    "error": None,
+                }
+            cooldown_until = (
+                row["compression_failure_cooldown_until"]
+                if isinstance(row, sqlite3.Row)
+                else row[0]
+            )
+            error = (
+                row["compression_failure_error"]
+                if isinstance(row, sqlite3.Row)
+                else row[1]
+            )
+            return {
+                "session_exists": True,
+                "cooldown_until": (
+                    float(cooldown_until) if cooldown_until is not None else None
+                ),
+                "error": error,
+            }
+
+        snapshot = self._execute_write(_do)
+        snapshot["owner_token"] = token
+        return snapshot
+
+    def restore_compression_failure_cooldown_row_for_owner(
+        self,
+        session_id: str,
+        snapshot: Dict[str, Any],
+    ) -> bool:
+        """Restore an exact cooldown snapshot only while its owner still owns it.
+
+        ``snapshot`` is what :meth:`begin_compression_cooldown_ownership`
+        returned, including its ``owner_token``. Supersedes the unqualified
+        :meth:`restore_compression_failure_cooldown_row` for cancellation
+        compensation: the ownership comparison, the UPDATE and the verification
+        read-back all run inside ONE write transaction, so an ownership check
+        can never be separated from the mutation it authorizes, and a later
+        attempt that took the session between them is never overwritten —
+        including when that attempt has already released its lease.
+
+        Returns True when the row was restored and verified, False when a later
+        owner holds the session (nothing is written). Write and verification
+        failures still propagate: a caller must not report cancellation as
+        mutation-free when compensation failed.
+        """
+        token = snapshot.get("owner_token")
+        if not isinstance(token, str) or not token:
+            raise RuntimeError(
+                "compression cooldown rollback requires an ownership token"
+            )
+        key = self._compression_cooldown_owner_key(session_id)
+        expected_exists = bool(snapshot.get("session_exists", False))
+        deadline = snapshot.get("cooldown_until")
+        error = snapshot.get("error")
+        expected_deadline = float(deadline) if deadline is not None else None
+
+        def _do(conn):
+            owner_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+            current = None
+            if owner_row is not None:
+                current = (
+                    owner_row["value"]
+                    if isinstance(owner_row, sqlite3.Row)
+                    else owner_row[0]
+                )
+            if current != token:
+                # A later attempt owns this session's cooldown state; its row
+                # stands even if it has already released its lease.
+                return False
+            row = conn.execute(
+                "SELECT compression_failure_cooldown_until, "
+                "compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            if not expected_exists:
+                if row is not None:
+                    raise RuntimeError(
+                        "cannot restore absent compression cooldown row: "
+                        "session now exists"
+                    )
+                return True
+            cursor = conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = ?, "
+                "compression_failure_error = ? WHERE id = ?",
+                (expected_deadline, error, session_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError(
+                    f"compression cooldown rollback session missing: {session_id}"
+                )
+            verify = conn.execute(
+                "SELECT compression_failure_cooldown_until, "
+                "compression_failure_error FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()
+            actual_deadline = (
+                verify["compression_failure_cooldown_until"]
+                if isinstance(verify, sqlite3.Row)
+                else verify[0]
+            )
+            actual_error = (
+                verify["compression_failure_error"]
+                if isinstance(verify, sqlite3.Row)
+                else verify[1]
+            )
+            actual_deadline = (
+                float(actual_deadline) if actual_deadline is not None else None
+            )
+            if (actual_deadline, actual_error) != (expected_deadline, error):
+                raise RuntimeError(
+                    "compression cooldown rollback verification failed: "
+                    f"expected={(expected_deadline, error)!r}, "
+                    f"actual={(actual_deadline, actual_error)!r}"
+                )
+            return True
+
+        return bool(self._execute_write(_do))
+
     def restore_compression_failure_cooldown_row(
         self,
         session_id: str,

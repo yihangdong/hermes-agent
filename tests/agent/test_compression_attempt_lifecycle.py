@@ -1004,9 +1004,16 @@ class _DurableCooldownStore:
         self.row = dict(row)
         self.writes: list[str] = []
 
-    def restore_compression_failure_cooldown_row(self, session_id, state):
+    def restore_compression_failure_cooldown_row_for_owner(self, session_id, state):
+        # Owner-qualified rollback API (#198 F1). This stand-in keeps ORDER,
+        # not ownership, as its subject: the controls below prove the
+        # per-compressor mutex still makes "check then durable write" one step
+        # for one compressor object. Cross-compressor session ownership is
+        # proved at the REAL SessionDB boundary in
+        # tests/agent/test_compression_worker_isolation_76354.py.
         self.writes.append("rollback")
         self.row = dict(state)
+        return True
 
     def record_compression_failure_cooldown(self, session_id, deadline, error):
         self.writes.append("successor")

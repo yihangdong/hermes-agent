@@ -723,20 +723,40 @@ def _restore_compressor_attempt_state_inner(
             if durable_cooldown_authoritative is True:
                 restorer = getattr(
                     type(session_db),
-                    "restore_compression_failure_cooldown_row",
+                    "restore_compression_failure_cooldown_row_for_owner",
                     None,
                 )
                 if not callable(restorer) or durable_cooldown_state is None:
                     raise RuntimeError(
                         "exact compression cooldown rollback API is unavailable"
                     )
+                # #198 F1: the durable cooldown row is owned per SESSION, while
+                # the rollback mutex and attempt generation are owned per
+                # COMPRESSOR OBJECT. A DIFFERENT compressor admitted after the
+                # idle-timeout path released our lease is therefore invisible to
+                # both, and a current-holder check would not see it either: the
+                # successor may write its row AND release before we resume.
                 # This API restores raw columns (including expired and null
-                # combinations), verifies the read-back, and propagates failure.
-                restorer(
+                # combinations) only while the ownership token minted when we
+                # captured the row is still the session's current one, compares
+                # that token INSIDE the same write transaction as the UPDATE,
+                # verifies the read-back, and propagates write/verify failure.
+                # A False return means a later owner holds the session's cooldown
+                # state, so its row stands and this cancellation has nothing
+                # durable to compensate. The in-memory restore below is
+                # unaffected: those attributes belong to THIS compressor object
+                # and are still guarded by the generation checks.
+                if not restorer(
                     session_db,
                     session_id,
                     copy.deepcopy(durable_cooldown_state),
-                )
+                ):
+                    logger.warning(
+                        "Skipping stale durable compression cooldown rollback "
+                        "for session=%s: a later compression owner holds the "
+                        "session's cooldown state (#198 F1).",
+                        session_id,
+                    )
             else:
                 try:
                     deadline = float(
@@ -819,7 +839,9 @@ def _capture_authoritative_cooldown_under_lease(
         session_id = values.get("_session_id")
         raw_reader = (
             getattr(
-                type(session_db), "get_compression_failure_cooldown_row", None
+                type(session_db),
+                "begin_compression_cooldown_ownership",
+                None,
             )
             if session_db is not None
             else None
@@ -828,13 +850,26 @@ def _capture_authoritative_cooldown_under_lease(
             # Unbound compressors have no durable row to mutate or restore.
             return None, None
         if not callable(raw_reader):
+            # Same persistence-safety rule as a missing raw reader (#198 F1):
+            # without a session ownership stamp, a later cancellation could only
+            # restore this row UNQUALIFIED, which is exactly the cross-compressor
+            # overwrite. Refuse to call the row authoritative instead.
             return False, None
-        # Capture the exact persisted representation first. The active getter
-        # intentionally filters expired rows and therefore cannot serve as a
-        # lossless rollback snapshot.
+        # Stamp session cooldown ownership and capture the exact persisted
+        # representation in ONE transaction, so no writer can change the row
+        # between the stamp and the snapshot: the returned token describes
+        # exactly the returned row. The active getter intentionally filters
+        # expired rows and therefore cannot serve as a lossless rollback
+        # snapshot. The token rides WITH the snapshot, so every caller that
+        # already forwards ``durable_cooldown_state`` forwards the ownership
+        # epoch it was captured under, without changing this function's arity.
         durable_state = raw_reader(session_db, session_id)
         if not isinstance(durable_state, dict):
             raise TypeError("raw compression cooldown snapshot must be a mapping")
+        if not durable_state.get("owner_token"):
+            raise TypeError(
+                "raw compression cooldown snapshot carries no ownership token"
+            )
         ContextCompressor.get_active_compression_failure_cooldown(
             compressor,
             refresh=True,

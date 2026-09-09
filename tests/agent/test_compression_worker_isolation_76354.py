@@ -763,3 +763,204 @@ def test_f5_session_contextvar_rebound_after_rotation(
         )
     finally:
         clear_session_vars(tokens)
+
+
+# ---------------------------------------------------------------------------
+# #198 F1: cross-COMPRESSOR durable cooldown ownership, at the REAL boundary.
+#
+# The rollback mutex and the attempt generation live on ONE compressor object,
+# while the durable cooldown row is keyed by session_id. Two AIAgents sharing a
+# session own DIFFERENT compressors, so neither mechanism orders them. These
+# controls therefore run a REAL built-in ContextCompressor against a REAL
+# SessionDB (a MagicMock compressor is rejected by
+# ``_capture_authoritative_cooldown_under_lease`` and never reaches the raw
+# durable path at all). No sleep, no retry, no timing tolerance: every step is
+# causally ordered by the call sequence.
+# ---------------------------------------------------------------------------
+
+
+def _build_agent_with_real_compressor(db: SessionDB, session_id: str):
+    """An AIAgent whose REAL built-in ContextCompressor stays installed."""
+    from agent.context_compressor import ContextCompressor
+
+    with patch.dict(os.environ, {"OPENROUTER_API_KEY": "test-key"}):
+        from run_agent import AIAgent
+
+        agent = AIAgent(
+            api_key="test-key",
+            base_url="https://openrouter.ai/api/v1",
+            model="test/model",
+            quiet_mode=True,
+            session_db=db,
+            session_id=session_id,
+            skip_context_files=True,
+            skip_memory=True,
+        )
+    compressor = agent.context_compressor
+    assert isinstance(compressor, ContextCompressor), (
+        "this control must exercise the built-in compressor, not a stub"
+    )
+    # Production locates the durable boundary through exactly these two
+    # attributes (``vars(compressor)``); pin them so the control cannot
+    # silently degrade to an unbound compressor.
+    compressor._session_db = db
+    compressor._session_id = session_id
+    agent._compression_feasibility_checked = True
+    return agent, compressor
+
+
+def _capture_authoritative_row_under_lease(compressor, db, session_id, holder):
+    """Own the session lease, then capture exactly as production does."""
+    from agent import conversation_compression as cc
+
+    assert db.try_acquire_compression_lock(
+        session_id, holder, ttl_seconds=300
+    ), f"precondition: {holder} must own the session lease before capture"
+    authoritative, state = cc._capture_authoritative_cooldown_under_lease(
+        compressor, {}
+    )
+    assert authoritative is True, (
+        "precondition: a built-in compressor bound to a real SessionDB must "
+        "produce an AUTHORITATIVE capture, else this control is vacuous"
+    )
+    assert isinstance(state, dict) and state.get("owner_token"), (
+        "the authoritative capture carries no session ownership token"
+    )
+    return state
+
+
+def test_stale_cross_compressor_rollback_cannot_restore_successor_cooldown(
+    tmp_path: Path,
+) -> None:
+    """#198 F1: D1 written by a DIFFERENT compressor survives A's compensation.
+
+    Both successor lease states are covered, because a current-holder check
+    only survives the first one: the successor may still hold its lease, or may
+    already have released it before the stale primary resumes.
+    """
+    from agent import conversation_compression as cc
+
+    for successor_released in (False, True):
+        case = f"successor_released={successor_released}"
+        db = SessionDB(db_path=tmp_path / f"state-{int(successor_released)}.db")
+        session_id = "F1_CROSS_COMPRESSOR_COOLDOWN"
+        db.create_session(session_id, source="cli")
+        # D0: the authoritative row the stale primary will try to restore.
+        db.record_compression_failure_cooldown(
+            session_id, 4_000_000_000.0, "D0-primary"
+        )
+
+        _agent_a, compressor_a = _build_agent_with_real_compressor(db, session_id)
+        _agent_b, compressor_b = _build_agent_with_real_compressor(db, session_id)
+        assert compressor_a is not compressor_b, (
+            "two agents sharing one session must own DISTINCT compressors — "
+            "the exact shape #198 F1 is about"
+        )
+
+        # Primary A: claim, own the lease, capture D0.
+        generation_a = cc._claim_compressor_attempt(compressor_a)
+        holder_a = "pid:a:primary"
+        d0 = _capture_authoritative_row_under_lease(
+            compressor_a, db, session_id, holder_a
+        )
+        assert d0["session_exists"] is True
+        assert d0["cooldown_until"] == 4_000_000_000.0
+        assert d0["error"] == "D0-primary"
+
+        # The idle timeout poison-cancels A and invokes its holder-qualified
+        # release while A's provider is still blocked. That the host really
+        # does this is proved by test_f4_five_step_stale_holder_regression;
+        # here the same release call is made directly so the interleaving is
+        # fixed instead of scheduled.
+        db.release_compression_lock(session_id, holder_a)
+        assert db.get_compression_lock_holder(session_id) is None, case
+
+        # Successor B: a DISTINCT compressor takes the same session and writes
+        # its own authoritative row D1 through the production API.
+        cc._claim_compressor_attempt(compressor_b)
+        holder_b = "pid:b:successor"
+        _capture_authoritative_row_under_lease(
+            compressor_b, db, session_id, holder_b
+        )
+        db.record_compression_failure_cooldown(
+            session_id, 5_000_000_000.0, "D1-successor"
+        )
+        if successor_released:
+            db.release_compression_lock(session_id, holder_b)
+            assert db.get_compression_lock_holder(session_id) is None, case
+        else:
+            assert db.get_compression_lock_holder(session_id) == holder_b, case
+
+        # A's provider returns: cancellation compensation runs with D0.
+        cc._restore_compressor_attempt_state(
+            compressor_a,
+            {
+                "_summary_failure_cooldown_until": 11.0,
+                "_last_summary_error": "D0-primary",
+            },
+            durable_cooldown_authoritative=True,
+            durable_cooldown_state=d0,
+            attempt_generation=generation_a,
+        )
+
+        assert db.get_compression_failure_cooldown_row(session_id) == {
+            "session_exists": True,
+            "cooldown_until": 5_000_000_000.0,
+            "error": "D1-successor",
+        }, (
+            "a stale primary restored its captured cooldown row over a "
+            f"DIFFERENT compressor's successor-owned row (#198 F1); {case}"
+        )
+        if not successor_released:
+            db.release_compression_lock(session_id, holder_b)
+
+
+def test_no_successor_cancellation_still_restores_the_exact_original_row(
+    tmp_path: Path,
+) -> None:
+    """#198 F1 must not be closed by suppressing late compensation."""
+    from agent import conversation_compression as cc
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "F1_NO_SUCCESSOR_COOLDOWN"
+    db.create_session(session_id, source="cli")
+    db.record_compression_failure_cooldown(
+        session_id, 4_000_000_000.0, "D0-original"
+    )
+
+    _agent, compressor = _build_agent_with_real_compressor(db, session_id)
+    generation = cc._claim_compressor_attempt(compressor)
+    holder = "pid:a:only"
+    d0 = _capture_authoritative_row_under_lease(
+        compressor, db, session_id, holder
+    )
+
+    # The attempt's own summary clears the durable row before the commit
+    # boundary — the mutation a pre-commit cancellation must undo.
+    db.clear_compression_failure_cooldown(session_id)
+    assert db.get_compression_failure_cooldown_row(session_id) == {
+        "session_exists": True,
+        "cooldown_until": None,
+        "error": None,
+    }
+
+    cc._restore_compressor_attempt_state(
+        compressor,
+        {
+            "_summary_failure_cooldown_until": 11.0,
+            "_last_summary_error": "D0-original",
+        },
+        durable_cooldown_authoritative=True,
+        durable_cooldown_state=d0,
+        attempt_generation=generation,
+    )
+
+    assert db.get_compression_failure_cooldown_row(session_id) == {
+        "session_exists": True,
+        "cooldown_until": 4_000_000_000.0,
+        "error": "D0-original",
+    }, (
+        "a legitimate cancellation with NO later session owner failed to "
+        "restore the exact original authoritative row (#198 F1)"
+    )
+    db.release_compression_lock(session_id, holder)

@@ -2188,9 +2188,14 @@ def test_cooldown_rollback_failure_surfaces_and_releases_lease(
     def _rollback_write_fails(_self, _session_id, _snapshot) -> None:
         raise sqlite3.OperationalError("forced rollback write failure")
 
+    # #198 F1: the production cancellation compensation now resolves the
+    # OWNER-QUALIFIED rollback API off the SessionDB class, so the injected
+    # failure must target that method to keep intercepting the real
+    # compensating durable write. The unqualified method is retained and keeps
+    # its own direct raw-API contract tests below.
     monkeypatch.setattr(
         SessionDB,
-        "restore_compression_failure_cooldown_row",
+        "restore_compression_failure_cooldown_row_for_owner",
         _rollback_write_fails,
     )
 
