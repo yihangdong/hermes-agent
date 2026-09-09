@@ -21,9 +21,11 @@ These tests pin the contract:
 from __future__ import annotations
 
 import threading
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from agent import conversation_compression as cc
 from agent.context_compressor import (
     ContextCompressor,
     pin_summary_route,
@@ -163,6 +165,44 @@ def test_retry_runs_on_a_host_published_fence():
     assert worker.fences[1] is minted[0]
     assert worker.fences[1] is not worker.fences[0]
     assert worker.fences[0].is_cancelled, "the aborted attempt stays cancelled"
+
+
+def test_slow_setup_does_not_consume_the_primary_attempt():
+    """#97488: the ceiling is charged from the post-setup attempt epoch.
+
+    With the ceiling armed BEFORE the wrapper's lazy setup, a cold start
+    longer than the tiny test ceiling refused the PRIMARY worker pre-start, so
+    the one permitted fallback became the only attempt that ever ran.
+    """
+    original = [{"role": "user", "content": "keep-me"}]
+    compressed = [{"role": "user", "content": "summary of earlier turns"}]
+    worker = _StalledSummaryWorker(compressed)
+    timeouts = []
+    real_executor = cc._get_compress_timeout_executor
+
+    def _slow_setup():
+        executor = real_executor()
+        time.sleep(0.3)  # > the 0.2s ceiling of this attempt
+        return executor
+
+    try:
+        with patch.object(cc, "_get_compress_timeout_executor", _slow_setup):
+            msgs, prompt = _run(
+                worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
+            )
+    finally:
+        worker.release.set()
+
+    assert worker.attempts == 2, (
+        "the primary attempt must still enter its worker after slow setup, "
+        "and the stall must be retried exactly once"
+    )
+    assert worker.routes[0] is None, "the primary attempt is never pinned"
+    assert worker.routes[1] is not None, "the retry carries the fallback route"
+    assert worker.fences[1] is not worker.fences[0], "the retry needs a fresh fence"
+    assert worker.fences[0].is_cancelled, "the aborted attempt stays cancelled"
+    assert msgs == compressed and prompt == "summarized-prompt"
+    assert not timeouts, "no continue-without-compression degrade after recovery"
 
 
 def test_hard_interrupt_suppresses_the_fallback_attempt():

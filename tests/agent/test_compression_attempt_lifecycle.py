@@ -19,6 +19,7 @@ collapsed lean compaction to one auxiliary request per attempt:
 
 from __future__ import annotations
 
+import concurrent.futures
 import copy
 import os
 import threading
@@ -28,6 +29,7 @@ from unittest.mock import patch
 
 import pytest
 
+from agent import conversation_compression as cc
 from agent.auxiliary_client import AuxiliaryExplicitCancellation
 from agent.conversation_compression import (
     CompressionCommitFence,
@@ -65,6 +67,22 @@ def _build_agent(tmp_path: Path, session_id: str, db: SessionDB | None = None):
 
 def _messages():
     return [{"role": "user", "content": f"m{i}"} for i in range(20)]
+
+
+def _slow_pool_setup(delay: float):
+    """Make the wrapper's lazy pool setup outlast a tiny test ceiling.
+
+    Models the CI cold start (first ``tools.thread_context`` import + pool
+    construction) that runs BEFORE the attempt epoch is established.
+    """
+    real = cc._get_compress_timeout_executor
+
+    def _slow():
+        executor = real()
+        time.sleep(delay)
+        return executor
+
+    return patch.object(cc, "_get_compress_timeout_executor", _slow)
 
 
 class TestWorkerTeardownOnCeiling:
@@ -168,6 +186,183 @@ class TestWorkerTeardownOnCeiling:
         assert worker_finished.wait(timeout=2)
         # Late result was fence-poisoned, never adopted.
         assert msgs == [{"role": "user", "content": "keep"}]
+
+
+class TestCommonAttemptEpoch:
+    """#97488 clock origin: setup latency is not provider silence."""
+
+    def test_setup_delay_before_the_epoch_still_admits_the_worker(self):
+        original = [{"role": "user", "content": "keep"}]
+        entered = threading.Event()
+        worker_done = threading.Event()
+
+        def cooperative_worker(fence: CompressionCommitFence):
+            entered.set()
+            deadline = time.monotonic() + 5.0
+            while time.monotonic() < deadline:
+                if fence.is_cancelled:
+                    break
+                fence.touch_progress()
+                time.sleep(0.01)
+            time.sleep(0.08)
+            worker_done.set()
+            return (original, "late")
+
+        fence = CompressionCommitFence()
+        started = time.monotonic()
+        with _slow_pool_setup(0.35):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=cooperative_worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                fence=fence,
+                stall_fallback=False,
+            )
+        elapsed = time.monotonic() - started
+        assert entered.is_set(), (
+            "worker never entered: setup latency ahead of the attempt epoch "
+            "consumed the whole ceiling (#97488)"
+        )
+        assert elapsed >= 0.5, (
+            "the ceiling must be charged from the post-setup epoch, not from "
+            "fence construction"
+        )
+        assert worker_done.is_set(), "cooperative worker was not joined"
+        assert msgs == [{"role": "user", "content": "keep"}]
+        assert prompt in ("fallback", "late")
+        assert fence._retain_cancelled_lock_until_worker_done is False
+
+    def test_worker_thrown_timeout_error_is_a_completed_outcome(self):
+        original = [{"role": "user", "content": "keep"}]
+        timeouts = []
+        fence = CompressionCommitFence()
+
+        def timing_out_worker(_fence: CompressionCommitFence):
+            raise concurrent.futures.TimeoutError("provider read timed out")
+
+        with pytest.raises(
+            concurrent.futures.TimeoutError, match="provider read timed out"
+        ):
+            run_compress_context_with_progress_timeout(
+                worker=timing_out_worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                fence=fence,
+                on_timeout=lambda *args: timeouts.append(args),
+                stall_fallback=False,
+            )
+        assert not timeouts, (
+            "a settled worker TimeoutError was misread as a host wait timeout"
+        )
+        assert fence._retain_cancelled_lock_until_worker_done is False
+
+    def test_live_worker_reports_live_only_when_not_done_after_grace(self):
+        original = [{"role": "user", "content": "keep"}]
+        release = threading.Event()
+        started = threading.Event()
+        joins = []
+        real_join = cc._join_cancelled_worker
+
+        def _record_join(future, grace_seconds):
+            outcome = real_join(future, grace_seconds)
+            joins.append((outcome, future.done()))
+            return outcome
+
+        def stuck_worker(fence: CompressionCommitFence):
+            started.set()
+            while not release.wait(timeout=0.02):
+                fence.touch_progress()
+            return ([{"role": "assistant", "content": "late"}], "late")
+
+        fence = CompressionCommitFence()
+        try:
+            with patch.object(cc, "_join_cancelled_worker", _record_join):
+                msgs, prompt = run_compress_context_with_progress_timeout(
+                    worker=stuck_worker,
+                    messages=original,
+                    system_prompt_fallback="fallback",
+                    idle_timeout_seconds=0.1,
+                    total_ceiling_seconds=0.3,
+                    fence=fence,
+                    stall_fallback=False,
+                )
+            assert started.is_set()
+            assert msgs is original and prompt == "fallback"
+            assert joins == [(False, False)], (
+                "a genuinely running future must be reported live"
+            )
+            assert fence.is_cancelled, "the timed-out fence must be poisoned"
+            assert fence._retain_cancelled_lock_until_worker_done is True
+            assert fence.begin_commit() is False, "late commit was admitted"
+        finally:
+            release.set()
+
+
+class TestExistingSafetyControlsIntact:
+    def test_in_flight_commit_is_never_abandoned_past_the_ceiling(self):
+        original = [{"role": "user", "content": "keep"}]
+        compressed = [{"role": "assistant", "content": "committed"}]
+        in_commit = threading.Event()
+        finish = threading.Event()
+        overruns = []
+
+        def committing_worker(fence: CompressionCommitFence):
+            assert fence.begin_commit()
+            try:
+                in_commit.set()
+                assert finish.wait(timeout=5)
+                return (compressed, "committed")
+            finally:
+                fence.finish_commit()
+
+        def _finish_after_ceiling():
+            if in_commit.wait(timeout=5):
+                time.sleep(0.35)
+            finish.set()
+
+        releaser = threading.Thread(target=_finish_after_ceiling, daemon=True)
+        releaser.start()
+        try:
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=committing_worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                on_commit_overrun=lambda *args: overruns.append(args),
+                stall_fallback=False,
+            )
+        finally:
+            finish.set()
+            releaser.join(timeout=5)
+        assert msgs == compressed and prompt == "committed", (
+            "an admitted in-flight commit must never be abandoned"
+        )
+        assert len(overruns) == 1, "commit overrun must surface exactly once"
+
+    def test_pool_saturation_still_fails_closed(self):
+        original = [{"role": "user", "content": "keep"}]
+        entered = []
+
+        def refused_worker(fence: CompressionCommitFence):
+            entered.append(fence)
+            return ([{"role": "assistant", "content": "nope"}], "nope")
+
+        with patch.object(cc, "_try_admit_compression_job", return_value=False):
+            msgs, prompt = run_compress_context_with_progress_timeout(
+                worker=refused_worker,
+                messages=original,
+                system_prompt_fallback="fallback",
+                idle_timeout_seconds=0.1,
+                total_ceiling_seconds=0.2,
+                stall_fallback=False,
+            )
+        assert msgs is original and prompt == "fallback"
+        assert not entered, "a saturation refusal must never run a worker"
 
 
 class TestDurableAttemptBackoff:

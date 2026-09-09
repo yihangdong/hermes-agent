@@ -206,6 +206,95 @@ def test_host_timeout_releases_pool_slot_while_protected_provider_is_still_block
             time.sleep(0.02)
 
 
+def test_slow_pool_setup_still_reaches_the_protected_provider(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """Cold-start setup longer than the ceiling must not eat the attempt.
+
+    The wrapper's lazy setup runs BEFORE the attempt epoch; with the ceiling
+    armed ahead of it, a slow CI start expired the fence before the
+    compression owner could enter, so the isolated provider never started and
+    the owner-slot release proved nothing (#97488). Budgets are unchanged.
+    """
+    from agent import auxiliary_client as aux
+    from agent import conversation_compression as cc
+
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        with cc._compress_admission_lock:
+            if cc._compress_admitted_count == 0:
+                break
+        time.sleep(0.02)
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "F3_SLOW_SETUP_OWNER_RELEASE"
+    db.create_session(session_id, source="cli")
+    agent = _build_agent_with_db(db, session_id)
+    agent._cached_system_prompt = "sys"
+    monkeypatch.setattr(
+        "agent.conversation_compression.resolve_context_compression_timeouts",
+        lambda cfg=None: (0.05, 0.1),
+    )
+
+    real_executor = cc._get_compress_timeout_executor
+
+    def _slow_setup():
+        executor = real_executor()
+        time.sleep(0.3)  # > the 0.1s ceiling armed for this attempt
+        return executor
+
+    monkeypatch.setattr(cc, "_get_compress_timeout_executor", _slow_setup)
+
+    provider_started = threading.Event()
+    release_provider = threading.Event()
+
+    def _blocked_provider(_kwargs):
+        provider_started.set()
+        assert release_provider.wait(timeout=10)
+        return "late-provider-result"
+
+    def _compress_with_protected_provider(msgs, **_kwargs):
+        aux._run_protected_sync_provider_call(_blocked_provider, {})
+        return msgs
+
+    agent.context_compressor.compress.side_effect = _compress_with_protected_provider
+    live = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    baseline = copy.deepcopy(live)
+
+    try:
+        returned, _sp = agent._compress_context(
+            live, "sys", approx_tokens=120_000
+        )
+        assert returned is live
+        assert provider_started.wait(timeout=2), (
+            "the compression owner never entered: setup latency consumed the "
+            "attempt before its epoch was established"
+        )
+        assert not release_provider.is_set()
+
+        deadline = time.time() + 1
+        while time.time() < deadline:
+            with cc._compress_admission_lock:
+                if cc._compress_admitted_count == 0:
+                    break
+            time.sleep(0.01)
+        with cc._compress_admission_lock:
+            assert cc._compress_admitted_count == 0, (
+                "timed-out compression owner retained its shared pool slot "
+                "while the isolated provider stream was still blocked"
+            )
+        assert live == baseline
+    finally:
+        release_provider.set()
+        deadline = time.time() + 5
+        while time.time() < deadline:
+            with cc._compress_admission_lock:
+                if cc._compress_admitted_count == 0:
+                    break
+            time.sleep(0.02)
+    assert live == baseline, "late provider result published over the transcript"
+
+
 def test_f4_five_step_stale_holder_regression(tmp_path: Path) -> None:
     """Reviewer's exact 5-step durable-lease regression (#76354 F4).
 

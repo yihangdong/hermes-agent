@@ -728,6 +728,27 @@ class CompressionCommitFence:
             raise ValueError("total compression ceiling must be positive")
         self._deadline = time.monotonic() + seconds
 
+    def begin_attempt(self, total_ceiling_seconds: float) -> float:
+        """Arm the ceiling AND the idle clock from one attempt epoch.
+
+        Returns the monotonic epoch the host must also use for its own
+        elapsed-time accounting. The fence is constructed before an attempt's
+        lazy setup runs (cold ``tools.thread_context`` import, first-use pool
+        construction), so a construction-time origin charged that setup to the
+        provider: the ceiling could expire before the worker was ever admitted
+        while the host's wait clock still read ~0 (#97488). No budget changes
+        here — only the instant both clocks are charged from.
+        """
+        epoch = time.monotonic()
+        seconds = float(total_ceiling_seconds)
+        if seconds <= 0:
+            raise ValueError("total compression ceiling must be positive")
+        self._deadline = epoch + seconds
+        # ``_progress_observed`` is deliberately left alone: it means "the
+        # PROVIDER reported progress", and no worker has run for this attempt.
+        self._last_progress = epoch
+        return epoch
+
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
 
@@ -1011,7 +1032,12 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
         future.result(timeout=grace)
         return True
     except concurrent.futures.TimeoutError:
-        return False
+        # Ambiguous by class (#97488): the grace may have expired, or the
+        # WORKER may itself have settled by raising TimeoutError (the
+        # fence-gated pre-start refusal does exactly that). Quiescence is a
+        # property of future STATE — a settled future proves the worker thread
+        # left; only a still-running one is a live orphan.
+        return bool(future.done())
     except concurrent.futures.CancelledError:
         # Never started; nothing can be in flight.
         return True
@@ -1047,6 +1073,46 @@ _compress_admitted_count = 0
 
 class CompressionExecutorSaturatedError(RuntimeError):
     """All compression pool slots are occupied; submission was refused."""
+
+
+class _CompressionWorkerPreStartExpiry(concurrent.futures.TimeoutError):
+    """The fence-gated worker refused to START: the attempt was already over.
+
+    Subclasses ``concurrent.futures.TimeoutError`` so every existing handler
+    keeps its behaviour, while letting the host tell "the worker never
+    started" apart from "this host's bounded wait slice expired" and from a
+    genuine worker fault.
+    """
+
+
+def _settled_worker_outcome(future: Any) -> Optional[Tuple[str, Any]]:
+    """Classify a ``TimeoutError`` raised by ``future.result(timeout=...)``.
+
+    That call raises ``TimeoutError`` for two unrelated events (#97488): the
+    caller's bounded wait expired (future still running), or the worker
+    finished by RAISING ``TimeoutError`` (future settled). The class is
+    ambiguous, so classify from future state instead.
+
+    Returns ``None`` for a genuine host wait expiry, else ``(kind, payload)``
+    with kind ``"result"``, ``"exception"`` or ``"not_started"``.
+    """
+    if not future.done():
+        return None
+    try:
+        exc = future.exception(timeout=0)
+    except concurrent.futures.CancelledError as cancelled:
+        return "exception", cancelled
+    except concurrent.futures.TimeoutError:
+        # Lost the settle race after ``done()`` — treat as a host wait expiry.
+        return None
+    if isinstance(exc, _CompressionWorkerPreStartExpiry):
+        return "not_started", exc
+    if exc is not None:
+        return "exception", exc
+    try:
+        return "result", future.result(timeout=0)
+    except BaseException as settled_exc:  # pragma: no cover - settled above
+        return "exception", settled_exc
 
 
 def _try_admit_compression_job() -> bool:
@@ -1477,7 +1543,9 @@ def run_compress_context_with_progress_timeout(
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
     fence = fence if fence is not None else CompressionCommitFence()
-    fence.set_total_ceiling_seconds(ceiling)
+    # The ceiling is armed AFTER the lazy setup below, from one shared attempt
+    # epoch (``fence.begin_attempt``), so a cold import or first-use pool build
+    # can no longer consume the whole budget before the worker can enter.
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1518,7 +1586,10 @@ def run_compress_context_with_progress_timeout(
         # summary work so a stale job never burns an LLM call; its return
         # value is discarded by the already-departed host.
         if worker_fence.deadline_exceeded:
-            raise concurrent.futures.TimeoutError(
+            # Distinct subclass (still a ``concurrent.futures.TimeoutError``
+            # for existing handlers) so a host that is somehow still waiting
+            # can tell a never-started worker apart from its own wait expiry.
+            raise _CompressionWorkerPreStartExpiry(
                 "compression deadline expired before worker start"
             )
         if worker_fence.is_cancelled:
@@ -1528,6 +1599,10 @@ def run_compress_context_with_progress_timeout(
             return messages, ""
         return worker(worker_fence)
 
+    # One monotonic attempt epoch (#97488): the fence ceiling, the fence idle
+    # clock and this host's elapsed-time accounting all start HERE, after the
+    # local lazy setup above. Budgets are unchanged; only their origin is.
+    attempt_epoch = fence.begin_attempt(ceiling)
     # Bare pool workers start with an empty ContextVar map; propagate the
     # parent conversation/approval context into the worker.
     try:
@@ -1538,7 +1613,7 @@ def run_compress_context_with_progress_timeout(
         _release_compression_admission()
         raise
     future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
+    wait_started = attempt_epoch
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
@@ -1565,6 +1640,23 @@ def run_compress_context_with_progress_timeout(
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
+                settled = _settled_worker_outcome(future)
+                if settled is not None:
+                    kind, payload = settled
+                    if kind == "result":
+                        # The worker finished inside the expiring slice.
+                        handled_exit = True
+                        return payload
+                    if kind == "exception":
+                        # A completed worker that RAISED (TimeoutError or not)
+                        # is never a host wait timeout and never an orphan:
+                        # honour the ordinary worker-exception contract and
+                        # let ``finally`` revoke commit admission.
+                        raise payload
+                    # "not_started": the fence-gated worker refused to start
+                    # because this attempt was already over — that is this
+                    # host's own timeout, so take the shared degrade path.
+                    break
                 waited = time.monotonic() - wait_started
                 since_progress = fence.seconds_since_progress()
                 if (
@@ -1677,6 +1769,19 @@ def run_compress_context_with_progress_timeout(
                     handled_exit = True
                     return result
                 except concurrent.futures.TimeoutError:
+                    settled = _settled_worker_outcome(future)
+                    if settled is not None:
+                        # The commit worker settled (its own TimeoutError
+                        # included). Re-waiting on a settled future would spin
+                        # forever, so adopt the outcome: a result returns, a
+                        # raise follows the ordinary worker contract. The
+                        # commit is still never abandoned mid-flight — this
+                        # branch is reachable only once it has finished.
+                        kind, payload = settled
+                        if kind == "result":
+                            handled_exit = True
+                            return payload
+                        raise payload
                     # Fence progress (commit-phase touch_progress) is
                     # informative only — the commit must complete regardless;
                     # loop and re-report with the updated overrun window.
