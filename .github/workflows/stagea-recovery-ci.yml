@@ -1,0 +1,2246 @@
+# Governed successor CI carrier: AI-Org #198 gates 5626694014 / 5626766264.
+# Self-scoped labeled event only. R0 review precedes the single ci-reviewed
+# label addition; source authors do not self-label. No opened/manual trigger.
+# Existing workflow_call leaves are inlined at unchanged commands/action pins,
+# inputs and per-job permission ceilings. Product/source blobs are frozen.
+# Desktop E2E remains source-disabled; Python e2e and native OS lanes run.
+# The OSV job below incorporates the pinned Google reusable workflow:
+# Copyright 2023 Google LLC. Licensed under the Apache License, Version 2.0
+# (the "License"); you may not use this file except in compliance with the
+# License. You may obtain a copy at http://www.apache.org/licenses/LICENSE-2.0
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS, WITHOUT
+# WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+# License for the specific language governing permissions and limitations.
+
+name: Stage-A recovery CI
+'on':
+  pull_request:
+    types:
+    - labeled
+    branches:
+    - dyhano/canonical-base-ff7745fb
+    paths:
+    - .github/workflows/stagea-recovery-ci.yml
+permissions:
+  contents: read
+concurrency:
+  group: stagea-recovery-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  identity:
+    name: Bind labeled event and exact candidate
+    if: ${{ github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name ==
+      'ci-reviewed' && github.repository == 'yihangdong/hermes-agent' }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - name: Validate exact object and record sanitized identity
+      run: "python3 - <<'PY'\nimport hashlib, json, os, subprocess\nfrom pathlib import Path\ndef git(*args):\n\
+        \    return subprocess.check_output(['git', *args], text=True).strip()\nevent = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())\n\
+        pr = event['pull_request']\nhead, base = pr['head']['sha'], pr['base']['sha']\nassert event['action'] ==\
+        \ 'labeled' and event['label']['name'] == 'ci-reviewed'\nassert event['repository']['full_name'] == 'yihangdong/hermes-agent'\n\
+        assert pr['head']['repo']['full_name'] == 'yihangdong/hermes-agent'\nassert base == '2820750eccc6e9b336b1c024663cc8fe448fd065'\
+        \ and pr['base']['ref'] == 'dyhano/canonical-base-ff7745fb'\nassert os.environ['GITHUB_RUN_ATTEMPT'] ==\
+        \ '1'\nassert os.environ['GITHUB_REF'] == f\"refs/pull/{pr['number']}/merge\"\nmerge = git('rev-parse',\
+        \ 'HEAD')\nassert merge == os.environ['GITHUB_SHA']\nassert git('show', '-s', '--format=%P', merge).split()\
+        \ == [base, head]\nassert git('show', '-s', '--format=%P', head).split() == ['2318eca25a19d3476131fe99340a67a07a9e62b5']\n\
+        delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', '2318eca25a19d3476131fe99340a67a07a9e62b5',\
+        \ head)\nassert delta == 'A\t.github/workflows/stagea-recovery-ci.yml'\nassert sorted(git('diff', '--name-only',\
+        \ base, head).splitlines()) == ['.github/workflows/stagea-recovery-ci.yml', 'agent/stagea_proposal_only.py',\
+        \ 'pyproject.toml', 'tests/agent/test_stagea_proposal_only.py']\nassert git('rev-parse', merge + '^{tree}')\
+        \ == git('rev-parse', head + '^{tree}')\nreceipt = {'repository': event['repository']['full_name'], 'pr':\
+        \ pr['number'], 'head': head, 'base': base, 'merge': merge, 'merge_parents': [base, head], 'merge_tree':\
+        \ git('rev-parse', merge + '^{tree}'), 'head_tree': git('rev-parse', head + '^{tree}'), 'workflow_blob':\
+        \ git('rev-parse', head + ':.github/workflows/stagea-recovery-ci.yml'), 'run_id': os.environ['GITHUB_RUN_ID'],\
+        \ 'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'event': os.environ['GITHUB_EVENT_NAME'], 'action':\
+        \ event['action'], 'label': event['label']['name'], 'ref': os.environ['GITHUB_REF'], 'runner_os': os.environ['RUNNER_OS'],\
+        \ 'runner_arch': os.environ['RUNNER_ARCH'], 'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion')}\n\
+        Path('stagea-exact-object.json').write_text(json.dumps(receipt, indent=2) + '\\n')\nprint(json.dumps(receipt,\
+        \ sort_keys=True))\nPY\n"
+    - name: Upload exact object receipt
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: stagea-exact-object
+        path: stagea-exact-object.json
+        retention-days: 14
+        if-no-files-found: error
+  detect:
+    name: Detect affected areas
+    runs-on: ubuntu-latest
+    timeout-minutes: 1
+    outputs:
+      python: ${{ steps.classify.outputs.python }}
+      python_prod: ${{ steps.classify.outputs.python_prod }}
+      frontend: ${{ steps.classify.outputs.frontend }}
+      site: ${{ steps.classify.outputs.site }}
+      scan: ${{ steps.classify.outputs.scan }}
+      deps: ${{ steps.classify.outputs.deps }}
+      uv_lock: ${{ steps.classify.outputs.uv_lock }}
+      npm_lock: ${{ steps.classify.outputs.npm_lock }}
+      installer: ${{ steps.classify.outputs.installer }}
+      rust: ${{ steps.classify.outputs.rust }}
+      docker_meta: ${{ steps.classify.outputs.docker_meta }}
+      mcp_catalog: ${{ steps.classify.outputs.mcp_catalog }}
+      ci_review: ${{ steps.classify.outputs.ci_review }}
+      ci_review_files: ${{ steps.classify.outputs.ci_review_files }}
+      event_name: ${{ github.event_name }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Detect affected areas
+      id: classify
+      uses: ./.github/actions/detect-changes
+      with:
+        github-token: ${{ github.token }}
+    needs: identity
+    permissions:
+      contents: read
+  tests__test:
+    name: ${{ github.repository == 'yihangdong/hermes-agent' && format('Run tests {0}/4', matrix.slice) || 'Run
+      tests' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        slice: ${{ fromJSON(github.repository == 'yihangdong/hermes-agent' && '[1, 2, 3, 4]' || '[1]') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install ripgrep (prebuilt binary)
+      run: |
+        set -euo pipefail
+        RG_VERSION=15.1.0
+        RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+        RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+        curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+          "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+        echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+        tar -xzf "$RG_TARBALL"
+        sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+        rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+        rg --version
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          uv.lock
+    - name: Set up Python 3.11
+      uses: ./.github/actions/retry
+      with:
+        command: uv python install 3.11
+    - name: Install dependencies
+      uses: ./.github/actions/retry
+      with:
+        command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra
+          fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+    - name: Minimize uv cache
+      run: uv cache prune --ci
+    - name: Run tests
+      run: |
+        source .venv/bin/activate
+        if [ -n "${CI_TEST_SLICE:-}" ]; then
+          scripts/run_tests.sh --slice "$CI_TEST_SLICE"
+        else
+          scripts/run_tests.sh
+        fi
+      env:
+        HERMES_TEST_WORKERS: ${{ github.repository == 'yihangdong/hermes-agent' && '8' || '96' }}
+        CI_TEST_SLICE: ${{ github.repository == 'yihangdong/hermes-agent' && format('{0}/4', matrix.slice) || ''
+          }}
+        OPENROUTER_API_KEY: ''
+        OPENAI_API_KEY: ''
+        NOUS_API_KEY: ''
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && (true)) }}
+    permissions: &id001
+      contents: read
+  tests__e2e:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install ripgrep (prebuilt binary)
+      run: |
+        set -euo pipefail
+        RG_VERSION=15.1.0
+        RG_SHA256=1c9297be4a084eea7ecaedf93eb03d058d6faae29bbc57ecdaf5063921491599
+        RG_TARBALL=ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl.tar.gz
+        curl -sSfL --retry 3 --retry-delay 5 -o "$RG_TARBALL" \
+          "https://github.com/BurntSushi/ripgrep/releases/download/${RG_VERSION}/${RG_TARBALL}"
+        echo "${RG_SHA256}  ${RG_TARBALL}" | sha256sum -c -
+        tar -xzf "$RG_TARBALL"
+        sudo mv "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl/rg" /usr/local/bin/rg
+        rm -rf "$RG_TARBALL" "ripgrep-${RG_VERSION}-x86_64-unknown-linux-musl"
+        rg --version
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          uv.lock
+    - name: Set up Python 3.11
+      run: uv python install 3.11
+    - name: Install dependencies
+      uses: ./.github/actions/retry
+      with:
+        command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra
+          fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+    - name: Minimize uv cache
+      run: uv cache prune --ci
+    - name: Run e2e tests
+      run: |
+        source .venv/bin/activate
+        python -m pytest tests/e2e/ -v --tb=short
+      env:
+        OPENROUTER_API_KEY: ''
+        OPENAI_API_KEY: ''
+        NOUS_API_KEY: ''
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && (true)) }}
+    permissions: *id001
+  tests:
+    name: Recovery tests
+    needs:
+    - identity
+    - tests__test
+    - tests__e2e
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.python == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  tests-os__os-tests:
+    name: ${{ matrix.name }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+        - name: macOS-only tests
+          runner: macos-latest
+          marker: macos_only
+        - name: Windows-only tests
+          runner: windows-latest
+          marker: windows_only
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+        enable-cache: true
+        cache-dependency-glob: |
+          pyproject.toml
+          uv.lock
+    - name: Set up Python 3.11
+      uses: ./.github/actions/retry
+      with:
+        command: uv python install 3.11
+    - name: Install dependencies
+      uses: ./.github/actions/retry
+      with:
+        command: uv sync --locked --python 3.11 --extra all --extra dev --extra anthropic --extra mistral --extra
+          fal --extra modal --extra daytona --extra hindsight --extra parallel-web
+    - name: Minimize uv cache
+      run: uv cache prune --ci
+    - name: Run ${{ matrix.marker }} tests
+      shell: bash
+      run: |
+        set -uo pipefail
+
+        LIST="${RUNNER_TEMP:-.}/selected-tests.txt"
+
+        # Process substitution would hide the helper's exit status, so write
+        # to a file and check it explicitly.
+        if ! uv run --no-sync python scripts/ci/list_os_marked_tests.py \
+               "${{ matrix.marker }}" > "$LIST"; then
+          echo "::error::could not enumerate ${{ matrix.marker }} test files"
+          exit 1
+        fi
+        if [ ! -s "$LIST" ]; then
+          echo "::error::empty ${{ matrix.marker }} file list"
+          exit 1
+        fi
+
+        # Deliberately NOT `mapfile`: that is a bash 4 builtin and the macOS
+        # runner's /bin/bash is 3.2. Word-splitting is safe here because the
+        # helper emits repo-relative test paths, which contain no spaces.
+        # shellcheck disable=SC2046
+        set -- $(cat "$LIST")
+        echo "selected $# file(s) for ${{ matrix.marker }}:"
+        cat "$LIST"
+
+        # ``shell: bash`` runs this script with ``-e`` injected, which
+        # ``set -uo pipefail`` above does not clear. A bare pytest call
+        # would therefore abort the script on any non-zero exit and the
+        # exit-5 branch below would be unreachable dead code — the job
+        # would still fail red, but the diagnostic would never print.
+        status=0
+        uv run --no-sync python -m pytest \
+          "$@" \
+          -m "${{ matrix.marker }} and not integration" \
+          -v --tb=short || status=$?
+        if [ "$status" -eq 5 ]; then
+          echo "::error::No tests matched -m ${{ matrix.marker }}. Either the" \
+               "marker was renamed/dropped or selection is broken — this job" \
+               "must never pass without running its OS's tests."
+          exit 1
+        fi
+        exit "$status"
+      env:
+        OPENROUTER_API_KEY: ''
+        OPENAI_API_KEY: ''
+        NOUS_API_KEY: ''
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && (true)) }}
+    permissions:
+      contents: read
+  tests-os:
+    name: Recovery tests-os
+    needs:
+    - identity
+    - tests-os__os-tests
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.python == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  lint__lint-diff:
+    name: ruff + ty diff
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && ((needs.detect.outputs.event_name) == 'pull_request')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+    - name: Install ruff + ty
+      uses: ./.github/actions/retry
+      with:
+        command: uv tool install ruff && uv tool install ty
+    - name: Determine base ref
+      id: base
+      run: |
+        # For PRs, diff against the merge base with the target branch.
+        # For pushes to main, diff against the previous commit on main.
+        if [ "${{ (needs.detect.outputs.event_name) }}" = "pull_request" ]; then
+          BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+          BASE_REF="origin/${{ github.base_ref }}"
+        else
+          BASE_SHA=$(git rev-parse HEAD~1 2>/dev/null || git rev-parse HEAD)
+          BASE_REF="HEAD~1"
+        fi
+        echo "sha=${BASE_SHA}" >> "$GITHUB_OUTPUT"
+        echo "ref=${BASE_REF}" >> "$GITHUB_OUTPUT"
+        echo "Base SHA: ${BASE_SHA}"
+        echo "Base ref: ${BASE_REF}"
+    - name: Run ruff + ty on HEAD
+      run: |
+        mkdir -p .lint-reports/head
+        ruff check --output-format json --exit-zero \
+          > .lint-reports/head/ruff.json || true
+        ty check --output-format gitlab --exit-zero \
+          > .lint-reports/head/ty.json || true
+        echo "HEAD ruff: $(wc -c < .lint-reports/head/ruff.json) bytes"
+        echo "HEAD ty:   $(wc -c < .lint-reports/head/ty.json) bytes"
+    - name: Run ruff + ty on base (via git worktree)
+      run: |
+        mkdir -p .lint-reports/base
+        # Use a worktree so we don't clobber the main checkout. If the basex
+        # SHA is identical to HEAD (e.g. first commit), skip and leave the
+        # base reports empty — the diff script handles missing files.
+        HEAD_SHA=$(git rev-parse HEAD)
+        BASE_SHA="${{ steps.base.outputs.sha }}"
+        if [ "$BASE_SHA" = "$HEAD_SHA" ]; then
+          echo "Base SHA == HEAD SHA, skipping base scan."
+          echo '[]' > .lint-reports/base/ruff.json
+          echo '[]' > .lint-reports/base/ty.json
+        else
+          git worktree add --detach /tmp/lint-base "$BASE_SHA"
+          (
+            cd /tmp/lint-base
+            ruff check --output-format json --exit-zero \
+              > "$GITHUB_WORKSPACE/.lint-reports/base/ruff.json" || true
+            ty check --output-format gitlab --exit-zero \
+              > "$GITHUB_WORKSPACE/.lint-reports/base/ty.json" || true
+          )
+          git worktree remove --force /tmp/lint-base
+        fi
+        echo "base ruff: $(wc -c < .lint-reports/base/ruff.json) bytes"
+        echo "base ty:   $(wc -c < .lint-reports/base/ty.json) bytes"
+    - name: Generate diff summary
+      env:
+        HEAD_REF: ${{ (needs.detect.outputs.event_name) == 'pull_request' && github.head_ref || github.ref_name
+          }}
+      run: |
+        python scripts/lint_diff.py \
+          --base-ruff .lint-reports/base/ruff.json \
+          --head-ruff .lint-reports/head/ruff.json \
+          --base-ty   .lint-reports/base/ty.json \
+          --head-ty   .lint-reports/head/ty.json \
+          --base-ref  "${{ steps.base.outputs.ref }}" \
+          --head-ref  "$HEAD_REF" \
+          --output    .lint-reports/summary.md
+        cat .lint-reports/summary.md >> "$GITHUB_STEP_SUMMARY"
+    needs:
+    - identity
+    - detect
+    permissions: &id002
+      contents: read
+  lint__ruff-blocking:
+    name: ruff enforcement (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+    - name: Install ruff
+      uses: ./.github/actions/retry
+      with:
+        command: uv tool install ruff
+    - name: ruff check .
+      run: |
+        ruff check .
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && (true)) }}
+    permissions: *id002
+  lint__windows-footguns:
+    name: Windows footguns (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+    - name: Set up Python 3.11
+      uses: ./.github/actions/retry
+      with:
+        command: uv python install 3.11
+    - name: Run footgun checker
+      run: python scripts/check-windows-footguns.py --all
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && (true)) }}
+    permissions: *id002
+  lint:
+    name: Recovery lint
+    needs:
+    - identity
+    - lint__lint-diff
+    - lint__ruff-blocking
+    - lint__windows-footguns
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.python == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  js-tests__check:
+    name: JS & TS checks
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: 26
+        cache: npm
+    - name: grab npm 12
+      run: |
+        # No-op once the bundled npm is already 12.x — saves ~5-15s/job and
+        # keeps the installed major aligned with the npm12 cache-key tag.
+        npm --version | grep -q '^12\.' || npm i -g npm@12
+    - name: Restore node_modules
+      id: node-modules-cache
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+      with:
+        path: |
+          node_modules
+          apps/*/node_modules
+          ui-tui/node_modules
+          ui-tui/packages/*/node_modules
+          tests-js/node_modules
+          web/node_modules
+        key: node-modules-scripts-${{ runner.os }}-node26-npm12-${{ hashFiles('package-lock.json') }}
+    - uses: ./.github/actions/retry
+      if: steps.node-modules-cache.outputs.cache-hit != 'true'
+      with:
+        command: npm ci
+    - name: Run all workspace checks
+      run: node .github/scripts/run-workspace-checks.mjs
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.frontend == 'true') && (true)) }}
+    permissions:
+      contents: read
+      pull-requests: write
+      actions: read
+      security-events: write
+  js-tests:
+    name: Recovery js-tests
+    needs:
+    - identity
+    - js-tests__check
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.frontend == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  installer-tests__powershell:
+    name: PowerShell installer tests
+    runs-on: windows-latest
+    timeout-minutes: 15
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: 8.3 short-path normalization (pwsh 7)
+      shell: pwsh
+      run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-longpath.ps1
+    - name: 8.3 short-path normalization (Windows PowerShell 5.1)
+      shell: powershell
+      run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-longpath.ps1
+    - name: System Node and npm compatibility (pwsh 7)
+      shell: pwsh
+      run: pwsh -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-node-compatibility.ps1
+    - name: System Node and npm compatibility (Windows PowerShell 5.1)
+      shell: powershell
+      run: powershell -NoProfile -ExecutionPolicy Bypass -File scripts/tests/test-install-ps1-node-compatibility.ps1
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.installer == 'true') && (true)) }}
+    permissions:
+      contents: read
+  installer-tests:
+    name: Recovery installer-tests
+    needs:
+    - identity
+    - installer-tests__powershell
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.installer == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  rust-tests__bootstrap-installer:
+    name: cargo test (bootstrap installer)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: apps/bootstrap-installer/src-tauri
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install Tauri system dependencies
+      working-directory: .
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y \
+          libwebkit2gtk-4.1-dev \
+          libappindicator3-dev \
+          librsvg2-dev \
+          libxdo-dev \
+          libssl-dev \
+          patchelf
+    - name: Restore cargo cache
+      uses: actions/cache@0400d5f644dc74513175e3cd8d07132dd4860809
+      with:
+        path: |
+          ~/.cargo/registry
+          ~/.cargo/git
+          apps/bootstrap-installer/src-tauri/target
+        key: cargo-${{ runner.os }}-${{ hashFiles('apps/bootstrap-installer/src-tauri/Cargo.toml') }}
+    - name: cargo test
+      run: cargo test --lib
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.rust == 'true') && (true)) }}
+    permissions:
+      contents: read
+  rust-tests:
+    name: Recovery rust-tests
+    needs:
+    - identity
+    - rust-tests__bootstrap-installer
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.rust == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  e2e-desktop:
+    name: Desktop E2E (disabled by unchanged CI source)
+    if: false
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    timeout-minutes: 1
+    steps:
+    - run: exit 1
+  docs-site__docs-site-checks:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - uses: actions/setup-node@49933ea5288caeca8642d1e84afbd3f7d6820020
+      with:
+        node-version: 26
+        cache: npm
+        cache-dependency-path: website/package-lock.json
+    - name: grab npm 12
+      run: |
+        npm i -g npm@12
+    - name: Install website dependencies
+      uses: ./.github/actions/retry
+      with:
+        command: npm ci
+        working-directory: website
+    - uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405
+      with:
+        python-version: '3.11'
+    - name: Install ascii-guard
+      uses: ./.github/actions/retry
+      with:
+        command: python -m pip install ascii-guard==2.3.0 pyyaml==6.0.3
+    - name: Extract skill metadata for dashboard
+      run: python3 website/scripts/extract-skills.py
+    - name: Regenerate per-skill docs pages + catalogs
+      run: python3 website/scripts/generate-skill-docs.py
+    - name: Lint docs diagrams
+      run: npm run lint:diagrams
+      working-directory: website
+    - name: Build Docusaurus
+      run: npm run build:fast
+      working-directory: website
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.site == 'true') && (true)) }}
+    permissions:
+      contents: read
+  docs-site:
+    name: Recovery docs-site
+    needs:
+    - identity
+    - docs-site__docs-site-checks
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.site == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  history-check__check-common-ancestor:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.merge-base-check.outputs.review_status }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - id: merge-base-check
+      name: Reject PRs with no common ancestor on main
+      run: |
+        # `git merge-base` exits non-zero AND prints nothing when the two
+        # commits share no ancestor.  We check both conditions explicitly
+        # so the failure message is clear regardless of which signal fires
+        # first.
+        if ! BASE=$(git merge-base origin/main HEAD 2>/dev/null) || [ -z "$BASE" ]; then
+          STATUS='[{"source":"unrelated histories","results":[{"kind":"action_required","title":"Unrelated histories","summary":"This PR has no common ancestor with main.","detail":"","how_to_fix":"Rebase your changes onto current main:\n```\ngit fetch origin main\ngit checkout -b fix-branch origin/main\n# re-apply your changes (cherry-pick, copy files, etc.)\ngit push -f origin fix-branch\n```\n"}]}]'
+          echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo "review_status=${STATUS}" > review-status.json
+          echo ""
+          echo "::error::This PR has no common ancestor with main."
+          echo ""
+          echo "Your branch's history is disconnected from main.  Common causes:"
+          echo "  - the branch was created with 'git checkout --orphan'"
+          echo "  - '.git/' was re-initialized at some point during the work"
+          echo "  - the branch was force-pushed from an unrelated repository"
+          echo ""
+          echo "Merging an unrelated-history PR grafts a parent-less root commit"
+          echo "into main and collapses git blame for every file in that snapshot."
+          echo "Reference: PR #25045 caused this and re-rooted blame on ~1500"
+          echo "files to a single orphan commit."
+          echo ""
+          echo "To fix, rebase your changes onto current main:"
+          echo "  git fetch origin main"
+          echo "  git checkout -b fix-branch origin/main"
+          echo "  # re-apply your changes (cherry-pick, copy files, etc.)"
+          echo "  git push -f origin fix-branch"
+          exit 1
+        fi
+        echo "::notice::Common ancestor with main: $BASE"
+        echo "review_status=[]" >> "$GITHUB_OUTPUT"
+        echo "review_status=[]" > review-status.json
+    - name: Upload review status artifact
+      if: always() && steps.merge-base-check.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-history-check
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.event_name == 'pull_request') && (true)) }}
+    permissions:
+      contents: read
+  history-check:
+    name: Recovery history-check
+    needs:
+    - identity
+    - history-check__check-common-ancestor
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.event_name == 'pull_request') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      review_status: ${{ needs.history-check__check-common-ancestor.outputs.review_status }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  contributor-check__check-attribution:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.check-emails.outputs.review_status }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - name: Check for unmapped contributor emails
+      id: check-emails
+      run: |
+        # Get the merge base between this PR and main
+        MERGE_BASE=$(git merge-base origin/main HEAD)
+
+        # Find any new author emails in this PR's commits
+        NEW_EMAILS=$(git log ${MERGE_BASE}..HEAD --format='%ae' --no-merges | sort -u)
+
+        if [ -z "$NEW_EMAILS" ]; then
+          echo "No new commits to check."
+          echo "review_status=[]" >> "$GITHUB_OUTPUT"
+          echo "review_status=[]" > review-status.json
+          exit 0
+        fi
+
+        # An email is mapped if it has a file in contributors/emails/
+        # (one file per email — conflict-free) or an entry in the frozen
+        # legacy AUTHOR_MAP in scripts/release.py.
+        MISSING=""
+        while IFS= read -r email; do
+          # Skip teknium and bot emails
+          case "$email" in
+            *teknium*|*noreply@github.com*|*dependabot*|*github-actions*|*anthropic.com*|*cursor.com*)
+              continue ;;
+          esac
+
+          if echo "$email" | grep -qP '\+.*@users\.noreply\.github\.com'; then
+            continue  # GitHub id+login noreply emails auto-resolve
+          fi
+
+          if [ -f "contributors/emails/${email}" ]; then
+            continue  # mapped via the contributors directory
+          fi
+
+          if ! grep -qF "\"${email}\"" scripts/release.py 2>/dev/null; then
+            AUTHOR=$(git log --author="$email" --format='%an' -1)
+            MISSING="${MISSING}\n  ${email} (${AUTHOR})"
+          fi
+        done <<< "$NEW_EMAILS"
+
+        if [ -n "$MISSING" ]; then
+          echo ""
+          echo "⚠️  New contributor email(s) without a mapping:"
+          echo -e "$MISSING"
+          echo ""
+          echo "Add a mapping file (do NOT edit AUTHOR_MAP in release.py):"
+          echo "  python3 scripts/audit_pr_attribution.py --fix   # auto-resolve + create files"
+          echo "or manually:"
+          echo -e "$MISSING" | while read -r line; do
+            email=$(echo "$line" | sed 's/^ *//' | cut -d' ' -f1)
+            [ -z "$email" ] && continue
+            echo "    python3 scripts/add_contributor.py ${email} <github-username>"
+          done
+          echo ""
+          echo "To find the GitHub username for an email:"
+          echo "  gh api 'search/users?q=EMAIL+in:email' --jq '.items[0].login'"
+
+          # Emit review_status for unmapped emails
+          DETAIL=$(echo -e "$MISSING" | sed '/^$/d; s/^  //')
+          HOW_TO_FIX=$'Run from the PR branch:\n```\npython3 scripts/audit_pr_attribution.py --fix\ngit add contributors && git commit -m "chore: map contributor emails" && git push\n```\nOr map one email manually (do NOT edit AUTHOR_MAP in release.py):\n```\npython3 scripts/add_contributor.py <email> <github-username>\n```\nTo find the GitHub username for an email:\n```\ngh api \'search/users?q=EMAIL+in:email\' --jq \'.items[0].login\'\n```\n'
+          REVIEW_STATUS=$(jq -nc \
+            --arg detail "$DETAIL" \
+            --arg how_to_fix "$HOW_TO_FIX" \
+            '[{"source":"contributor attribution","results":[{"kind":"action_required","title":"Unmapped contributor email(s)","summary":"New contributor email(s) are not in AUTHOR_MAP.","detail":$detail,"how_to_fix":$how_to_fix}]}]')
+          echo "review_status=$REVIEW_STATUS" >> "$GITHUB_OUTPUT"
+          echo "review_status=$REVIEW_STATUS" > review-status.json
+
+          exit 1
+        else
+          echo "✅ All contributor emails are mapped."
+          echo "review_status=[]" >> "$GITHUB_OUTPUT"
+          echo "review_status=[]" > review-status.json
+        fi
+    - name: Upload review status artifact
+      if: always() && steps.check-emails.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-contributor-check
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.python == 'true') && (true)) }}
+    permissions:
+      contents: read
+  contributor-check:
+    name: Recovery contributor-check
+    needs:
+    - identity
+    - contributor-check__check-attribution
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.python == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      review_status: ${{ needs.contributor-check__check-attribution.outputs.review_status }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  uv-lockfile__check:
+    name: uv lock --check
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      review_status: ${{ steps.verify.outputs.review_status }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Install uv
+      uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39
+      with:
+        version: 0.9.28
+    - name: Verify uv.lock is up-to-date
+      id: verify
+      run: |
+        # uv lock --check re-resolves against PyPI (network). Retry so a
+        # registry blip doesn't read as "lockfile stale". A genuinely stale
+        # lockfile fails all attempts (deterministic), costing only seconds.
+        #
+        # Backoff rather than a flat 10s: three attempts inside ~20s all
+        # land in the same blip. 5/15/45s spans ~65s instead.
+        #
+        # Network failure and a real desync are also reported differently.
+        # uv says "Request failed after N retries" when it can't reach the
+        # registry, versus "lockfile needs to be updated" when the lock is
+        # genuinely stale. Only the second is the contributor's to fix, so
+        # an unreachable registry says so instead of sending them to
+        # `uv lock` with nothing to regenerate.
+        ok=false
+        net_fail=false
+        delays=(5 15 45)
+        for i in 1 2 3; do
+          if uv lock --check >lock-check.log 2>&1; then
+            ok=true
+            net_fail=false
+            cat lock-check.log
+            break
+          fi
+          cat lock-check.log
+          if grep -qiE "Request failed after|Failed to fetch|error sending request|connection (reset|closed)|timed out" lock-check.log; then
+            net_fail=true
+          else
+            # Deterministic failure (a real desync) — retrying just prints
+            # the same error twice more.
+            net_fail=false
+            break
+          fi
+          [ "$i" = 3 ] && break
+          echo "::warning::uv lock --check could not reach the registry (attempt $i); retrying in ${delays[$((i-1))]}s"
+          sleep "${delays[$((i-1))]}"
+        done
+        if [ "$ok" != true ] && [ "$net_fail" = true ]; then
+          echo "::error title=uv.lock check could not reach PyPI::Registry unreachable after 3 attempts — infrastructure failure, not a stale lockfile. Re-run the job."
+          review_status='[{"source":"uv.lock check","results":[{"kind":"action_required","title":"uv.lock check could not reach PyPI","summary":"`uv lock --check` could not reach the package registry after 3 attempts. This is an infrastructure failure, not a stale lockfile.","how_to_fix":"Re-run the failed job. No change to `uv.lock` is needed."}]}]'
+          echo "review_status=${review_status}" >> "$GITHUB_OUTPUT"
+          echo "review_status=${review_status}" > review-status.json
+          exit 1
+        fi
+        if [ "$ok" != true ]; then
+          cat <<'EOF' >> "$GITHUB_STEP_SUMMARY"
+        ## ❌ uv.lock is out of sync with pyproject.toml
+
+        **If this is a PR:** this check runs against the merged state
+        (your branch + current `main`), not just your branch.  If
+        `uv lock --check` passes locally, your branch is likely behind
+        `main` — recent changes to `pyproject.toml` on `main` aren't
+        reflected in your branch's `uv.lock` yet.
+
+        To fix, sync with main and regenerate the lockfile:
+
+        ```bash
+        git fetch origin main
+        git rebase origin/main   # or `git merge origin/main`
+        uv lock                  # regenerate against new pyproject.toml
+        git add uv.lock
+        git commit -m "chore: refresh uv.lock after syncing with main"
+        git push --force-with-lease  # drop --force-with-lease if you merged
+        ```
+
+        **If you only changed pyproject.toml:** run `uv lock` locally
+        and commit the result.
+
+        This check is blocking because the Docker image build uses
+        `uv sync --frozen --extra all`, which rejects stale lockfiles
+        — catching it here avoids a ~15 min failed docker run
+        on `main` post-merge.
+        EOF
+          echo "::error title=uv.lock out of sync::Run \`uv lock\` locally and commit the result. If on a PR, sync with main first."
+          review_status='[{"source":"uv.lock check","results":[{"kind":"action_required","title":"uv.lock out of sync","summary":"uv.lock is out of sync with pyproject.toml.","how_to_fix":"Run `uv lock` locally and commit the result. If on a PR, sync with main first:\n```\ngit fetch origin main\ngit rebase origin/main\nuv lock\ngit add uv.lock\ngit commit -m \"chore: refresh uv.lock\"\n```\n"}]}]'
+          echo "review_status=${review_status}" >> "$GITHUB_OUTPUT"
+          echo "review_status=${review_status}" > review-status.json
+          exit 1
+        fi
+        review_status='[]'
+        echo "review_status=${review_status}" >> "$GITHUB_OUTPUT"
+        echo "review_status=${review_status}" > review-status.json
+    - name: Upload review status artifact
+      if: always() && steps.verify.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-uv-lockfile
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.uv_lock == 'true') && (true)) }}
+    permissions:
+      contents: read
+  uv-lockfile:
+    name: Recovery uv-lockfile
+    needs:
+    - identity
+    - uv-lockfile__check
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.uv_lock == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      review_status: ${{ needs.uv-lockfile__check.outputs.review_status }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  infographic-check__check-no-committed-infographics:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      review_status: ${{ steps.infographic-check.outputs.review_status }}
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - id: infographic-check
+      name: Reject committed PR-infographic images
+      run: |
+        # Match on the IMAGE, not on a directory name.  Keying this to
+        # `infographic/` is what let `infograficos/` through in #70552 —
+        # any localized or typo'd directory would sidestep it again.
+        # Instead: find tracked raster images whose path contains an
+        # infographic-ish segment, in any spelling, at any depth.
+        #
+        # `docs/assets` and `website/` legitimately hold product imagery
+        # and are excluded; those are referenced from shipped docs pages.
+        OFFENDERS=$(git ls-files -z \
+          | tr '\0' '\n' \
+          | grep -iE '(^|/)(infograph|infograf)[^/]*/' \
+          | grep -iE '\.(png|jpe?g|webp|gif)$' \
+          || true)
+
+        if [ -n "$OFFENDERS" ]; then
+          COUNT=$(printf '%s\n' "$OFFENDERS" | wc -l | tr -d ' ')
+          STATUS='[{"source":"committed infographics","results":[{"kind":"action_required","title":"PR infographic committed to the repo","summary":"Infographic images belong in the PR description, never in git.","detail":"","how_to_fix":"Untrack the image and reference the provider URL from the PR body instead:\n```\ngit rm --cached <path-to-image>\n```\nThen put it in the PR description:\n```\n## Infographic\n\n![slug](https://<provider-url>)\n```\n"}]}]'
+          echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+          echo ""
+          echo "::error::${COUNT} PR-infographic image(s) are tracked in git."
+          echo ""
+          printf '%s\n' "$OFFENDERS" | sed 's/^/  /'
+          echo ""
+          echo "PR infographics are rendered to an image-provider URL and"
+          echo "embedded in the PR DESCRIPTION.  The PR body is the archive —"
+          echo "the binary never enters git history."
+          echo ""
+          echo "This rule has been re-established twice already (#48261,"
+          echo "#54564) and leaked both times, because .gitignore cannot stop"
+          echo "'git add -f' or a differently-spelled directory (#70552)."
+          echo ""
+          echo "To fix:"
+          echo "  git rm --cached <path>   # keeps your local copy"
+          echo "  # then embed the provider URL in the PR description"
+          exit 1
+        fi
+        echo "::notice::No committed PR-infographic images."
+        echo "review_status=[]" >> "$GITHUB_OUTPUT"
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((true) && (true)) }}
+    permissions:
+      contents: read
+  infographic-check:
+    name: Recovery infographic-check
+    needs:
+    - identity
+    - infographic-check__check-no-committed-infographics
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      review_status: ${{ needs.infographic-check__check-no-committed-infographics.outputs.review_status }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  profile-artifact-check__check-profile-artifacts:
+    name: Reject profile archives
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Reject profile exports in the checkout
+      run: python3 scripts/ci/check_profile_archive_boundary.py
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((true) && (true)) }}
+    permissions:
+      contents: read
+  profile-artifact-check:
+    name: Recovery profile-artifact-check
+    needs:
+    - identity
+    - profile-artifact-check__check-profile-artifacts
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  case-collision-check__check-case-collisions:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Run case-collision checker
+      run: python3 scripts/check-case-collisions.py
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((true) && (true)) }}
+    permissions:
+      contents: read
+  case-collision-check:
+    name: Recovery case-collision-check
+    needs:
+    - identity
+    - case-collision-check__check-case-collisions
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  lockfile-diff__diff:
+    name: package-lock.json semantic diff
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      changed: ${{ steps.diff.outputs.changed }}
+      review_status: ${{ steps.emit-status.outputs.review_status }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - name: Generate semantic lockfile diff
+      id: diff
+      run: |
+        set -euo pipefail
+        # Three-dot semantics by hand: diff from the merge base with the
+        # target branch to the PR head, so changes that landed on main
+        # after the branch point don't show up as this PR's doing.
+        BASE_SHA=$(git merge-base "origin/${{ github.base_ref }}" HEAD)
+        echo "Merge base: ${BASE_SHA}"
+        python3 scripts/ci/lockfile_diff.py \
+          --base "$BASE_SHA" \
+          --head HEAD \
+          --output /tmp/lockfile-diff.md
+        if [ -s /tmp/lockfile-diff.md ]; then
+          echo "changed=true" >> "$GITHUB_OUTPUT"
+          {
+            echo "## package-lock.json semantic diff"
+            echo ""
+            cat /tmp/lockfile-diff.md
+          } >> "$GITHUB_STEP_SUMMARY"
+        else
+          echo "changed=false" >> "$GITHUB_OUTPUT"
+          : > /tmp/lockfile-diff.md
+        fi
+    - name: Emit review_status
+      id: emit-status
+      run: |
+        set -euo pipefail
+        CHANGED="${{ steps.diff.outputs.changed }}"
+        STATUS="[]"
+
+        if [ "$CHANGED" = "true" ]; then
+          CONTENT=$(cat /tmp/lockfile-diff.md | python3 -c "import sys,json; print(json.dumps(sys.stdin.read()))")
+          STATUS="[{\"source\":\"lockfile-diff\",\"results\":[{\"kind\":\"action_required\",\"title\":\"package-lock.json\",\"summary\":\"Locked npm dependency versions changed.\",\"detail\":${CONTENT},\"how_to_fix\":\"Add the \`ci-reviewed\` label after verifying the version changes are expected.\"}]}]"
+        else
+          STATUS="[]"
+        fi
+
+        echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+        echo "review_status=${STATUS}" > review-status.json
+    - name: Upload review status artifact
+      if: always() && steps.emit-status.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-lockfile-diff
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    - name: Upload diff artifact
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: lockfile-diff
+        path: /tmp/lockfile-diff.md
+        retention-days: 1
+        overwrite: true
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true') && (true))
+      }}
+    permissions:
+      contents: read
+  lockfile-diff:
+    name: Recovery lockfile-diff
+    needs:
+    - identity
+    - lockfile-diff__diff
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.event_name == 'pull_request' && needs.detect.outputs.npm_lock == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      changed: ${{ needs.lockfile-diff__diff.outputs.changed }}
+      review_status: ${{ needs.lockfile-diff__diff.outputs.review_status }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  docker-lint__hadolint:
+    name: Lint Dockerfile (hadolint)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: hadolint
+      uses: hadolint/hadolint-action@54c9adbab1582c2ef04b2016b760714a4bfde3cf
+      with:
+        dockerfile: Dockerfile
+        config: .hadolint.yaml
+        failure-threshold: warning
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.docker_meta == 'true') && (true)) }}
+    permissions: &id003
+      contents: read
+  docker-lint__shellcheck:
+    name: Lint docker/ shell scripts (shellcheck)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: shellcheck
+      uses: ludeeus/action-shellcheck@00cae500b08a931fb5698e11e79bfbd38e612a38
+      env:
+        SHELLCHECK_OPTS: --severity=error
+      with:
+        scandir: ./docker
+    needs:
+    - identity
+    - detect
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.docker_meta == 'true') && (true)) }}
+    permissions: *id003
+  docker-lint:
+    name: Recovery docker-lint
+    needs:
+    - identity
+    - docker-lint__hadolint
+    - docker-lint__shellcheck
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.docker_meta == 'true') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  supply-chain__scan:
+    name: Scan PR for critical supply chain risks
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps
+      == 'true')) && ((needs.detect.outputs.scan == 'true'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      review_status: ${{ steps.emit-status.outputs.review_status }}
+      critical_findings: ${{ steps.scan.outputs.found }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - name: Scan diff for critical patterns
+      id: scan
+      env:
+        GH_TOKEN: ${{ github.token }}
+        CI_REVIEWED: ${{ contains(github.event.pull_request.labels.*.name, 'ci-reviewed') }}
+      run: |
+        set -euo pipefail
+
+        BASE="${{ github.event.pull_request.base.sha }}"
+        HEAD="${{ github.event.pull_request.head.sha }}"
+
+        # Added lines only, excluding lockfiles.
+        # Three-point diff (base...head) diffs from the merge base to HEAD,
+        # so only changes introduced by this PR are included — not changes
+        # that landed on main after the PR branched off.
+        DIFF=$(git diff "$BASE"..."$HEAD" -- . ':!uv.lock' ':!*.lock' ':!package-lock.json' ':!yarn.lock' || true)
+
+        FINDINGS=""
+
+        # --- .pth files (auto-execute on Python startup) ---
+        # The exact mechanism used in the litellm supply chain attack:
+        # https://github.com/BerriAI/litellm/issues/24512
+        PTH_FILES=$(git diff --diff-filter=d --name-only "$BASE"..."$HEAD" | grep '\.pth$' || true)
+        if [ -n "$PTH_FILES" ]; then
+          FINDINGS="${FINDINGS}
+        ### 🚨 CRITICAL: .pth file added or modified
+        Python \`.pth\` files in \`site-packages/\` execute automatically when the interpreter starts — no import required.
+
+        **Files:**
+        \`\`\`
+        ${PTH_FILES}
+        \`\`\`
+        "
+        fi
+
+        # --- base64 decode + exec/eval on the same line (the litellm attack pattern) ---
+        B64_EXEC_HITS=$(echo "$DIFF" | grep -n '^+' | grep -iE 'base64\.(b64decode|decodebytes|urlsafe_b64decode)' | grep -iE 'exec\(|eval\(' | head -10 || true)
+        if [ -n "$B64_EXEC_HITS" ]; then
+          FINDINGS="${FINDINGS}
+        ### 🚨 CRITICAL: base64 decode + exec/eval combo
+        Base64-decoded strings passed directly to exec/eval — the signature of hidden credential-stealing payloads.
+
+        **Matches:**
+        \`\`\`
+        ${B64_EXEC_HITS}
+        \`\`\`
+        "
+        fi
+
+        # --- subprocess with encoded/obfuscated command argument ---
+        PROC_HITS=$(echo "$DIFF" | grep -n '^+' | grep -E 'subprocess\.(Popen|call|run)\s*\(' | grep -iE 'base64|\\x[0-9a-f]{2}|chr\(' | head -10 || true)
+        if [ -n "$PROC_HITS" ]; then
+          FINDINGS="${FINDINGS}
+        ### 🚨 CRITICAL: subprocess with encoded/obfuscated command
+        Subprocess calls whose command strings are base64- or hex-encoded are a strong indicator of payload execution.
+
+        **Matches:**
+        \`\`\`
+        ${PROC_HITS}
+        \`\`\`
+        "
+        fi
+
+        # --- Install-hook files (setup.py/sitecustomize/usercustomize/__init__.pth) ---
+        # These execute during pip install or interpreter startup.
+        # Anchored at repo root: only the top-level setup.py/setup.cfg run during
+        # `pip install`, and only top-level sitecustomize.py/usercustomize.py are
+        # auto-loaded by the interpreter via site.py. Any nested file with the
+        # same name (e.g. hermes_cli/setup.py — the CLI setup wizard) is unrelated
+        # and produced false positives that trained reviewers to ignore the scanner.
+        SETUP_HITS=$(git diff --diff-filter=d --name-only "$BASE"..."$HEAD" | grep -E '^(setup\.py|setup\.cfg|sitecustomize\.py|usercustomize\.py|__init__\.pth)$' || true)
+        # A maintainer-applied ci-reviewed label records the manual review
+        # required for intentional changes to an install hook. The scanner
+        # still blocks every unreviewed addition or modification.
+        if [ -n "$SETUP_HITS" ] && [ "$CI_REVIEWED" != "true" ]; then
+          FINDINGS="${FINDINGS}
+        ### 🚨 CRITICAL: Install-hook file added or modified
+        These files can execute code during package installation or interpreter startup.
+
+        **Files:**
+        \`\`\`
+        ${SETUP_HITS}
+        \`\`\`
+        "
+        fi
+
+        if [ -n "$FINDINGS" ]; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "$FINDINGS" > /tmp/findings.md
+        else
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Emit review_status
+      id: emit-status
+      if: always()
+      env:
+        FOUND: ${{ steps.scan.outputs.found }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os
+
+        # The review-label gate renders and blocks critical findings. Keep
+        # this scan a fact-finder so adding ci-reviewed can rerun the gate
+        # without requiring the scanner itself to fail again.
+        status = []
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"review_status={json.dumps(status)}\n")
+        PYEOF
+    needs:
+    - identity
+    - detect
+    permissions: &id004
+      pull-requests: write
+      contents: read
+  supply-chain__dep-bounds:
+    name: Check PyPI dependency upper bounds
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps
+      == 'true')) && ((needs.detect.outputs.deps == 'true'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      review_status: ${{ steps.emit-status.outputs.review_status }}
+    steps:
+    - name: Checkout
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+      with:
+        fetch-depth: 0
+    - name: Check for unbounded PyPI deps
+      id: bounds
+      run: |
+        set -euo pipefail
+
+        BASE="${{ github.event.pull_request.base.sha }}"
+        HEAD="${{ github.event.pull_request.head.sha }}"
+
+        # Only check added lines in pyproject.toml
+        ADDED=$(git diff "$BASE"..."$HEAD" -- pyproject.toml | grep '^+' | grep -v '^+++' || true)
+
+        if [ -z "$ADDED" ]; then
+          echo "found=false" >> "$GITHUB_OUTPUT"
+          exit 0
+        fi
+
+        # Match PyPI dep specs that have >= and no < ceiling.
+        # Pattern: "package>=version" without a following ",<" bound.
+        # Excludes git+ URLs (which use commit SHAs) and comments.
+        UNBOUNDED=$(echo "$ADDED" | grep -oE '"[a-zA-Z0-9_-]+(\[[^\]]*\])?>=[ 0-9.]+"' | grep -v ',<' || true)
+
+        if [ -n "$UNBOUNDED" ]; then
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "$UNBOUNDED" > /tmp/unbounded.txt
+        else
+          echo "found=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Emit review_status
+      id: emit-status
+      if: always()
+      env:
+        FOUND: ${{ steps.bounds.outputs.found }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os
+
+        found = os.environ.get("FOUND", "") == "true"
+
+        if found:
+            with open("/tmp/unbounded.txt", encoding="utf-8") as f:
+                detail = f.read()
+            status = [{
+                "source": "supply chain",
+                "results": [{
+                    "kind": "action_required",
+                    "title": "Unbounded PyPI dependencies",
+                    "summary": "This PR adds PyPI dependencies without upper bounds.",
+                    "detail": detail,
+                    "how_to_fix": 'Add a `<next_major` upper bound, e.g. `"package>=1.2.0,<2"`. See CONTRIBUTING.md dependency pinning policy.'
+                }]
+            }]
+        else:
+            status = []
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"review_status={json.dumps(status)}\n")
+        PYEOF
+    - name: Fail on unbounded deps
+      if: steps.bounds.outputs.found == 'true'
+      run: |
+        echo "::error::PyPI dependencies without upper bounds detected. Add <next_major ceiling per CONTRIBUTING.md policy."
+        exit 1
+    needs:
+    - identity
+    - detect
+    permissions: *id004
+  supply-chain__aggregate:
+    name: Aggregate review statuses
+    needs:
+    - identity
+    - detect
+    - supply-chain__scan
+    - supply-chain__dep-bounds
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps
+      == 'true')) && (always())) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    outputs:
+      review_status: ${{ steps.merge.outputs.review_status }}
+      critical_findings: ${{ steps.merge.outputs.critical_findings }}
+    steps:
+    - name: Merge review statuses
+      id: merge
+      env:
+        SCAN_STATUS: ${{ needs.supply-chain__scan.outputs.review_status }}
+        DEP_STATUS: ${{ needs.supply-chain__dep-bounds.outputs.review_status }}
+        CRITICAL_FINDINGS: ${{ needs.supply-chain__scan.outputs.critical_findings }}
+      run: |
+        python3 - <<'PYEOF'
+        import json, os
+
+        merged = []
+        for key in ("SCAN_STATUS", "DEP_STATUS"):
+            raw = os.environ.get(key, "")
+            if not raw:
+                continue
+            try:
+                data = json.loads(raw)
+            except (json.JSONDecodeError, TypeError):
+                continue
+            if isinstance(data, list):
+                merged.extend(data)
+
+        with open(os.environ["GITHUB_OUTPUT"], "a", encoding="utf-8") as f:
+            f.write(f"review_status={json.dumps(merged)}\n")
+            f.write("critical_findings=" + os.environ.get("CRITICAL_FINDINGS", "false") + "\n")
+
+        # Write review-status.json for the live comment poller artifact.
+        with open("review-status.json", "w", encoding="utf-8") as f:
+            f.write(f"review_status={json.dumps(merged)}\n")
+        PYEOF
+    - name: Upload review status artifact
+      if: always() && steps.merge.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-supply-chain
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    permissions: *id004
+  supply-chain:
+    name: Recovery supply-chain
+    needs:
+    - identity
+    - supply-chain__scan
+    - supply-chain__dep-bounds
+    - supply-chain__aggregate
+    - detect
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.scan == 'true' || needs.detect.outputs.deps
+      == 'true')) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      review_status: ${{ needs.supply-chain__aggregate.outputs.review_status }}
+      critical_findings: ${{ needs.supply-chain__aggregate.outputs.critical_findings }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  review-labels__check:
+    name: Review label gate
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true'
+      || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true'))
+      && ((needs.detect.outputs.ci_review == 'true') || (needs.detect.outputs.mcp_catalog == 'true') || (needs.supply-chain.outputs.critical_findings
+      == 'true'))) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    outputs:
+      ci_reviewed: ${{ steps.label-check.outputs.ci_reviewed }}
+      review_status: ${{ steps.build-status.outputs.review_status }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Check ci-reviewed label
+      id: label-check
+      env:
+        GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        REPO: ${{ github.repository }}
+      run: |
+        set -euo pipefail
+        PR="${{ github.event.pull_request.number }}"
+        LABELS=$(gh pr view "$PR" --repo "$REPO" --json labels --jq '.labels[].name' || true)
+
+        if echo "$LABELS" | grep -Fxq 'ci-reviewed'; then
+          echo "ci-reviewed label present."
+          echo "ci_reviewed=true" >> "$GITHUB_OUTPUT"
+        else
+          echo "ci-reviewed label missing."
+          echo "ci_reviewed=false" >> "$GITHUB_OUTPUT"
+        fi
+    - name: Build review_status JSON
+      id: build-status
+      env:
+        CI_REVIEW: ${{ (needs.detect.outputs.ci_review == 'true') }}
+        CI_REVIEW_FILES: ${{ (needs.detect.outputs.ci_review_files) }}
+        MCP_CATALOG: ${{ (needs.detect.outputs.mcp_catalog == 'true') }}
+        SUPPLY_CHAIN: ${{ (needs.supply-chain.outputs.critical_findings == 'true') }}
+        LABEL_PRESENT: ${{ steps.label-check.outputs.ci_reviewed }}
+        REPO_URL: ${{ github.server_url }}/${{ github.repository }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      run: |
+        set -euo pipefail
+        args=()
+        if [ "$CI_REVIEW" = "true" ]; then args+=(--ci-review); fi
+        args+=(--ci-review-files "$CI_REVIEW_FILES")
+        if [ "$MCP_CATALOG" = "true" ]; then args+=(--mcp-catalog); fi
+        if [ "$SUPPLY_CHAIN" = "true" ]; then args+=(--supply-chain); fi
+        if [ "$LABEL_PRESENT" = "true" ]; then args+=(--label-present); fi
+
+        # Write to both $GITHUB_OUTPUT and review-status.json for the
+        # live comment poller to pick up as an artifact.
+        python3 scripts/ci/emit_review_status.py "${args[@]}" \
+          --repo-url "$REPO_URL" --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+          --output "$GITHUB_OUTPUT"
+        grep '^review_status=' "$GITHUB_OUTPUT" > review-status.json
+    - name: Upload review status artifact
+      if: always() && steps.build-status.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-review-labels
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    - name: Fail on missing label
+      if: steps.label-check.outputs.ci_reviewed != 'true'
+      run: |
+        echo "::error::CI-sensitive changes require the ci-reviewed label. Add the label and re-run this check."
+        exit 1
+    needs:
+    - identity
+    - detect
+    - supply-chain
+    permissions:
+      contents: read
+      pull-requests: read
+  review-labels:
+    name: Recovery review-labels
+    needs:
+    - identity
+    - review-labels__check
+    - detect
+    - supply-chain
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (always() && needs.detect.outputs.event_name == 'pull_request' && (needs.detect.outputs.ci_review == 'true'
+      || needs.detect.outputs.mcp_catalog == 'true' || needs.supply-chain.outputs.critical_findings == 'true'))
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      ci_reviewed: ${{ needs.review-labels__check.outputs.ci_reviewed }}
+      review_status: ${{ needs.review-labels__check.outputs.review_status }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  osv-scanner__scan__osv-scan:
+    runs-on: ubuntu-latest
+    outputs:
+      results: ${{ steps.export.outputs.results }}
+    steps:
+    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8
+      with:
+        persist-credentials: false
+        submodules: ${{ (false) }}
+        ref: ${{ ('') }}
+    - name: Download custom artifact if specified
+      uses: actions/download-artifact@v8
+      if: ${{ ('') != '' }}
+      with:
+        name: ${{ ('') }}
+        path: ./
+    - name: Run scanner
+      uses: google/osv-scanner-action/osv-scanner-action@8dc09193bb540e09b23da07ad7e30bd33bf87018
+      with:
+        scan-args: |-
+          --output=${{ ('') }}results.json
+          --format=json
+          ${{ ('--lockfile=uv.lock
+          --lockfile=package-lock.json
+          --lockfile=website/package-lock.json
+          --lockfile=plugins/platforms/photon/sidecar/package-lock.json
+          --lockfile=scripts/whatsapp-bridge/package-lock.json') }}
+      continue-on-error: true
+    - name: Run osv-scanner-reporter
+      uses: google/osv-scanner-action/osv-reporter-action@8dc09193bb540e09b23da07ad7e30bd33bf87018
+      with:
+        scan-args: |-
+          --output=${{ ('') }}${{ ('osv-results.sarif') }}
+          --new=${{ ('') }}results.json
+          --gh-annotations=false
+          --fail-on-vuln=${{ (false) }}
+    - name: Export results
+      id: export
+      run: |
+        if [ -f ${{ ('') }}osv-results.json ]; then
+          DELIMITER="EOF_$(tr -dc 'a-zA-Z0-9' < /dev/urandom 2>/dev/null | head -c 16)"
+          echo "results<<${DELIMITER}" >> "${GITHUB_OUTPUT}"
+          cat ${{ ('') }}osv-results.json >> "${GITHUB_OUTPUT}"
+          echo "${DELIMITER}" >> "${GITHUB_OUTPUT}"
+        fi
+    - name: Upload artifact
+      id: upload_artifact
+      if: ${{ !cancelled() }}
+      uses: actions/upload-artifact@bbbca2ddaa5d8feaa63e36b76fdaad77386f024f
+      with:
+        name: ${{ ('') }}OSV Scanner SARIF file
+        path: ${{ ('') }}${{ ('osv-results.sarif') }}
+        retention-days: 5
+    - name: Upload to code-scanning
+      if: ${{ !cancelled() && (true) == true }}
+      uses: github/codeql-action/upload-sarif@cdefb33c0f6224e58673d9004f47f7cb3e328b89
+      with:
+        sarif_file: ${{ ('') }}${{ ('osv-results.sarif') }}
+    - name: Print Code Scanning URL
+      if: ${{ !cancelled() && (true) == true }}
+      run: |
+        echo "View the OSV-Scanner results in the 'Security' tab, using the following link:"
+        echo "${{ github.server_url }}/${{ github.repository }}/security/code-scanning?query=is%3Aopen+branch%3A${GITHUB_REF_NAME}+tool%3Aosv-scanner"
+      env:
+        GITHUB_REF_NAME: ${{ github.ref_name }}
+    - name: Error troubleshooter
+      if: ${{ always() && steps.upload_artifact.outcome == 'failure' }}
+      run: |
+        echo "::error::Artifact upload failed. This is most likely caused by a error during scanning earlier in the workflow."
+        exit 1
+    needs:
+    - identity
+    if: ${{ (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (((true) && (true)) && (true)) }}
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+  osv-scanner__scan:
+    name: Recovery osv-scanner__scan
+    needs:
+    - identity
+    - osv-scanner__scan__osv-scan
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((true) && (true)) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    outputs:
+      results: ${{ needs.osv-scanner__scan__osv-scan.outputs.results }}
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  osv-scanner__emit-status:
+    name: Emit review status
+    runs-on: ubuntu-latest
+    needs:
+    - identity
+    - osv-scanner__scan
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && ((true) && (always())) }}
+    outputs:
+      review_status: ${{ steps.emit.outputs.review_status }}
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Download SARIF result
+      uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093
+      with:
+        name: OSV Scanner SARIF file
+        path: /tmp/osv-results
+      continue-on-error: true
+    - name: Emit review_status
+      id: emit
+      run: |
+        set -euo pipefail
+        STATUS="[]"
+
+        if [ -f /tmp/osv-results/osv-results.sarif ]; then
+          # Count vulnerabilities from the SARIF file
+          VULN_COUNT=$(python3 -c "
+        import json, sys
+        try:
+            with open('/tmp/osv-results/osv-results.sarif') as f:
+                data = json.load(f)
+            count = 0
+            vulns = []
+            for run in data.get('runs', []):
+                for result in run.get('results', []):
+                    count += 1
+                    rule_id = result.get('ruleId', 'unknown')
+                    message = result.get('message', {}).get('text', '')
+                    loc = result.get('locations', [{}])[0].get('physicalLocation', {}).get('artifactLocation', {}).get('uri', '')
+                    vulns.append(f'- {rule_id} in {loc}: {message}')
+            print(count)
+            if vulns:
+                print('\n'.join(vulns[:20]), file=sys.stderr)
+        except Exception:
+            print(0)
+        ")
+
+          VULN_DETAIL=""
+          if [ "$VULN_COUNT" -gt 0 ] 2>/dev/null; then
+            VULN_PLURAL=$([ "$VULN_COUNT" -eq 1 ] && echo "y" || echo "ies")
+            VULN_DETAIL=$(python3 -c "
+        import json, sys
+        try:
+            with open('/tmp/osv-results/osv-results.sarif') as f:
+                data = json.load(f)
+            vulns = []
+            for run in data.get('runs', []):
+                for result in run.get('results', []):
+                    rule_id = result.get('ruleId', 'unknown')
+                    loc = result.get('locations', [{}])[0].get('physicalLocation', {}).get('artifactLocation', {}).get('uri', '')
+                    vulns.append(f'- {rule_id} in {loc}')
+            print(json.dumps('\n'.join(vulns[:20])))
+        except Exception:
+            print(json.dumps(''))
+        ")
+            STATUS="[{\"source\":\"osv scan\",\"results\":[{\"kind\":\"warning\",\"title\":\"OSV vulnerability scan\",\"summary\":\"${VULN_COUNT} known vulnerabilit${VULN_PLURAL} found in pinned dependencies.\",\"detail\":${VULN_DETAIL},\"how_to_fix\":\"Review the findings in the [Security tab](../../security/code-scanning). Update the affected dependencies if a patched version is available.\"}]}]"
+          else
+            STATUS="[]"
+          fi
+        fi
+
+        echo "review_status=${STATUS}" >> "$GITHUB_OUTPUT"
+        echo "review_status=${STATUS}" > review-status.json
+    - name: Upload review status artifact
+      if: always() && steps.emit.outcome != 'skipped'
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-osv-scanner
+        path: review-status.json
+        retention-days: 1
+        overwrite: true
+        if-no-files-found: ignore
+    permissions:
+      actions: read
+      contents: read
+      security-events: write
+  osv-scanner:
+    name: Recovery osv-scanner
+    needs:
+    - identity
+    - osv-scanner__scan
+    - osv-scanner__emit-status
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      && (true) }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 2
+    permissions:
+      contents: read
+    steps:
+    - name: Require every selected child to succeed
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        r = {k: v["result"] for k, v in json.loads(os.environ["NEEDS"]).items()}
+        print(json.dumps(r, sort_keys=True))
+        sys.exit(0 if r and all(v == "success" for v in r.values()) else 1)
+        PY
+  all-checks-pass:
+    name: Recovery all required checks pass
+    needs:
+    - identity
+    - detect
+    - tests
+    - tests-os
+    - lint
+    - js-tests
+    - installer-tests
+    - rust-tests
+    - e2e-desktop
+    - docs-site
+    - history-check
+    - contributor-check
+    - uv-lockfile
+    - infographic-check
+    - profile-artifact-check
+    - case-collision-check
+    - lockfile-diff
+    - docker-lint
+    - supply-chain
+    - review-labels
+    - osv-scanner
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+    - name: Require complete selected lane results
+      env:
+        NEEDS: ${{ toJSON(needs) }}
+        EXPECTED: '["identity", "detect", "tests", "tests-os", "lint", "js-tests", "installer-tests", "rust-tests",
+          "e2e-desktop", "docs-site", "history-check", "contributor-check", "uv-lockfile", "infographic-check",
+          "profile-artifact-check", "case-collision-check", "lockfile-diff", "docker-lint", "supply-chain", "review-labels",
+          "osv-scanner"]'
+        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        EVENT_ACTION: ${{ github.event.action }}
+        EVENT_LABEL: ${{ github.event.label.name }}
+      run: |
+        python3 - <<'PY'
+        import json, os, sys
+        from pathlib import Path
+        needs = json.loads(os.environ['NEEDS'])
+        results = {name: info['result'] for name, info in needs.items()}
+        expected = json.loads(os.environ['EXPECTED'])
+        bad = [name for name in expected if results.get(name) != ('skipped' if name == 'e2e-desktop' else 'success')]
+        unexpected = sorted(set(results) - set(expected))
+        receipt = {'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': os.environ['GITHUB_RUN_ATTEMPT'], 'head': os.environ['HEAD_SHA'], 'base': os.environ['BASE_SHA'], 'merge': os.environ['GITHUB_SHA'], 'event': os.environ['GITHUB_EVENT_NAME'], 'action': os.environ['EVENT_ACTION'], 'label': os.environ['EVENT_LABEL'], 'expected': expected, 'results': results, 'failed_or_missing': bad, 'unexpected': unexpected}
+        Path('stagea-lane-results.json').write_text(json.dumps(receipt, indent=2) + '\n')
+        print(json.dumps(receipt, sort_keys=True))
+        sys.exit(1 if bad or unexpected else 0)
+        PY
+    - name: Upload complete lane result receipt
+      if: always()
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: stagea-lane-results
+        path: stagea-lane-results.json
+        retention-days: 14
+        if-no-files-found: error
+  ci-timings:
+    name: CI timing report
+    needs:
+    - identity
+    - all-checks-pass
+    if: ${{ always() && (github.event_name == 'pull_request' && github.event.action == 'labeled' && github.event.label.name
+      == 'ci-reviewed' && github.repository == 'yihangdong/hermes-agent') && needs.identity.result == 'success'
+      }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+    - name: Checkout code
+      uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd
+    - name: Restore baseline cache (PR only)
+      if: github.event_name == 'pull_request'
+      uses: actions/cache/restore@27d5ce7f107fe9357f9df03efb73ab90386fccae
+      with:
+        path: ci-timings-baseline.json
+        key: ci-timings-baseline-never-exact
+        restore-keys: |
+          ci-timings-baseline-
+    - name: Collect timings and generate report
+      env:
+        GITHUB_TOKEN: ${{ github.token }}
+      run: |
+        python3 scripts/ci/timings_report.py \
+          --baseline ci-timings-baseline.json \
+          --output ci-timings-report.html \
+          --json-out ci-timings.json \
+          --summary-out ci-timings-summary.md
+    - name: Upload HTML report
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      id: ci-timings-html
+      with:
+        name: ci-timings-report
+        path: ci-timings-report.html
+        retention-days: 14
+    - name: Build linked review status
+      if: hashFiles('ci-timings.json') != ''
+      env:
+        CI_TIMINGS_REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url }}
+      run: |
+        python3 scripts/ci/timings_report.py \
+          --from-json ci-timings.json \
+          --baseline ci-timings-baseline.json \
+          --review-status-out review-status.json \
+          --review-status-only
+    - name: Upload review status
+      if: hashFiles('review-status.json') != ''
+      continue-on-error: true
+      uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a
+      with:
+        name: review-status-ci-timings
+        path: review-status.json
+        retention-days: 14
+    - name: Output summary
+      env:
+        REPORT_URL: ${{ steps.ci-timings-html.outputs.artifact-url}}
+      run: |
+        {
+          echo "# CI Timing report"
+          echo "[View the full interactive report]($REPORT_URL)"
+        } >> "$GITHUB_STEP_SUMMARY"
+        cat ci-timings-summary.md >> "$GITHUB_STEP_SUMMARY"
+    - name: Save baseline cache (main only)
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+      run: |
+        # Degraded runs (API rate-limited) produce no ci-timings.json —
+        # skip rather than fail, and never cache an empty baseline.
+        if [ -f ci-timings.json ]; then
+          cp ci-timings.json ci-timings-baseline.json
+        else
+          echo "No timings JSON this run — skipping baseline update"
+        fi
+    - name: Upload baseline to cache (main only)
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && hashFiles('ci-timings-baseline.json')
+        != ''
+      uses: actions/cache/save@27d5ce7f107fe9357f9df03efb73ab90386fccae
+      with:
+        path: ci-timings-baseline.json
+        key: ci-timings-baseline-${{ github.run_id }}
+    permissions:
+      contents: read
+      actions: read
