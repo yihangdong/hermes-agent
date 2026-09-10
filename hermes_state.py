@@ -8669,6 +8669,71 @@ class SessionDB(SessionSearchMixin, SessionSchemaMixin, SessionPortabilityMixin)
 
         return bool(self._execute_write(_do))
 
+    def record_compression_failure_cooldown_for_owner(
+        self,
+        session_id: str,
+        cooldown_until: float,
+        error: Optional[str],
+        owner_token: str,
+    ) -> bool:
+        """Record a failure cooldown only while ``owner_token`` still owns it.
+
+        The owner-qualified companion of
+        :meth:`record_compression_failure_cooldown` (#198 F1). A cancelled
+        attempt performs MORE durable cooldown mutations than the exact-row
+        restore: the worker's follow-on stall backoff and the host's
+        idle-timeout record both land after the capture, and both must be
+        authorized by the SAME ownership epoch
+        :meth:`begin_compression_cooldown_ownership` returned. The token
+        comparison and the UPDATE run inside ONE write transaction, so an
+        ownership check can never be separated from the mutation it authorizes:
+        a successor that took the session after the capture -- including one
+        that has already released its lease -- is never overwritten.
+
+        Returns True when the row was written, False when a later owner holds
+        the session's cooldown state (nothing is written). Unlike the
+        unqualified recorder, sqlite errors PROPAGATE: a superseded no-op and a
+        failed write must not look identical to the caller.
+        """
+        if not session_id:
+            return False
+        if not isinstance(owner_token, str) or not owner_token:
+            raise RuntimeError(
+                "owner-qualified compression cooldown record requires a token"
+            )
+        key = self._compression_cooldown_owner_key(session_id)
+
+        def _do(conn):
+            owner_row = conn.execute(
+                "SELECT value FROM state_meta WHERE key = ?",
+                (key,),
+            ).fetchone()
+            current = None
+            if owner_row is not None:
+                current = (
+                    owner_row["value"]
+                    if isinstance(owner_row, sqlite3.Row)
+                    else owner_row[0]
+                )
+            if current != owner_token:
+                # A later attempt owns this session's cooldown state; its row
+                # stands even if it has already released its lease.
+                return False
+            # Identical merge-max deadline / latest-error semantics to the
+            # unqualified recorder (#96775) -- only the authorization differs,
+            # so a current owner's timeout/stall ladder is unchanged.
+            conn.execute(
+                "UPDATE sessions SET compression_failure_cooldown_until = CASE "
+                "WHEN compression_failure_cooldown_until IS NOT NULL "
+                " AND compression_failure_cooldown_until > ? "
+                "THEN compression_failure_cooldown_until ELSE ? END, "
+                "compression_failure_error = ? WHERE id = ?",
+                (cooldown_until, cooldown_until, error, session_id),
+            )
+            return True
+
+        return bool(self._execute_write(_do))
+
     def restore_compression_failure_cooldown_row(
         self,
         session_id: str,

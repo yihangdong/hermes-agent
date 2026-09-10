@@ -964,3 +964,284 @@ def test_no_successor_cancellation_still_restores_the_exact_original_row(
         "restore the exact original authoritative row (#198 F1)"
     )
     db.release_compression_lock(session_id, holder)
+
+
+# ---------------------------------------------------------------------------
+# #198 F1 (unified): the REAL cancellation branch, INCLUDING the follow-on
+# stall-interrupted backoff.
+#
+# The two controls above stop at ``_restore_compressor_attempt_state``.
+# Production does not: the same ``except AuxiliaryExplicitCancellation`` branch
+# then records a stall backoff before releasing the lease. These controls drive
+# the production ``compress_context`` itself -- real built-in ContextCompressor,
+# real SessionDB -- so BOTH durable cooldown writes of one cancellation unwind
+# are exercised, in both successor-arrival windows and both successor lease
+# states. Every step is causally ordered by the call sequence: no sleep, no
+# retry, no timing tolerance, no mocked persistence.
+#
+# The HOST half of the same window (release_cancelled_compression_lock ->
+# fallback opportunity -> the real run_agent ``_on_timeout``) is pinned by
+# tests/agent/test_compression_stall_fallback_78981.py.
+# ---------------------------------------------------------------------------
+
+_D0_ROW = {
+    "session_exists": True,
+    "cooldown_until": 4_000_000_000.0,
+    "error": "D0-primary",
+}
+_D1_ROW = {
+    "session_exists": True,
+    "cooldown_until": 5_000_000_000.0,
+    "error": "D1-successor",
+}
+
+
+class _StalledCancellationFence(CompressionCommitFence):
+    """Report a stalled idle age to the WORKER's own stall classification.
+
+    Production budgets are untouched -- only the fence handed to
+    ``compress_context`` is controlled (the ``_ProviderEntryFence`` idiom
+    above), and only for the thread running the attempt, so every other reader
+    keeps the real value.
+    """
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.worker_ident = None
+        self.stall_samples = 0
+
+    def seconds_since_progress(self) -> float:
+        if self.worker_ident != threading.get_ident():
+            return super().seconds_since_progress()
+        self.stall_samples += 1
+        return _STALE_IDLE_SECONDS
+
+
+def _successor_takes_session_and_writes_d1(
+    db: SessionDB, session_id: str, compressor_b, *, release: bool
+) -> str:
+    """A DIFFERENT compressor mints a successor epoch and writes D1."""
+    holder_b = "pid:b:successor"
+    _capture_authoritative_row_under_lease(
+        compressor_b, db, session_id, holder_b
+    )
+    db.record_compression_failure_cooldown(
+        session_id, 5_000_000_000.0, "D1-successor"
+    )
+    if release:
+        db.release_compression_lock(session_id, holder_b)
+    return holder_b
+
+
+def test_real_cancellation_backoff_cannot_write_successor_owned_cooldown(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#198 F1: the WHOLE post-cancel window, not just the restore instant.
+
+    Four schedules, all through the production cancellation branch: successor B
+    takes the session BEFORE A's compensation (where the owner-qualified
+    restore already refuses A) and in the window AFTER a SUCCESSFUL restore but
+    BEFORE the follow-on backoff write -- each with B's lease still held and
+    already released. The final durable row must be byte-exact D1 every time.
+    """
+    from agent import conversation_compression as cc
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+
+    real_restore = cc._restore_compressor_attempt_state
+
+    for arrival in ("before_restore", "after_restore"):
+        for successor_released in (False, True):
+            case = f"{arrival}/successor_released={successor_released}"
+            monkeypatch.setattr(
+                cc,
+                "resolve_context_compression_timeouts",
+                lambda cfg=None: (1.0, 2.0),
+            )
+            db = SessionDB(
+                db_path=tmp_path
+                / f"state-{arrival}-{int(successor_released)}.db"
+            )
+            session_id = "F1_REAL_CANCEL_BACKOFF"
+            db.create_session(session_id, source="cli")
+            db.append_message(session_id, "user", "durable original")
+            # D0: the authoritative row this attempt captures and may restore.
+            db.record_compression_failure_cooldown(
+                session_id, 4_000_000_000.0, "D0-primary"
+            )
+
+            agent_a, compressor_a = _build_agent_with_real_compressor(
+                db, session_id
+            )
+            _agent_b, compressor_b = _build_agent_with_real_compressor(
+                db, session_id
+            )
+            assert compressor_a is not compressor_b, (
+                "two agents sharing one session must own DISTINCT compressors "
+                f"-- the exact shape #198 F1 is about; {case}"
+            )
+            agent_a._cached_system_prompt = "sys"
+            agent_a.compression_in_place = True
+
+            admitted: list = []
+
+            def _admit_successor() -> None:
+                admitted.append(
+                    _successor_takes_session_and_writes_d1(
+                        db,
+                        session_id,
+                        compressor_b,
+                        release=successor_released,
+                    )
+                )
+
+            if arrival == "after_restore":
+
+                def _restore_then_admit(*args, **kwargs):
+                    real_restore(*args, **kwargs)
+                    # Proves this window really opened AFTER a SUCCESSFUL
+                    # owner-qualified restore: the attempt's own summary
+                    # cleared the row below, so only that restore can have put
+                    # D0 back before this point.
+                    assert (
+                        db.get_compression_failure_cooldown_row(session_id)
+                        == _D0_ROW
+                    ), (
+                        "the successor window did not open after the stale "
+                        f"attempt's successful restore; {case}"
+                    )
+                    _admit_successor()
+
+                monkeypatch.setattr(
+                    cc,
+                    "_restore_compressor_attempt_state",
+                    _restore_then_admit,
+                )
+
+            fence = _StalledCancellationFence()
+
+            def _cancel_like_a_detached_worker(msgs, **_kwargs):
+                # The host idle timeout poison-cancels this attempt and invokes
+                # the PUBLISHED holder-qualified release while this provider is
+                # still detached -- production's own hook (that the host really
+                # calls it is proved by
+                # test_f4_five_step_stale_holder_regression and by the host
+                # control in test_compression_stall_fallback_78981.py).
+                fence.worker_ident = threading.get_ident()
+                fence.release_cancelled_compression_lock()
+                assert db.get_compression_lock_holder(session_id) is None, case
+                # The attempt's own summary cleared the durable row before the
+                # commit boundary -- the mutation cancellation must compensate.
+                db.clear_compression_failure_cooldown(session_id)
+                if arrival == "before_restore":
+                    _admit_successor()
+                raise AuxiliaryExplicitCancellation()
+
+            compressor_a.compress = _cancel_like_a_detached_worker
+
+            messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+            baseline = copy.deepcopy(messages)
+            returned, _prompt = cc.compress_context(
+                agent_a,
+                messages,
+                "sys",
+                approx_tokens=120_000,
+                force=True,
+                commit_fence=fence,
+            )
+
+            assert returned is messages and messages == baseline, case
+            assert admitted, case
+            # The attempt provably reached the stall classification of the real
+            # cancellation branch, so a backoff write WAS attempted.
+            assert fence.stall_samples >= 1, (
+                "the production cancellation branch never classified this "
+                f"attempt as stalled; {case}"
+            )
+            assert (
+                db.get_compression_failure_cooldown_row(session_id) == _D1_ROW
+            ), (
+                "the stale attempt's post-cancel unwind mutated a DIFFERENT "
+                f"compressor's successor-owned cooldown row; {case}"
+            )
+            if successor_released:
+                assert db.get_compression_lock_holder(session_id) is None, case
+            else:
+                assert (
+                    db.get_compression_lock_holder(session_id) == admitted[0]
+                ), (
+                    "the stale attempt released the successor's durable lease "
+                    f"(ABA); {case}"
+                )
+                db.release_compression_lock(session_id, admitted[0])
+
+
+def test_real_cancellation_keeps_the_stall_backoff_for_the_current_owner(
+    tmp_path: Path, monkeypatch
+) -> None:
+    """#198 F1 must not be closed by suppressing the stall/timeout ladder.
+
+    Same production path, no successor: the cancelled attempt still owns the
+    captured session epoch, so its stall-interrupted backoff must still be
+    recorded durably on the first rung of the unchanged 60/300/900 ladder.
+    """
+    from agent import conversation_compression as cc
+    from agent.auxiliary_client import AuxiliaryExplicitCancellation
+
+    monkeypatch.setattr(
+        cc,
+        "resolve_context_compression_timeouts",
+        lambda cfg=None: (1.0, 2.0),
+    )
+
+    db = SessionDB(db_path=tmp_path / "state.db")
+    session_id = "F1_REAL_CANCEL_NO_SUCCESSOR"
+    db.create_session(session_id, source="cli")
+    db.append_message(session_id, "user", "durable original")
+
+    agent, compressor = _build_agent_with_real_compressor(db, session_id)
+    agent._cached_system_prompt = "sys"
+    agent.compression_in_place = True
+    fence = _StalledCancellationFence()
+
+    def _cancel_without_successor(msgs, **_kwargs):
+        fence.worker_ident = threading.get_ident()
+        raise AuxiliaryExplicitCancellation()
+
+    compressor.compress = _cancel_without_successor
+
+    messages = [{"role": "user", "content": f"m{i}"} for i in range(20)]
+    before = time.time()
+    cc.compress_context(
+        agent,
+        messages,
+        "sys",
+        approx_tokens=120_000,
+        force=True,
+        commit_fence=fence,
+    )
+
+    # The capture also publishes the epoch onto the fence the host owns; an
+    # unpublished epoch would leave the host callback unqualified.
+    assert fence.cooldown_owner_token(), (
+        "the attempt never published its captured session cooldown ownership "
+        "epoch onto its commit fence (#198 F1 host window)"
+    )
+    assert fence.stall_samples >= 1, (
+        "the production cancellation branch never classified this attempt as "
+        "stalled, so this control proves nothing about the backoff"
+    )
+    row = db.get_compression_failure_cooldown_row(session_id)
+    assert row["session_exists"] is True
+    assert str(row["error"] or "").startswith("backoff:stall_interrupted:"), (
+        "a cancelled attempt that still owns the captured session cooldown "
+        "epoch lost its stall-interrupted durable backoff (#198 F1 must not "
+        f"be closed by suppressing the ladder); row={row!r}"
+    )
+    assert row["cooldown_until"] is not None
+    assert float(row["cooldown_until"]) >= before + 59.0, (
+        f"the first 60s rung of the timeout ladder was not persisted: {row!r}"
+    )
+    assert compressor._consecutive_timeout_failures == 1
+    assert db.get_compression_lock_holder(session_id) is None, (
+        "the cancelled attempt did not release its own durable lease"
+    )

@@ -817,6 +817,103 @@ def _restore_compressor_attempt_state_inner(
             setattr(compressor, name, value)
 
 
+# #198 F1 (capture -> publication window): reserved stand-in for "this attempt
+# may already hold durable session cooldown ownership, but the exact epoch is
+# unknown". SessionDB mints ownership epochs as ``os.urandom(16).hex()``, so
+# this value can never BE one: a host cooldown write authorized by it is
+# refused by the owner-qualified compare-and-write inside the same SessionDB
+# transaction, and nothing is persisted. It is deliberately NOT ``None``:
+# absent means "no native durable ownership was ever established", which is the
+# only case the legacy unqualified host write may still serve.
+COOLDOWN_OWNERSHIP_UNRESOLVED = "compression-cooldown-ownership-unresolved"
+
+
+def _native_cooldown_ownership_may_be_stamped(compressor: Any) -> bool:
+    """Whether the native capture could have COMMITTED an ownership stamp.
+
+    Mirrors exactly the preconditions under which
+    :func:`_capture_authoritative_cooldown_under_lease` reaches
+    ``SessionDB.begin_compression_cooldown_ownership``. Third-party, unbound and
+    legacy-store compressors can never stamp, so their absent token keeps
+    proving "never owned" and their host path is byte-unchanged. An unexpected
+    error answers True: over-reporting costs at most one skipped host cooldown
+    record, while under-reporting reopens the stale-write window.
+    """
+    try:
+        from agent.context_compressor import ContextCompressor
+
+        if not isinstance(compressor, ContextCompressor):
+            return False
+        values = vars(compressor)
+        session_db = values.get("_session_db")
+        session_id = values.get("_session_id")
+        if session_db is None or not session_id:
+            return False
+        return callable(
+            getattr(
+                type(session_db),
+                "begin_compression_cooldown_ownership",
+                None,
+            )
+        )
+    except Exception:
+        logger.debug(
+            "native compression cooldown ownership probe failed", exc_info=True
+        )
+        return True
+
+
+def _publish_captured_cooldown_ownership(
+    commit_fence: Any,
+    compressor: Any,
+    authoritative: Optional[bool],
+    durable_state: Optional[dict[str, Any]],
+) -> None:
+    """Publish this attempt's host-visible cooldown ownership state.
+
+    #198 F1: the host's idle-timeout callback records its own durable cooldown
+    AFTER ``release_cancelled_compression_lock()`` and after the one permitted
+    stall fallback, so a successor may own the session by then. The fence is the
+    one per-attempt object the host and the (possibly detached) worker share,
+    and what is published here is the ONLY fact that can authorize that write:
+
+    * captured epoch -> publish it, so the host's write is compared with the
+      mutation inside ONE SessionDB transaction and a superseded attempt writes
+      nothing;
+    * capture refused or ambiguous while a durable stamp may already exist ->
+      publish :data:`COOLDOWN_OWNERSHIP_UNRESOLVED`, which no session can ever
+      match, so the host fails closed instead of taking the legacy no-owner
+      branch. ``begin_compression_cooldown_ownership`` COMMITS the stamp before
+      the authoritative refresh that follows it (and before the snapshot is
+      validated), so "no epoch returned" does not mean "no ownership was
+      established" -- a store that mints epochs but has no
+      ``get_compression_failure_cooldown`` reaches exactly that state;
+    * no native stamp was possible -> publish nothing. Absent stays the
+      source-proven "never established native durable ownership" case.
+
+    Publication only: no durable write, no lock, no callback. Never raises, so
+    it is safe on the unwinding path of the fenced capture.
+    """
+    try:
+        publisher = getattr(commit_fence, "publish_cooldown_owner_token", None)
+        if not callable(publisher):
+            return
+        token = None
+        if authoritative is True and isinstance(durable_state, dict):
+            token = durable_state.get("owner_token") or None
+        if token is None and _native_cooldown_ownership_may_be_stamped(
+            compressor
+        ):
+            token = COOLDOWN_OWNERSHIP_UNRESOLVED
+        if token is None:
+            return
+        publisher(token)
+    except Exception:
+        logger.debug(
+            "compression cooldown ownership publication failed", exc_info=True
+        )
+
+
 def _capture_authoritative_cooldown_under_lease(
     compressor: Any,
     attempt_snapshot: dict[str, Any],
@@ -938,6 +1035,13 @@ class CompressionCommitFence:
         self._progress_observed = False
         self._deadline: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
+        # #198 F1 (host window): the session cooldown ownership epoch the
+        # attempt running under this fence captured under its lease. Published
+        # by compress_context, read by the host's idle-timeout callback so its
+        # durable cooldown write can be authorized by the SAME fact. Plain
+        # attribute store/read -- atomic in CPython, like ``_admission_revoked``
+        # -- so the cancellation path takes no additional lock.
+        self._cooldown_owner_token: Optional[str] = None
         if total_ceiling_seconds is not None:
             self.set_total_ceiling_seconds(total_ceiling_seconds)
 
@@ -1180,6 +1284,22 @@ class CompressionCommitFence:
         with self._lock_release_guard:
             if self._cancelled_lock_release is release:
                 self._cancelled_lock_release = None
+
+    def publish_cooldown_owner_token(self, token: Optional[str]) -> None:
+        """Publish this attempt's captured session cooldown ownership epoch.
+
+        #198 F1: the host records its own durable timeout cooldown AFTER
+        :meth:`release_cancelled_compression_lock` and after the one permitted
+        stall fallback, so a successor can own the session by then. The epoch
+        captured under this attempt's lease is the only fact that can authorize
+        that write, and this fence is the one per-attempt object the host and
+        the (possibly detached) worker share.
+        """
+        self._cooldown_owner_token = token or None
+
+    def cooldown_owner_token(self) -> Optional[str]:
+        """The captured ownership epoch, or None when nothing was captured."""
+        return self._cooldown_owner_token
 
     def release_cancelled_compression_lock(self) -> None:
         """Release the cancelled worker's lock without finalizing its clients.
@@ -1530,11 +1650,24 @@ def _record_stall_interrupted_backoff(
     started_at: float,
     messages: Any,
     approx_tokens: Optional[int],
+    durable_cooldown_authoritative: Optional[bool] = None,
+    durable_cooldown_state: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Persist a stall-interrupted cooldown after snapshot restore.
 
     Must run *after* ``_restore_compressor_attempt_state`` so rollback cannot
     wipe the new row. Returns True when the stall backoff was recorded.
+
+    #198 F1: this is the SECOND durable cooldown mutation of the same
+    cancellation unwind. The owner-qualified restore before it only proves who
+    owned the session at ITS instant, so checking that restore's boolean result
+    would leave the interval open -- a successor can take the session BETWEEN a
+    successful restore and this write, and may already have released its lease
+    again. When the attempt captured an authoritative ownership epoch, this
+    write therefore carries the SAME token and is compared with the mutation
+    inside one SessionDB write transaction: a superseded attempt writes nothing,
+    while an attempt that still owns the epoch keeps the intended timeout/stall
+    ladder unchanged.
     """
     if not compression_attempt_stalled(
         commit_fence=commit_fence, started_at=started_at
@@ -1544,12 +1677,49 @@ def _record_stall_interrupted_backoff(
     record = getattr(compressor, "record_timeout_failure", None)
     if not callable(record):
         return False
+    owner_token = None
+    if durable_cooldown_authoritative is True and isinstance(
+        durable_cooldown_state, dict
+    ):
+        owner_token = durable_cooldown_state.get("owner_token") or None
+    if owner_token is not None:
+        # Only the built-in compressor implements the owner-qualified durable
+        # contract. If the engine was swapped after the capture, fail closed
+        # rather than fall back to an unqualified successor-visible write.
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            native = isinstance(compressor, ContextCompressor)
+        except Exception:
+            native = False
+        if not native:
+            logger.warning(
+                "Skipping stall-interrupted compression backoff for "
+                "session=%s: the captured session cooldown ownership epoch "
+                "cannot be enforced by this context engine (#198 F1).",
+                getattr(agent, "session_id", None) or "none",
+            )
+            return False
     error = (
         f"{STALL_INTERRUPTED_FAILURE_CLASS}:"
         f"{_stall_source_fingerprint(agent, messages, approx_tokens)}"
     )
     try:
-        record(error, failure_kind="stall_interrupted")
+        if owner_token is not None:
+            if record(
+                error,
+                failure_kind="stall_interrupted",
+                owner_token=owner_token,
+            ) is False:
+                logger.warning(
+                    "Skipped stale stall-interrupted compression backoff for "
+                    "session=%s: a later compression owner holds the "
+                    "session's cooldown state (#198 F1).",
+                    getattr(agent, "session_id", None) or "none",
+                )
+                return False
+        else:
+            record(error, failure_kind="stall_interrupted")
     except Exception:
         logger.debug(
             "stall-interrupted compression cooldown persist failed",
@@ -4054,6 +4224,27 @@ def compress_context(
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
+        # #198 F1 residual (lease -> capture window): this attempt now OWNS a
+        # native durable session lease, so it is no longer the "never
+        # established native durable ownership" case the host's legacy
+        # UNQUALIFIED cooldown write is reserved for. From here until the
+        # fenced capture below publishes an exact epoch, a host idle
+        # cancellation can release THIS lease and admit a successor that
+        # stamps and owns the session's cooldown row, while the fence would
+        # still answer "no token" and send the host down that legacy branch --
+        # overwriting the successor its own release admitted. Publish the
+        # matchless stand-in now, inside the lock-setup barrier that already
+        # blocks cancellation, so any host write in that window is compared
+        # owner-qualified INSIDE the SessionDB transaction and is refused
+        # instead. The capture below replaces it with the exact epoch whenever
+        # one is established, and never republishes absence. Publication only:
+        # no durable write, no lock, no callback, no new budget. An attempt
+        # that never held a native lease never reaches this line, and a
+        # compressor that could never stamp publishes nothing here, so the
+        # true never-native-lease legacy path stays byte-unchanged.
+        _publish_captured_cooldown_ownership(
+            commit_fence, agent.context_compressor, None, None
+        )
         if (
             commit_fence is not None
             and commit_fence.register_cancelled_lock_release(
@@ -4132,12 +4323,73 @@ def compress_context(
     # Snapshot the authoritative durable cooldown only after this attempt owns
     # the session lease. This runs for force=True too, but does not apply the
     # automatic breaker gate: manual compression still retries immediately.
-    _durable_cooldown_authoritative, _durable_cooldown_state = (
-        _capture_authoritative_cooldown_under_lease(
-            agent.context_compressor,
-            _compressor_attempt_snapshot,
+    #
+    # #198 F1 (capture -> publication window): the capture below can COMMIT a
+    # durable session cooldown ownership stamp (SessionDB
+    # begin_compression_cooldown_ownership), while the fact that authorizes the
+    # host's own timeout record is what this attempt publishes on the fence.
+    # The lock-setup barrier was already left above, so between that stamp and
+    # the publication a host idle cancellation could release this attempt's
+    # lease, admit a successor, and then take the legacy no-owner branch --
+    # writing UNQUALIFIED over the successor's row. Re-enter the SAME existing
+    # fence setup barrier for exactly that window: no cancellation can be
+    # admitted (try_cancel_before_commit / cancel_before_commit / the release
+    # that revoke_commit_admission defers all need this fence lock) until the
+    # stamp's host-visible state is published. Bounded by construction: one
+    # native SessionDB ownership transaction plus one plain attribute
+    # publication. No provider, model, plugin, network or application callback
+    # runs inside it, no new lock is introduced, and no other session is
+    # serialized.
+    if commit_fence is not None and not _lock_setup_entered:
+        _lock_setup_entered = commit_fence.begin_lock_setup()
+        if not _lock_setup_entered:
+            # Cancellation won BEFORE any stamp could be attempted, so this
+            # attempt provably never established native durable cooldown
+            # ownership: the fence's absent token stays source-proven and the
+            # host's legacy path remains correct for it. Abort rather than
+            # stamp ownership on a session whose lease is being released.
+            logger.info(
+                "Compression commit cancelled before durable cooldown "
+                "ownership capture (session=%s).",
+                agent.session_id or "none",
+            )
+            agent._last_compaction_in_place = False
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="commit_fence_cancelled",
+            )
+            _release_lock()
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
+    _durable_cooldown_authoritative = None
+    _durable_cooldown_state = None
+    try:
+        _durable_cooldown_authoritative, _durable_cooldown_state = (
+            _capture_authoritative_cooldown_under_lease(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+            )
         )
-    )
+    finally:
+        # EVERY exit of the capture -- success, refusal, ambiguity and even an
+        # unexpected escape -- publishes this attempt's host-visible ownership
+        # state BEFORE the barrier opens, so a host that wins cancellation
+        # immediately afterwards can never read "no token" for an attempt that
+        # may already hold a durable stamp. Balanced on every path: this
+        # finally leaves the barrier, and the abort/return paths below reach
+        # _finish_lock_setup() again through _release_lock() as a no-op.
+        _publish_captured_cooldown_ownership(
+            commit_fence,
+            agent.context_compressor,
+            _durable_cooldown_authoritative,
+            _durable_cooldown_state,
+        )
+        _finish_lock_setup()
     if _durable_cooldown_authoritative is False:
         # A bound built-in compressor reached its durable getter and the read
         # failed. Proceeding with force=True could clear an unknown newer row
@@ -4148,6 +4400,15 @@ def compress_context(
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
         return messages, existing_prompt
+
+    # #198 F1 (host window): the epoch captured above is published INSIDE the
+    # fenced capture (see _publish_captured_cooldown_ownership), before any
+    # cancellation/release can be admitted, so that the host's idle-timeout
+    # callback -- which records its own durable cooldown AFTER
+    # release_cancelled_compression_lock() and after the one permitted stall
+    # fallback -- authorizes its write with the SAME fact (see
+    # run_agent.AIAgent._compress_context._on_timeout). No later publication
+    # point exists, so no window re-exposes an absent token.
 
     # The agent may have been constructed before another path completed an
     # in-place compaction on the same session. Re-read durable breaker state
@@ -4507,13 +4768,17 @@ def compress_context(
         ):
             messages[:] = copy.deepcopy(messages_before_compression)
         # Record after restore so rollback cannot wipe a stall backoff, and
-        # while the lease is still held so the next turn cannot race it.
+        # while the lease is still held so the next turn cannot race it. The
+        # captured ownership epoch rides along so this second durable mutation
+        # is authorized by the same fact the restore was (#198 F1).
         _stall_backoff = _record_stall_interrupted_backoff(
             agent,
             commit_fence=commit_fence,
             started_at=_attempt_started_at,
             messages=messages,
             approx_tokens=approx_tokens,
+            durable_cooldown_authoritative=_durable_cooldown_authoritative,
+            durable_cooldown_state=_durable_cooldown_state,
         )
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
@@ -4740,6 +5005,10 @@ def compress_context(
                     started_at=_attempt_started_at,
                     messages=messages,
                     approx_tokens=approx_tokens,
+                    durable_cooldown_authoritative=(
+                        _durable_cooldown_authoritative
+                    ),
+                    durable_cooldown_state=_durable_cooldown_state,
                 )
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:
