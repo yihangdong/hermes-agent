@@ -53,10 +53,32 @@ MAX_PATH_CHARS = 200
 MAX_PATH_SEGMENTS = 16
 MAX_STDOUT_BYTES = 262144
 INSTRUCTIONS = (
-    "Answer one bounded Stage-A proposal request. Emit exactly one line: "
-    + FRAMING_PREFIX + "<envelope>, where <envelope> is one canonical "
-    "printable-ASCII JSON mutation envelope (sorted keys, no spaces, "
-    "schema_version " + ENVELOPE_SCHEMA_VERSION + "). Emit nothing else.")
+    "Answer one bounded Stage-A proposal request. The user message is "
+    "the request JSON; obey it and this contract exactly. Emit exactly "
+    "one line: " + FRAMING_PREFIX + "<envelope>. Emit nothing else: no "
+    "prose, no explanation, no markdown, no code fence, no tool call. "
+    "You get one attempt; any violation is refused without retry.\n"
+    "<envelope> is one canonical printable-ASCII JSON object: keys "
+    "sorted, no whitespace between tokens, non-ASCII escaped, at most "
+    + str(MAX_ENVELOPE_BYTES) + " bytes. Its keys are exactly "
+    "schema_version and mutations, with schema_version "
+    + ENVELOPE_SCHEMA_VERSION + " and mutations a list of 1 to "
+    + str(MAX_ENVELOPE_FILES) + " mutation objects.\n"
+    "Each mutation object has exactly one of these closed key sets and "
+    "no other key: {op=create, path, content}; {op=replace, path, "
+    "base_blob_sha, content}; {op=delete, path, base_blob_sha}. No "
+    "other op exists. base_blob_sha is required by replace and delete "
+    "only, and is exactly 40 lowercase hex characters naming the blob "
+    "currently at that path. content is a JSON string of at most "
+    + str(MAX_FILE_CONTENT_BYTES) + " UTF-8 bytes.\n"
+    "Propose only paths listed in the request's admitted_write_set; "
+    "every other path is refused. A path is relative, at most "
+    + str(MAX_PATH_CHARS) + " characters and " + str(MAX_PATH_SEGMENTS)
+    + " slash-separated segments, uses only ASCII letters, digits, "
+    "'.', '_', '-' and '/', has no empty, '.' or '..' segment, and does "
+    "not start with the .git segment. Two mutations may not share a "
+    "path, and no path may be an ancestor (directory prefix) of "
+    "another mutation's path.")
 
 
 class ProposalRefusal(Exception):

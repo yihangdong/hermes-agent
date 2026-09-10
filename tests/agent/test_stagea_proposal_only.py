@@ -348,3 +348,25 @@ def test_envelope_grammar_is_fail_closed(raw, code):
 
 def test_canonical_envelope_round_trips():
     assert sp.validate_envelope(ENVELOPE) == ENVELOPE
+
+
+def test_instructions_state_the_enforced_grammar():
+    """The one system prompt must carry what the parser really enforces."""
+    text = sp.INSTRUCTIONS
+    assert "exactly one line: " + sp.FRAMING_PREFIX in text
+    assert sp.ENVELOPE_SCHEMA_VERSION in text
+    for op, keys in sp.OP_KEYS.items():
+        assert "op=" + op in text
+        for key in keys - {"op"}:
+            assert key in text
+    for bound in (sp.MAX_ENVELOPE_BYTES, sp.MAX_ENVELOPE_FILES,
+                  sp.MAX_FILE_CONTENT_BYTES, sp.MAX_PATH_CHARS,
+                  sp.MAX_PATH_SEGMENTS):
+        assert str(bound) in text
+    for fragment in ("admitted_write_set", "40 lowercase hex",
+                     "not share a path", "ancestor (directory prefix)",
+                     "printable-ASCII", "sorted", "no whitespace",
+                     "no markdown", "no code fence", "no tool call"):
+        assert fragment in text
+    # The superseded PR #204 model-level REFUSED protocol is not inherited.
+    assert "REFUSED" not in text
