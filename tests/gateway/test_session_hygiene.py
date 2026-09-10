@@ -1656,6 +1656,9 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
 
     worker_started = threading.Event()
     release_worker = threading.Event()
+    lease_released = threading.Event()
+    worker_exited = threading.Event()
+    guard_expired = threading.Event()
     cleanup_done = threading.Event()
     session_id = "sess-fence-wait"
 
@@ -1678,19 +1681,27 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         def _compress_context(
             self, messages, *_args, commit_fence=None, **_kwargs
         ):
-            if commit_fence is not None:
-                commit_fence.try_cancel_before_commit()
-            worker_started.set()
-            # Keep the worker alive (and keep reporting "progress") so a
-            # host that still extends to the 600s ceiling would stall here.
-            deadline = time.monotonic() + 2.0
-            while time.monotonic() < deadline:
+            try:
                 if commit_fence is not None:
-                    commit_fence.touch_progress()
-                if release_worker.is_set():
-                    break
-                time.sleep(0.02)
-            return (messages, None)
+                    commit_fence.register_cancelled_lock_release(lease_released.set)
+                    commit_fence.try_cancel_before_commit()
+                worker_started.set()
+                # Reuse the sibling timeout test's 10s worker-liveness guard.
+                # The original 0.02s progress cadence remains; no duration is
+                # an acceptance predicate. Expiry is sticky and cannot pass
+                # the host-return assertions even if worker failure is caught.
+                guard_deadline = time.monotonic() + 10.0
+                while not release_worker.is_set():
+                    if commit_fence is not None:
+                        commit_fence.touch_progress()
+                    remaining = guard_deadline - time.monotonic()
+                    if remaining <= 0:
+                        guard_expired.set()
+                        raise AssertionError("synthetic worker liveness guard expired")
+                    release_worker.wait(timeout=min(0.02, remaining))
+                return (messages, None)
+            finally:
+                worker_exited.set()
 
     db = SessionDB(db_path=tmp_path / "state.db")
     try:
@@ -1698,25 +1709,35 @@ async def test_hygiene_does_not_wait_ceiling_after_fence_cancel(
         runner, adapter, event = _make_cooldown_runner(
             monkeypatch, tmp_path, HungAfterFenceCancelAgent, db, session_id
         )
-        started = time.monotonic()
         result = await runner._handle_message(event)
-        elapsed = time.monotonic() - started
 
         assert result == "ok"
         assert worker_started.wait(timeout=2)
-        assert elapsed < 2.0, (
-            f"hygiene host waited {elapsed:.1f}s after fence cancel — "
-            "must not extend toward the 600s ceiling (#96953)"
-        )
+        # State ordering proves detachment; reaching the bounded worker guard
+        # or consuming its result cannot masquerade as a successful detach.
+        assert not release_worker.is_set()
+        assert not guard_expired.is_set(), "worker guard expired before host return"
+        assert not worker_exited.is_set(), "host waited for the cancelled worker"
+        assert lease_released.is_set(), "cancelled lease was not released by the host"
+        HungAfterFenceCancelAgent.last_instance.close.assert_not_called()
         assert runner._run_agent.await_count == 1
         state = db.get_compression_failure_cooldown(session_id)
         assert state is not None and state["remaining_seconds"] > 0
         assert not any(
             "Context compression timed out" in s["content"] for s in adapter.sent
         ), "fence-cancel is not a summary-model timeout; no timeout toast"
+        assert not any(
+            "deferred" in s["content"].lower()
+            or "still streaming" in s["content"].lower()
+            for s in adapter.sent
+        ), "fence-cancel must not exit through turn-hold deferral"
         release_worker.set()
         await asyncio.wait_for(asyncio.to_thread(cleanup_done.wait), timeout=2)
+        assert worker_exited.is_set()
+        HungAfterFenceCancelAgent.last_instance.close.assert_called_once()
     finally:
+        # Also release the fake worker when a host-return assertion fails.
+        release_worker.set()
         db.close()
 
 
