@@ -21,8 +21,11 @@ These tests pin the contract:
 from __future__ import annotations
 
 import threading
+import concurrent.futures
 from types import SimpleNamespace
 from unittest.mock import patch
+
+import pytest
 
 from agent.context_compressor import (
     ContextCompressor,
@@ -68,6 +71,7 @@ class _StalledSummaryWorker:
         self.fences = []
         self._lock = threading.Lock()
         self.release = threading.Event()
+        self.started = threading.Event()
 
     @property
     def attempts(self):
@@ -78,6 +82,7 @@ class _StalledSummaryWorker:
             self.routes.append(take_pinned_summary_route())
             self.fences.append(fence)
             attempt = len(self.routes)
+        self.started.set()
         if attempt <= self.stall_attempts:
             # Connection open, zero tokens, zero fence progress.
             self.release.wait(timeout=10)
@@ -112,13 +117,67 @@ def test_stalled_summary_attempts_configured_fallback_chain():
     compressed = [{"role": "user", "content": "summary of earlier turns"}]
     worker = _StalledSummaryWorker(compressed)
     timeouts = []
+    clock = SimpleNamespace(now=0.0)
+    started = [threading.Event(), threading.Event()]
+    submitted = []
+    admission = threading.BoundedSemaphore(2)
+    wait_budgets = []
 
-    try:
-        msgs, prompt = _run(
-            worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
-        )
-    finally:
-        worker.release.set()
+    class ScheduledFuture:
+        def __init__(self, future, index):
+            self.future, self.index = future, index
+
+        def add_done_callback(self, callback):
+            self.future.add_done_callback(callback)
+
+        def cancel(self):
+            return self.future.cancel()
+
+        def result(self, timeout):
+            wait_budgets.append(timeout)
+            if self.index == 0:
+                # Script one idle timeout after the primary actually starts.
+                # No scheduler delay can consume the fallback's own deadline.
+                assert timeout == 0.05
+                clock.now = 0.05
+                raise concurrent.futures.TimeoutError
+            assert timeout == CHAIN_ENTRY["timeout"]
+            # Independent deadlock watchdog for the real synthetic worker;
+            # production idle/ceiling arguments above remain unchanged.
+            return self.future.result(timeout=5)
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as pool:
+        def submit(fn, fence):
+            index = len(submitted)
+            assert index < 2, "fallback must not submit a third attempt"
+
+            def run():
+                started[index].set()
+                return fn(fence)
+
+            future = pool.submit(run)
+            submitted.append(future)
+            assert started[index].wait(5), "test worker did not start"
+            if index == 0:
+                assert worker.started.wait(5), "primary did not enter its worker"
+            return ScheduledFuture(future, index)
+
+        with patch("agent.conversation_compression.time", SimpleNamespace(
+            monotonic=lambda: clock.now,
+        )), patch("agent.conversation_compression._get_compress_timeout_executor",
+                   return_value=SimpleNamespace(submit=submit)), patch(
+            "agent.conversation_compression._try_admit_compression_job",
+            side_effect=lambda: admission.acquire(blocking=False),
+        ), patch("agent.conversation_compression._release_compression_admission",
+                 side_effect=lambda *_args: admission.release()):
+            try:
+                msgs, prompt = _run(
+                    worker, chain=[CHAIN_ENTRY], timeouts=timeouts, messages=original
+                )
+            finally:
+                worker.release.set()
+                for future in submitted:
+                    future.result(timeout=5)
 
     assert worker.attempts == 2, "the aborted stall must be retried once"
     assert worker.routes[0] is None, "the primary attempt is never pinned"
@@ -129,6 +188,16 @@ def test_stalled_summary_attempts_configured_fallback_chain():
     assert msgs == compressed, "the fallback attempt's compression must be published"
     assert prompt == "summarized-prompt"
     assert not timeouts, "no continue-without-compression degrade after a recovery"
+    assert len(submitted) == 2
+    assert wait_budgets == [0.05, 45.0]
+
+
+def test_missing_configured_fallback_is_detected():
+    with patch("agent.conversation_compression._retry_compression_on_fallback_chain",
+               return_value=None), pytest.raises(
+        AssertionError, match="the aborted stall must be retried once"
+    ):
+        test_stalled_summary_attempts_configured_fallback_chain()
 
 
 def test_retry_runs_on_a_host_published_fence():

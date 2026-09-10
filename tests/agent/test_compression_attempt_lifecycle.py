@@ -20,10 +20,12 @@ collapsed lean compaction to one auxiliary request per attempt:
 from __future__ import annotations
 
 import copy
+import concurrent.futures
 import os
 import threading
 import time
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
@@ -71,40 +73,94 @@ class TestWorkerTeardownOnCeiling:
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —
-        the sabotage check for this test is removing the
-        `_join_cancelled_worker` call, which makes
-        `worker_done.is_set()` False when the host returns."""
+        the negative control separately checks that the bounded join was
+        actually used, even if a fast worker exits before host return."""
         original = [{"role": "user", "content": "keep"}]
         worker_done = threading.Event()
+        worker_started = threading.Event()
+        cleanup = threading.Event()
+        clock = SimpleNamespace(now=0.0)
+        waits = []
+        admission = threading.BoundedSemaphore(1)
+        submitted = []
 
         def cooperative_worker(fence: CompressionCommitFence):
-            # Continuous progress (the #97488 'last progress 0.0s ago'
-            # shape) so only the TOTAL ceiling expires; poll the poison
-            # fence like the production worker does between provider phases.
-            deadline = time.monotonic() + 5.0
-            while time.monotonic() < deadline:
-                if fence.is_cancelled:
-                    break
-                fence.touch_progress()
-                time.sleep(0.01)
-            # Cooperative-but-not-instant exit: the unwind after seeing the
-            # poison takes real time (rollback, telemetry). Long enough that
-            # a host WITHOUT the bounded-grace join returns first; far
-            # inside the 5s grace for a host WITH it.
-            time.sleep(0.08)
+            fence.touch_progress()
+            worker_started.set()
+            # Observe the production fence independently. Neither submit nor
+            # Future.result releases this worker or performs its cancellation.
+            while not fence.is_cancelled:
+                if cleanup.wait(0.001):
+                    return (original, "cleanup")
+            assert fence.is_cancelled
             worker_done.set()
             return (original, "late")
 
-        fence = CompressionCommitFence()
-        msgs, prompt = run_compress_context_with_progress_timeout(
-            worker=cooperative_worker,
-            messages=original,
-            system_prompt_fallback="fallback",
-            idle_timeout_seconds=0.1,
-            total_ceiling_seconds=0.2,
-            fence=fence,
-            stall_fallback=False,
-        )
+        class ScheduledFuture:
+            def __init__(self, future, fence):
+                self.future, self.fence = future, fence
+
+            def add_done_callback(self, callback):
+                self.future.add_done_callback(callback)
+
+            def cancel(self):
+                return self.future.cancel()
+
+            def result(self, timeout):
+                waits.append(timeout)
+                if not self.fence.is_cancelled:
+                    # Advance modeled time only after the real worker started.
+                    # Preserve recent progress: this is the total-ceiling path.
+                    clock.now = 0.2
+                    self.fence.touch_progress()
+                    raise concurrent.futures.TimeoutError
+                assert timeout == 0.2, "join must retain the original finite grace"
+                # The real Future, not just this wrapper's argument check,
+                # must settle within the exact production-requested grace.
+                return self.future.result(timeout=timeout)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+            def submit(fn, fence):
+                future = pool.submit(fn, fence)
+                submitted.append(future)
+                assert worker_started.wait(5), "test worker did not start"
+                return ScheduledFuture(future, fence)
+
+            with patch("agent.conversation_compression.time", SimpleNamespace(
+                monotonic=lambda: clock.now,
+            )), patch("agent.conversation_compression._get_compress_timeout_executor",
+                       return_value=SimpleNamespace(submit=submit)), patch(
+                "agent.conversation_compression._try_admit_compression_job",
+                side_effect=lambda: admission.acquire(blocking=False),
+            ), patch(
+                "agent.conversation_compression._release_compression_admission",
+                side_effect=lambda *_args: admission.release(),
+            ):
+                fence = CompressionCommitFence()
+                try:
+                    msgs, prompt = run_compress_context_with_progress_timeout(
+                        worker=cooperative_worker,
+                        messages=original,
+                        system_prompt_fallback="fallback",
+                        idle_timeout_seconds=0.1,
+                        total_ceiling_seconds=0.2,
+                        fence=fence,
+                        stall_fallback=False,
+                    )
+                    # Invocation coverage is separate from quiescence: a fast
+                    # worker could exit even if the host omitted its join.
+                    assert waits == [0.1, 0.2], "bounded-grace join missing"
+                    # These acceptance assertions all precede cleanup. The
+                    # watchdog below cannot supply extra time to pass them.
+                    assert worker_done.is_set(), (
+                        "host returned before tearing down a cooperative cancelled worker"
+                    )
+                    assert submitted[0].done()
+                    assert fence._retain_cancelled_lock_until_worker_done is False
+                finally:
+                    cleanup.set()
+                    for future in submitted:
+                        future.result(timeout=5)
         # The bounded-grace join must have reaped the cooperative worker
         # BEFORE the host returned.
         assert worker_done.is_set(), (
@@ -118,6 +174,13 @@ class TestWorkerTeardownOnCeiling:
         assert prompt in ("fallback", "late")
         # Teardown proved quiescence, so the lease must NOT stay retained.
         assert fence._retain_cancelled_lock_until_worker_done is False
+
+    def test_cooperative_worker_missing_join_is_detected(self):
+        with patch("agent.conversation_compression._join_cancelled_worker",
+                   return_value=False), pytest.raises(
+            AssertionError, match="bounded-grace join missing"
+        ):
+            self.test_cooperative_worker_joined_within_grace()
 
     def test_uninterruptible_worker_is_orphaned_with_lease_retained(self):
         """A worker stuck in an uninterruptible provider call is orphaned:
