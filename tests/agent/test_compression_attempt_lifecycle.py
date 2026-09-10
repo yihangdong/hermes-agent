@@ -73,13 +73,12 @@ class TestWorkerTeardownOnCeiling:
     def test_cooperative_worker_joined_within_grace(self):
         """A worker that exits promptly after cancel is joined on the
         total-ceiling path; the lease is released normally (no retention) —
-        the sabotage check for this test is removing the
-        `_join_cancelled_worker` call, which makes
-        `worker_done.is_set()` False when the host returns."""
+        the negative control separately checks that the bounded join was
+        actually used, even if a fast worker exits before host return."""
         original = [{"role": "user", "content": "keep"}]
         worker_done = threading.Event()
         worker_started = threading.Event()
-        unwind = threading.Event()
+        cleanup = threading.Event()
         clock = SimpleNamespace(now=0.0)
         waits = []
         admission = threading.BoundedSemaphore(1)
@@ -88,7 +87,11 @@ class TestWorkerTeardownOnCeiling:
         def cooperative_worker(fence: CompressionCommitFence):
             fence.touch_progress()
             worker_started.set()
-            assert unwind.wait(5), "test worker never received unwind handshake"
+            # Observe the production fence independently. Neither submit nor
+            # Future.result releases this worker or performs its cancellation.
+            while not fence.is_cancelled:
+                if cleanup.wait(0.001):
+                    return (original, "cleanup")
             assert fence.is_cancelled
             worker_done.set()
             return (original, "late")
@@ -112,12 +115,9 @@ class TestWorkerTeardownOnCeiling:
                     self.fence.touch_progress()
                     raise concurrent.futures.TimeoutError
                 assert timeout == 0.2, "join must retain the original finite grace"
-                assert not worker_done.is_set()
-                unwind.set()
-                # This is a scheduler handshake watchdog, not the production
-                # grace. The test checks bounded host arguments and actual
-                # quiescence, not OS scheduling latency within 200ms.
-                return self.future.result(timeout=5)
+                # The real Future, not just this wrapper's argument check,
+                # must settle within the exact production-requested grace.
+                return self.future.result(timeout=timeout)
 
         with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
             def submit(fn, fence):
@@ -147,14 +147,18 @@ class TestWorkerTeardownOnCeiling:
                         fence=fence,
                         stall_fallback=False,
                     )
-                    # Check before cleanup: without the production join the
-                    # real worker remains parked, so this cannot pass by luck.
+                    # Invocation coverage is separate from quiescence: a fast
+                    # worker could exit even if the host omitted its join.
+                    assert waits == [0.1, 0.2], "bounded-grace join missing"
+                    # These acceptance assertions all precede cleanup. The
+                    # watchdog below cannot supply extra time to pass them.
                     assert worker_done.is_set(), (
                         "host returned before tearing down a cooperative cancelled worker"
                     )
-                    assert waits == [0.1, 0.2]
+                    assert submitted[0].done()
+                    assert fence._retain_cancelled_lock_until_worker_done is False
                 finally:
-                    unwind.set()
+                    cleanup.set()
                     for future in submitted:
                         future.result(timeout=5)
         # The bounded-grace join must have reaped the cooperative worker
@@ -174,7 +178,7 @@ class TestWorkerTeardownOnCeiling:
     def test_cooperative_worker_missing_join_is_detected(self):
         with patch("agent.conversation_compression._join_cancelled_worker",
                    return_value=False), pytest.raises(
-            AssertionError, match="host returned before tearing down"
+            AssertionError, match="bounded-grace join missing"
         ):
             self.test_cooperative_worker_joined_within_grace()
 
