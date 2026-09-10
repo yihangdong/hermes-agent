@@ -114,6 +114,12 @@ def make_root(tmp_path, document=None):
     return root
 
 
+def _snapshot(root):
+    return {str(path.relative_to(root)):
+            (path.stat().st_mode, path.read_bytes() if path.is_file() else None)
+            for path in root.rglob("*")}
+
+
 class Observer:
     """Counts real construction file opens and every egress attempt."""
 
@@ -233,32 +239,29 @@ def test_task_config_must_be_non_secret_and_pinned(
         MODEL, BASE_URL, PROVIDER)
 
 
-def test_task_config_is_read_through_the_behavioral_loader(
+def test_task_config_read_is_literal_and_has_no_loader_side_effects(
         tmp_path, monkeypatch, no_managed_overlay):
-    """Screening/route reads use the loader, never a raw primitive."""
+    """Read the actual task file without the general loader's home writes."""
     import hermes_cli.config as hermes_config
 
     root = make_root(tmp_path)
-    seen = []
-    accepted = hermes_config.load_config_readonly
+    before = _snapshot(tmp_path)
 
     def refuse(*args, **kwargs):
-        raise AssertionError("raw behavioral config read")
-
-    def recording():
-        seen.append(hermes_config.get_config_path())
-        return accepted()
+        raise AssertionError("general loader or managed content reached")
 
     for raw in ("read_user_config_raw", "read_raw_config",
                 "read_raw_config_readonly"):
         monkeypatch.setattr(hermes_config, raw, refuse)
-    monkeypatch.setattr(hermes_config, "load_config_readonly", recording)
+    monkeypatch.setattr(hermes_config, "load_config_readonly", refuse)
+    monkeypatch.setattr(hermes_config, "ensure_hermes_home", refuse)
+    monkeypatch.setattr(no_managed_overlay, "load_managed_config", refuse)
     token = sp.activate_config_root(root)
     try:
         document = sp.read_task_config(root)
     finally:
         reset_hermes_home_override(token)
-    assert seen == [root / "config.yaml"]
+    assert _snapshot(tmp_path) == before
     assert document["model"] == dict(ROUTE)
 
 
@@ -606,7 +609,8 @@ def test_ordinary_route_values_are_not_mistaken_for_credentials(
 
 @pytest.mark.parametrize("directory, document, code", [
     ("/etc/hermes", {}, "config.managed_dir"),
-    (None, {"model": {"default": "managed/other"}}, "config.managed_overlay"),
+    ("/synthetic/managed", {"model": {"default": "managed/other"}},
+     "config.managed_dir"),
 ])
 def test_managed_overlay_fails_closed(
         tmp_path, monkeypatch, directory, document, code):
@@ -627,7 +631,7 @@ def test_managed_overlay_refusal_precedes_any_client_or_request(
     """F8: the refusal lands before a client exists or a request is built."""
     make_root(tmp_path)
     monkeypatch.chdir(tmp_path)
-    _bind_managed(monkeypatch, None,
+    _bind_managed(monkeypatch, "/synthetic/managed",
                   {"model": {"base_url": "https://managed.example/v1"}})
     reached = []
     monkeypatch.setattr(sp, "build_client",
@@ -637,7 +641,7 @@ def test_managed_overlay_refusal_precedes_any_client_or_request(
     monkeypatch.setattr(sp.sys, "stdin", Stub(buffer=io.BytesIO(REQUEST)))
     assert sp.main([]) == 1
     assert reached == []
-    assert "config.managed_overlay" in capsys.readouterr().err
+    assert "config.managed_dir" in capsys.readouterr().err
 
 
 def test_envelope_and_stdout_budgets_are_internally_consistent():
@@ -674,3 +678,189 @@ def test_exact_maximum_advertised_envelope_is_framed_and_printed(
             _sized_envelope(sp.MAX_EMITTED_ENVELOPE_BYTES + 1, paths),
             admitted)
     assert refusal.value.code == "envelope.bytes_length"
+
+
+@pytest.mark.parametrize("field", ["default", "provider", "base_url"])
+@pytest.mark.parametrize("literal", ["${STAGEA_INERT}", "$STAGEA_INERT",
+                                     "%STAGEA_INERT%"])
+def test_raw_route_substitution_is_refused_before_environment_read(
+        tmp_path, monkeypatch, no_managed_overlay, field, literal):
+    root = make_root(tmp_path, {"model": dict(ROUTE, **{field: literal})})
+    monkeypatch.setenv("STAGEA_INERT", "inert-fixture-value")
+    original = os._Environ.__getitem__
+
+    def guarded(environment, key):
+        assert key != "STAGEA_INERT", "route tried to read inherited value"
+        return original(environment, key)
+
+    monkeypatch.setattr(os._Environ, "__getitem__", guarded)
+    before = _snapshot(tmp_path)
+    token = sp.activate_config_root(root)
+    try:
+        with pytest.raises(sp.ProposalRefusal, match="config.environment_syntax"):
+            sp.read_task_config(root)
+    finally:
+        reset_hermes_home_override(token)
+    assert _snapshot(tmp_path) == before
+
+
+def test_external_overlay_content_is_never_consumed(
+        tmp_path, monkeypatch, no_managed_overlay):
+    root = make_root(tmp_path)
+    before = _snapshot(tmp_path)
+
+    def refuse():
+        raise AssertionError("external managed content was consumed")
+
+    monkeypatch.setattr(no_managed_overlay, "load_managed_config", refuse)
+    token = sp.activate_config_root(root)
+    try:
+        assert sp.resolve_route(sp.read_task_config(root)) == (
+            MODEL, BASE_URL, PROVIDER)
+        monkeypatch.setattr(no_managed_overlay, "get_managed_dir",
+                            lambda: tmp_path / "managed")
+        with pytest.raises(sp.ProposalRefusal, match="config.managed_dir"):
+            sp.read_task_config(root)
+    finally:
+        reset_hermes_home_override(token)
+    assert _snapshot(tmp_path) == before
+
+
+@pytest.mark.parametrize("maximum", [False, True])
+def test_binary_stdout_ignores_text_newline_translation(
+        live, monkeypatch, maximum):
+    paths = tuple("docs/frame%d.md" % index for index in range(6))
+    raw = (_sized_envelope(sp.MAX_EMITTED_ENVELOPE_BYTES, paths)
+           if maximum else ENVELOPE)
+    request = (sp.canonical_bytes(dict(json.loads(REQUEST),
+                                     admitted_write_set=list(paths)))
+               if maximum else REQUEST)
+    binary = io.BytesIO()
+    text = io.TextIOWrapper(binary, encoding="ascii", newline="\r\n")
+    monkeypatch.setattr(sp.sys, "stdout", text)
+    monkeypatch.setattr(sp.sys, "stdin", Stub(buffer=io.BytesIO(request)))
+    monkeypatch.setattr(sp, "create_completion", lambda *a, **k:
+                        _response(sp.FRAMING_PREFIX + raw.decode("ascii")))
+    try:
+        assert sp.main([]) == 0
+        assert binary.getvalue() == sp.FRAMING_PREFIX.encode("ascii") + raw + b"\n"
+        assert len(binary.getvalue()) <= sp.MAX_FRAMED_STDOUT_BYTES
+    finally:
+        text.detach()
+
+
+def _bind_offline_http(monkeypatch, handler):
+    """Replace only the socket transport; exercise the actual SDK/client."""
+    import httpx
+
+    calls = []
+    class OfflineTransport(httpx.BaseTransport):
+        def __init__(self, **options):
+            assert options == {"retries": 0, "trust_env": False}
+
+        def handle_request(self, request):
+            calls.append(request)
+            return handler(request)
+
+    monkeypatch.setattr(httpx, "HTTPTransport", OfflineTransport)
+    return calls
+
+
+def test_request_has_finite_generation_and_redirects_cannot_add_request(
+        monkeypatch):
+    import httpx
+
+    calls = _bind_offline_http(monkeypatch, lambda request:
+                              httpx.Response(302, headers={
+                                  "location": "https://inert.invalid/unused"}))
+    seam = sp.build_client(MODEL, BASE_URL, PROVIDER)
+    try:
+        kwargs = sp.build_request_kwargs(seam, json.loads(REQUEST))
+        assert type(kwargs["max_tokens"]) is int
+        assert 0 < kwargs["max_tokens"] == sp.MAX_COMPLETION_TOKENS
+        assert seam.client._client.follow_redirects is False
+        with pytest.raises(sp.ProposalRefusal, match="response.provider_failure"):
+            sp.create_completion(seam.client, **kwargs)
+        assert len(calls) == 1
+        assert json.loads(calls[0].content)["max_tokens"] == sp.MAX_COMPLETION_TOKENS
+    finally:
+        seam.client.close()
+
+
+def test_single_bounded_sdk_completion_preserves_whole_response(monkeypatch):
+    import httpx
+
+    framed = sp.FRAMING_PREFIX + ENVELOPE.decode("ascii")
+    body = json.dumps({"id": "synthetic", "object": "chat.completion",
+                       "created": 0, "model": MODEL,
+                       "choices": [{"index": 0, "finish_reason": "stop",
+                                    "message": {"role": "assistant",
+                                                "content": framed}}]}).encode()
+    monkeypatch.setattr(sp, "MAX_PROVIDER_RESPONSE_BYTES", len(body))
+    calls = _bind_offline_http(monkeypatch, lambda request: httpx.Response(
+        200, headers={"content-type": "application/json"},
+        stream=httpx.ByteStream(body)))
+    seam = sp.build_client(MODEL, BASE_URL, PROVIDER)
+    try:
+        response = sp.create_completion(
+            seam.client, **sp.build_request_kwargs(seam, json.loads(REQUEST)))
+        assert sp.response_text(response) == framed
+        assert sp.validate_envelope(sp.extract_framed(sp.response_text(response)),
+                                    REQUEST_ADMITTED) == ENVELOPE
+        assert len(calls) == 1
+    finally:
+        seam.client.close()
+
+
+def test_http_consumption_refuses_before_accumulating_past_ceiling(monkeypatch):
+    import httpx
+
+    # A tiny synthetic ceiling verifies consumption order without large input.
+    monkeypatch.setattr(sp, "MAX_PROVIDER_RESPONSE_BYTES", 16)
+    progress = []
+    class SyntheticStream(httpx.SyncByteStream):
+        def __iter__(self):
+            for index in range(6):
+                progress.append(index)
+                yield b"12345678"
+
+        def close(self):
+            progress.append("closed")
+
+    _bind_offline_http(monkeypatch, lambda request:
+                       httpx.Response(200, stream=SyntheticStream()))
+    seam = sp.build_client(MODEL, BASE_URL, PROVIDER)
+    try:
+        with seam.client._client.stream("GET", BASE_URL) as response:
+            accepted = bytearray()
+            with pytest.raises(sp.ProposalRefusal, match="response.bytes_length"):
+                for chunk in response.iter_bytes():
+                    accepted.extend(chunk)
+            assert len(accepted) == 16
+            assert progress == [0, 1, 2]
+        assert progress == [0, 1, 2, "closed"]
+    finally:
+        seam.client.close()
+
+
+def test_compressed_response_is_refused_before_consumption(monkeypatch):
+    import httpx
+
+    consumed = []
+    class SyntheticStream(httpx.SyncByteStream):
+        def __iter__(self):
+            consumed.append("read")
+            yield b"inert"
+
+        def close(self):
+            consumed.append("closed")
+
+    _bind_offline_http(monkeypatch, lambda request: httpx.Response(
+        200, headers={"content-encoding": "gzip"}, stream=SyntheticStream()))
+    seam = sp.build_client(MODEL, BASE_URL, PROVIDER)
+    try:
+        with pytest.raises(sp.ProposalRefusal, match="response.content_encoding"):
+            seam.client._client.get(BASE_URL)
+        assert consumed == ["closed"]
+    finally:
+        seam.client.close()

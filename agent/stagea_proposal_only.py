@@ -207,6 +207,9 @@ def screen_scalar_value(value):
     query/fragment/userinfo on a consumed URL is refused; every other scalar is
     refused when it names a credential as a delimited word, under any key.
     """
+    # The task route is literal activation truth. Never interpolate inherited
+    # environment values (including either shell or Windows syntax).
+    need("$" not in value and "%" not in value, "config.environment_syntax")
     lowered = value.lower()
     if "://" in lowered:
         parsed = urlsplit(value)
@@ -221,9 +224,8 @@ def screen_scalar_value(value):
 def screen_no_credential(node, default=None, depth=0):
     """Refuse credential-shaped material this task root contributes.
 
-    The behavioral loader answers with Hermes' shipped defaults merged
-    in, so a subtree still equal to its default is that skeleton and not
-    task material: only what this root actually contributes is screened.
+    The task-only loader supplies no defaults, so every raw task scalar is
+    screened before route interpretation; no environment expansion occurs.
     """
     need(depth <= 8, "config.depth")
     if isinstance(node, dict):
@@ -244,42 +246,37 @@ def screen_no_credential(node, default=None, depth=0):
 
 
 def assert_no_managed_overlay():
-    """F8: refuse when an external managed layer can outrank this task root.
-
-    Both probes are the accepted config layer's own behavioral entry points --
-    the exact calls hermes_cli/config.py:4068-4071 and 4166 make on every load
-    -- not a raw config parse, so the config-read quality guard is untouched.
-    """
+    """Refuse managed scope without reading any external overlay content."""
     from hermes_cli import managed_scope
 
     need(not managed_scope.get_managed_dir(), "config.managed_dir")
-    need(not managed_scope.load_managed_config(), "config.managed_overlay")
 
 
 def read_task_config(root):
-    """Screen this task root's config through the accepted loader."""
-    from hermes_cli.config import (DEFAULT_CONFIG, get_config_path,
-                                   load_config_readonly)
+    """Read literal task config without general Hermes loader side effects.
+
+    The general loader initializes the home, expands environment values and
+    merges external managed configuration even on its readonly fast path.
+    This task-only entry point needs none of those behaviors or defaults: every
+    load-bearing route value must be explicitly pinned in this one file.
+    """
+    import yaml
+    from hermes_constants import get_hermes_home
 
     path = root / "config.yaml"
     need(stat.S_ISREG(_owned_private_stat(path, "config").st_mode),
          "config.not_regular_file")
-    # Behavioral truth only: the accepted loader must already be bound to
-    # this exact task config path.  An unreadable or unparseable file
-    # degrades to the shipped defaults, whose empty route section
-    # resolve_route refuses.
-    need(Path(get_config_path()) == path, "config.loader_path")
-    # F8: get_config_path() naming this root is NOT sufficient.  The loader
-    # merges managed_scope.load_managed_config() over the task file with
-    # managed leaves winning (hermes_cli/config.py:4166-4180), so a managed
-    # model.default/base_url/provider would retarget this isolated route while
-    # the path check still passes.  No overlay-free behavioral read exists, so
-    # an active managed scope fails closed here -- before any route, client or
-    # request exists.
+    need(Path(get_hermes_home()) / "config.yaml" == path, "config.loader_path")
     assert_no_managed_overlay()
-    document = load_config_readonly()
+    try:
+        with path.open("rb") as stream:
+            raw = stream.read(MAX_ENVELOPE_BYTES + 1)
+        need(len(raw) <= MAX_ENVELOPE_BYTES, "config.bytes_length")
+        document = yaml.safe_load(raw)
+    except (OSError, ValueError, yaml.YAMLError):
+        raise ProposalRefusal("config.parse") from None
     need(isinstance(document, dict) and document, "config.not_mapping")
-    screen_no_credential(document, DEFAULT_CONFIG)
+    screen_no_credential(document)
     return document
 
 
@@ -455,6 +452,10 @@ MAX_PROVIDER_RETRIES = 0
 #: provider ends as a printed refusal rather than a killed child, which the
 #: controller could only report as UNKNOWN_MODEL_ATTEMPT_INTERRUPTED.
 PROVIDER_TIMEOUT_SECONDS = 600
+# Both the provider generation and the HTTP response body are bounded before
+# SDK JSON parsing. The latter includes protocol metadata/JSON escaping.
+MAX_COMPLETION_TOKENS = 32768
+MAX_PROVIDER_RESPONSE_BYTES = 4 * MAX_STDOUT_BYTES
 
 
 class ProposalClient:
@@ -489,11 +490,47 @@ class ProposalClient:
 
 def build_client(model, base_url, provider):
     """Side-effect-free Stage-A client construction on the explicit route."""
+    import httpx
     from openai import OpenAI
+
+    class BoundedStream(httpx.SyncByteStream):
+        def __init__(self, inner):
+            self.inner = inner
+
+        def __iter__(self):
+            total = 0
+            for chunk in self.inner:
+                total += len(chunk)
+                need(total <= MAX_PROVIDER_RESPONSE_BYTES, "response.bytes_length")
+                yield chunk
+
+        def close(self):
+            self.inner.close()
+
+    class BoundedTransport(httpx.BaseTransport):
+        def __init__(self):
+            self.inner = httpx.HTTPTransport(retries=0, trust_env=False)
+
+        def handle_request(self, request):
+            response = self.inner.handle_request(request)
+            # Compressed bodies can expand after the raw-byte bound. Refuse
+            # them before HTTPX's decoder or the SDK can accumulate content.
+            if response.headers.get("content-encoding", "identity") != "identity":
+                response.close()
+                raise ProposalRefusal("response.content_encoding")
+            response.stream = BoundedStream(response.stream)
+            return response
+
+        def close(self):
+            self.inner.close()
 
     client = OpenAI(api_key=NO_CREDENTIAL_PLACEHOLDER, base_url=base_url,
                     max_retries=MAX_PROVIDER_RETRIES,
-                    timeout=PROVIDER_TIMEOUT_SECONDS)
+                    timeout=PROVIDER_TIMEOUT_SECONDS,
+                    http_client=httpx.Client(
+                        transport=BoundedTransport(), follow_redirects=False,
+                        trust_env=False, timeout=PROVIDER_TIMEOUT_SECONDS,
+                        headers={"Accept-Encoding": "identity"}))
     need(getattr(client, "max_retries", None) == MAX_PROVIDER_RETRIES,
          "route.retries_enabled")
     return ProposalClient(model, base_url, provider, client)
@@ -501,7 +538,14 @@ def build_client(model, base_url, provider):
 
 def create_completion(client, **kwargs):
     """The single provider seam; offline tests patch exactly this."""
-    return client.chat.completions.create(**kwargs)
+    try:
+        return client.chat.completions.create(**kwargs)
+    except ProposalRefusal:
+        raise
+    except Exception:
+        # SDK wrappers may wrap a transport refusal. Do not retry or expose
+        # response bodies, route details or provider diagnostics on stderr.
+        raise ProposalRefusal("response.provider_failure") from None
 
 
 def build_request_kwargs(seam, document):
@@ -522,6 +566,7 @@ def build_request_kwargs(seam, document):
         need(banned not in kwargs, "request.tool_surface")
     need(kwargs.get("model") == model
          and len(kwargs.get("messages") or []) == 2, "request.identity")
+    kwargs["max_tokens"] = MAX_COMPLETION_TOKENS
     return kwargs
 
 
@@ -630,14 +675,15 @@ def run(root, request_bytes):
     """One bounded proposal attempt under an already-active config root."""
     document = parse_request(request_bytes)
     admitted = admitted_paths(document)
-    # One behavioral config read: read_task_config proves the accepted loader
-    # is bound to this root, refuses an active managed overlay, screens what
-    # the root contributes, and hands back the document the route comes from.
+    # One task-only, literal config read, without loader mutation or overlays.
     route = resolve_route(read_task_config(root))
     seam = build_client(*route)
     kwargs = build_request_kwargs(seam, document)
-    return validate_envelope(extract_framed(
-        response_text(create_completion(seam.client, **kwargs))), admitted)
+    try:
+        return validate_envelope(extract_framed(
+            response_text(create_completion(seam.client, **kwargs))), admitted)
+    finally:
+        seam.client.close()
 
 
 def main(argv=None):
@@ -648,10 +694,10 @@ def main(argv=None):
         root = resolve_config_root()
         token = activate_config_root(root)
         envelope = run(root, sys.stdin.buffer.read(MAX_ENVELOPE_BYTES + 1))
-        line = FRAMING_PREFIX + envelope.decode("ascii")
+        line = FRAMING_PREFIX.encode("ascii") + envelope
         need(len(line) + 1 <= MAX_FRAMED_STDOUT_BYTES, "framing.too_long")
-        sys.stdout.write(line + "\n")
-        sys.stdout.flush()
+        sys.stdout.buffer.write(line + b"\n")
+        sys.stdout.buffer.flush()
         return 0
     except ProposalRefusal as refusal:
         sys.stderr.write("STAGE_A_PROPOSAL_REFUSED " + refusal.code + "\n")
