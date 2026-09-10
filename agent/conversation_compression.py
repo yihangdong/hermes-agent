@@ -426,6 +426,50 @@ def _snapshot_compressor_attempt_state(compressor: Any) -> dict[str, Any]:
 
 _COMPRESSOR_ATTEMPT_LOCK = threading.Lock()
 
+# Per-compressor mutex ordering a durable cooldown ROLLBACK against a NEW
+# claim (#198 F1). ``threading.RLock`` is a factory, so the concrete type is
+# captured once for the isinstance guard below -- a mock compressor's
+# auto-created attribute must never be mistaken for a real lock.
+_COMPRESSOR_ROLLBACK_LOCK_TYPE = type(threading.RLock())
+_COMPRESSOR_DURABLE_ROLLBACK_LOCK_FIELD = "_compression_durable_rollback_lock"
+
+
+def _compressor_durable_rollback_lock(compressor: Any) -> Optional[Any]:
+    """Per-compressor mutex serializing durable rollback with new claims.
+
+    #198 F1: ``_restore_compressor_attempt_state`` checked attempt ownership
+    and then performed the authoritative durable cooldown write with NO lock
+    held, so a detached stale primary that had already passed the check could
+    overwrite the row an admitted stall-fallback successor wrote; the second
+    check protected only the in-memory ``setattr`` loop. The check and the
+    durable write must therefore be ONE step, ordered against
+    :func:`_claim_compressor_attempt`, which takes this same mutex.
+
+    Stored on the COMPRESSOR instance, never module-global: attempts on
+    unrelated sessions use different compressors, hence different mutexes, and
+    are never serialized by this. Created under ``_COMPRESSOR_ATTEMPT_LOCK``
+    so racing attempts cannot install two different locks; that global lock is
+    always RELEASED before this one is acquired, so the only order in the
+    module is rollback mutex -> ``_COMPRESSOR_ATTEMPT_LOCK``, never the
+    reverse. Re-entrant, so a nested restore on one thread cannot self-lock.
+
+    Returns ``None`` when the compressor cannot carry the attribute -- the
+    same all-or-nothing slotted/frozen third-party rule that disables the
+    generation guard itself, leaving that legacy path exactly as it was.
+    """
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        existing = getattr(
+            compressor, _COMPRESSOR_DURABLE_ROLLBACK_LOCK_FIELD, None
+        )
+        if isinstance(existing, _COMPRESSOR_ROLLBACK_LOCK_TYPE):
+            return existing
+        created = threading.RLock()
+        try:
+            setattr(compressor, _COMPRESSOR_DURABLE_ROLLBACK_LOCK_FIELD, created)
+        except Exception:
+            return None
+        return created
+
 
 def _claim_compressor_attempt(compressor: Any) -> int:
     """Claim the compressor for a new attempt; returns its generation id.
@@ -433,7 +477,30 @@ def _claim_compressor_attempt(compressor: Any) -> int:
     Monotonic per compressor instance. Any restore or cancelled-check
     mutation stamped with an OLDER generation becomes a no-op, so a
     detached, late-unwinding attempt cannot clobber its successor's state.
+
+    #198 F1: admission also waits out an in-flight durable cooldown rollback
+    on THIS compressor, which is what makes "check ownership, then write
+    durable state" atomic with respect to this claim. The section waited on
+    is one SessionDB cooldown restore/record/clear plus the in-memory
+    snapshot restore -- no provider, plugin, network or otherwise unbounded
+    callback runs inside it. A claim is taken at ``compress_context`` entry,
+    BEFORE durable session-lock acquisition and before any fence boundary, so
+    a waiting claimant holds no lease, no fence lock and no attempt lock, and
+    holds nothing the rollback needs; with the single order rollback mutex ->
+    ``_COMPRESSOR_ATTEMPT_LOCK`` there is no inversion and no deadlock.
     """
+    rollback_lock = _compressor_durable_rollback_lock(compressor)
+    if rollback_lock is not None:
+        rollback_lock.acquire()
+    try:
+        return _claim_compressor_attempt_locked(compressor)
+    finally:
+        if rollback_lock is not None:
+            rollback_lock.release()
+
+
+def _claim_compressor_attempt_locked(compressor: Any) -> int:
+    """Advance the monotonic claim counter under the attempt lock."""
     with _COMPRESSOR_ATTEMPT_LOCK:
         generation = int(getattr(compressor, "_compression_attempt_generation", 0) or 0) + 1
         try:
@@ -448,15 +515,86 @@ def _claim_compressor_attempt(compressor: Any) -> int:
         return generation
 
 
+# Claims retired by their OWN attempt (#198 F1). The generation is claimed
+# BEFORE durable-lock acquisition, so an attempt can advance the shared
+# counter and then discover that another path is the real per-session
+# compression owner. Such an attempt ran no summary and wrote no
+# compressor-owned state, so its claim must stop counting — otherwise the
+# lock LOSER supersedes the lock WINNER and both passes no-op.
+_COMPRESSOR_RETIRED_ATTEMPTS_FIELD = "_compression_retired_attempt_generations"
+
+
+def _effective_compressor_attempt_generation(compressor: Any) -> int:
+    """Newest claim on *compressor* that its own attempt did not retire.
+
+    Callers must hold ``_COMPRESSOR_ATTEMPT_LOCK``. The monotonic counter is
+    never rolled back; the walk only skips generations whose claimant proved
+    it never became the session's durable compression owner (see
+    :func:`_retire_compressor_attempt`), so it stops at the newest claim that
+    can still own compressor state.
+    """
+    generation = int(getattr(compressor, "_compression_attempt_generation", 0) or 0)
+    retired = getattr(compressor, _COMPRESSOR_RETIRED_ATTEMPTS_FIELD, None)
+    if not isinstance(retired, set):
+        return generation
+    while generation > 0 and generation in retired:
+        generation -= 1
+    return generation
+
+
+def _retire_compressor_attempt(compressor: Any, generation: int) -> bool:
+    """Give up a claim whose attempt never became the durable lock owner.
+
+    #198 F1: an overlapping attempt claims this compressor before it tries to
+    acquire the durable per-session lock. When it LOSES that lock it returns
+    the caller's messages unchanged through the ``lock_contended`` path,
+    having run no summary and mutated no compressor-owned state — yet its
+    newer claim used to classify the actual lock holder as
+    ``attempt_superseded``, so the holder discarded a healthy candidate and
+    both overlapping passes no-oped. The loser therefore retires its claim
+    here: it sits out, and the real owner stays eligible to commit.
+
+    Deliberately NOT a rollback of ``_compression_attempt_generation``: the
+    counter stays monotonic, so a genuinely admitted successor/fallback that
+    claimed after this generation keeps its authority and a detached, stale
+    primary can still never restore or commit over newer work. Only the
+    retiring attempt's own generation is recorded, which is why an older
+    attempt can never be resurrected over a newer real owner.
+
+    Returns True when the retirement was recorded. The retired set holds one
+    small int per attempt that lost this compressor's durable lock, so it is
+    bounded by observed lock contention on this compressor instance.
+    """
+    if not generation:
+        # Generation 0 means ownership tracking is unavailable on this
+        # compressor (slotted/frozen third party) and the guard is disabled
+        # for EVERY attempt on it, so there is nothing to retire.
+        return False
+    with _COMPRESSOR_ATTEMPT_LOCK:
+        retired = getattr(compressor, _COMPRESSOR_RETIRED_ATTEMPTS_FIELD, None)
+        if not isinstance(retired, set):
+            retired = set()
+        retired.add(int(generation))
+        try:
+            setattr(compressor, _COMPRESSOR_RETIRED_ATTEMPTS_FIELD, retired)
+        except Exception:
+            # Same all-or-nothing compatibility rule as the claim itself: a
+            # compressor that rejects the setattr rejected the claim too.
+            return False
+        return True
+
+
 def _compressor_attempt_is_current(compressor: Any, generation: int) -> bool:
-    """True when *generation* still owns the compressor (or guard disabled)."""
+    """True when *generation* still owns the compressor (or guard disabled).
+
+    A claim retired by its own attempt (a contender that never became the
+    session's durable compression owner) does not supersede anyone, so the
+    current durable lock holder stays current (#198 F1).
+    """
     if not generation:
         return True
     with _COMPRESSOR_ATTEMPT_LOCK:
-        return (
-            int(getattr(compressor, "_compression_attempt_generation", 0) or 0)
-            == generation
-        )
+        return _effective_compressor_attempt_generation(compressor) == generation
 
 
 def _install_compression_cancelled_check(
@@ -492,6 +630,53 @@ def _clear_compression_cancelled_check_if_owner(
 
 
 def _restore_compressor_attempt_state(
+    compressor: Any,
+    snapshot: dict[str, Any],
+    *,
+    durable_cooldown_authoritative: Optional[bool] = None,
+    durable_cooldown_state: Optional[dict[str, Any]] = None,
+    attempt_generation: Optional[int] = None,
+) -> None:
+    """Order the whole rollback against new claims, then restore (#198 F1).
+
+    The ownership check and the authoritative durable cooldown write below
+    used to be separated by no lock at all: a detached stale primary could
+    pass the check, an admitted stall-fallback successor could claim and write
+    its own authoritative cooldown row, and the primary could then overwrite
+    it -- the post-write generation check saw the staleness but could not undo
+    the durable mutation. A second unlocked pre-write check would not close
+    that: it only shrinks the window. Holding this compressor's rollback mutex
+    across BOTH the check and the durable write (see
+    :func:`_compressor_durable_rollback_lock`) makes them one step against
+    :func:`_claim_compressor_attempt`, which takes the same mutex: either the
+    successor claims first, and the check now rejects the rollback outright,
+    or the rollback completes first and the successor's later durable write is
+    the final state. Successor-owned durable state cannot be rolled back
+    either way, and a rollback with NO successor still runs exactly as before.
+
+    Bounded critical section: one SessionDB cooldown restore/record/clear, a
+    snapshot deepcopy and the attribute writes. No provider, plugin, network
+    or unbounded callback is invoked while it is held, the only lock taken
+    inside it is ``_COMPRESSOR_ATTEMPT_LOCK`` (never the reverse order), and
+    the mutex is per compressor, so unrelated sessions are not serialized.
+    """
+    rollback_lock = _compressor_durable_rollback_lock(compressor)
+    if rollback_lock is not None:
+        rollback_lock.acquire()
+    try:
+        _restore_compressor_attempt_state_inner(
+            compressor,
+            snapshot,
+            durable_cooldown_authoritative=durable_cooldown_authoritative,
+            durable_cooldown_state=durable_cooldown_state,
+            attempt_generation=attempt_generation,
+        )
+    finally:
+        if rollback_lock is not None:
+            rollback_lock.release()
+
+
+def _restore_compressor_attempt_state_inner(
     compressor: Any,
     snapshot: dict[str, Any],
     *,
@@ -538,20 +723,40 @@ def _restore_compressor_attempt_state(
             if durable_cooldown_authoritative is True:
                 restorer = getattr(
                     type(session_db),
-                    "restore_compression_failure_cooldown_row",
+                    "restore_compression_failure_cooldown_row_for_owner",
                     None,
                 )
                 if not callable(restorer) or durable_cooldown_state is None:
                     raise RuntimeError(
                         "exact compression cooldown rollback API is unavailable"
                     )
+                # #198 F1: the durable cooldown row is owned per SESSION, while
+                # the rollback mutex and attempt generation are owned per
+                # COMPRESSOR OBJECT. A DIFFERENT compressor admitted after the
+                # idle-timeout path released our lease is therefore invisible to
+                # both, and a current-holder check would not see it either: the
+                # successor may write its row AND release before we resume.
                 # This API restores raw columns (including expired and null
-                # combinations), verifies the read-back, and propagates failure.
-                restorer(
+                # combinations) only while the ownership token minted when we
+                # captured the row is still the session's current one, compares
+                # that token INSIDE the same write transaction as the UPDATE,
+                # verifies the read-back, and propagates write/verify failure.
+                # A False return means a later owner holds the session's cooldown
+                # state, so its row stands and this cancellation has nothing
+                # durable to compensate. The in-memory restore below is
+                # unaffected: those attributes belong to THIS compressor object
+                # and are still guarded by the generation checks.
+                if not restorer(
                     session_db,
                     session_id,
                     copy.deepcopy(durable_cooldown_state),
-                )
+                ):
+                    logger.warning(
+                        "Skipping stale durable compression cooldown rollback "
+                        "for session=%s: a later compression owner holds the "
+                        "session's cooldown state (#198 F1).",
+                        session_id,
+                    )
             else:
                 try:
                     deadline = float(
@@ -599,7 +804,7 @@ def _restore_compressor_attempt_state(
     # have claimed first, which the entry check already rejects.
     with _COMPRESSOR_ATTEMPT_LOCK:
         if attempt_generation is not None and attempt_generation and (
-            int(getattr(compressor, "_compression_attempt_generation", 0) or 0)
+            _effective_compressor_attempt_generation(compressor)
             != attempt_generation
         ):
             logger.warning(
@@ -610,6 +815,103 @@ def _restore_compressor_attempt_state(
             return
         for name, value in restored.items():
             setattr(compressor, name, value)
+
+
+# #198 F1 (capture -> publication window): reserved stand-in for "this attempt
+# may already hold durable session cooldown ownership, but the exact epoch is
+# unknown". SessionDB mints ownership epochs as ``os.urandom(16).hex()``, so
+# this value can never BE one: a host cooldown write authorized by it is
+# refused by the owner-qualified compare-and-write inside the same SessionDB
+# transaction, and nothing is persisted. It is deliberately NOT ``None``:
+# absent means "no native durable ownership was ever established", which is the
+# only case the legacy unqualified host write may still serve.
+COOLDOWN_OWNERSHIP_UNRESOLVED = "compression-cooldown-ownership-unresolved"
+
+
+def _native_cooldown_ownership_may_be_stamped(compressor: Any) -> bool:
+    """Whether the native capture could have COMMITTED an ownership stamp.
+
+    Mirrors exactly the preconditions under which
+    :func:`_capture_authoritative_cooldown_under_lease` reaches
+    ``SessionDB.begin_compression_cooldown_ownership``. Third-party, unbound and
+    legacy-store compressors can never stamp, so their absent token keeps
+    proving "never owned" and their host path is byte-unchanged. An unexpected
+    error answers True: over-reporting costs at most one skipped host cooldown
+    record, while under-reporting reopens the stale-write window.
+    """
+    try:
+        from agent.context_compressor import ContextCompressor
+
+        if not isinstance(compressor, ContextCompressor):
+            return False
+        values = vars(compressor)
+        session_db = values.get("_session_db")
+        session_id = values.get("_session_id")
+        if session_db is None or not session_id:
+            return False
+        return callable(
+            getattr(
+                type(session_db),
+                "begin_compression_cooldown_ownership",
+                None,
+            )
+        )
+    except Exception:
+        logger.debug(
+            "native compression cooldown ownership probe failed", exc_info=True
+        )
+        return True
+
+
+def _publish_captured_cooldown_ownership(
+    commit_fence: Any,
+    compressor: Any,
+    authoritative: Optional[bool],
+    durable_state: Optional[dict[str, Any]],
+) -> None:
+    """Publish this attempt's host-visible cooldown ownership state.
+
+    #198 F1: the host's idle-timeout callback records its own durable cooldown
+    AFTER ``release_cancelled_compression_lock()`` and after the one permitted
+    stall fallback, so a successor may own the session by then. The fence is the
+    one per-attempt object the host and the (possibly detached) worker share,
+    and what is published here is the ONLY fact that can authorize that write:
+
+    * captured epoch -> publish it, so the host's write is compared with the
+      mutation inside ONE SessionDB transaction and a superseded attempt writes
+      nothing;
+    * capture refused or ambiguous while a durable stamp may already exist ->
+      publish :data:`COOLDOWN_OWNERSHIP_UNRESOLVED`, which no session can ever
+      match, so the host fails closed instead of taking the legacy no-owner
+      branch. ``begin_compression_cooldown_ownership`` COMMITS the stamp before
+      the authoritative refresh that follows it (and before the snapshot is
+      validated), so "no epoch returned" does not mean "no ownership was
+      established" -- a store that mints epochs but has no
+      ``get_compression_failure_cooldown`` reaches exactly that state;
+    * no native stamp was possible -> publish nothing. Absent stays the
+      source-proven "never established native durable ownership" case.
+
+    Publication only: no durable write, no lock, no callback. Never raises, so
+    it is safe on the unwinding path of the fenced capture.
+    """
+    try:
+        publisher = getattr(commit_fence, "publish_cooldown_owner_token", None)
+        if not callable(publisher):
+            return
+        token = None
+        if authoritative is True and isinstance(durable_state, dict):
+            token = durable_state.get("owner_token") or None
+        if token is None and _native_cooldown_ownership_may_be_stamped(
+            compressor
+        ):
+            token = COOLDOWN_OWNERSHIP_UNRESOLVED
+        if token is None:
+            return
+        publisher(token)
+    except Exception:
+        logger.debug(
+            "compression cooldown ownership publication failed", exc_info=True
+        )
 
 
 def _capture_authoritative_cooldown_under_lease(
@@ -634,7 +936,9 @@ def _capture_authoritative_cooldown_under_lease(
         session_id = values.get("_session_id")
         raw_reader = (
             getattr(
-                type(session_db), "get_compression_failure_cooldown_row", None
+                type(session_db),
+                "begin_compression_cooldown_ownership",
+                None,
             )
             if session_db is not None
             else None
@@ -643,13 +947,26 @@ def _capture_authoritative_cooldown_under_lease(
             # Unbound compressors have no durable row to mutate or restore.
             return None, None
         if not callable(raw_reader):
+            # Same persistence-safety rule as a missing raw reader (#198 F1):
+            # without a session ownership stamp, a later cancellation could only
+            # restore this row UNQUALIFIED, which is exactly the cross-compressor
+            # overwrite. Refuse to call the row authoritative instead.
             return False, None
-        # Capture the exact persisted representation first. The active getter
-        # intentionally filters expired rows and therefore cannot serve as a
-        # lossless rollback snapshot.
+        # Stamp session cooldown ownership and capture the exact persisted
+        # representation in ONE transaction, so no writer can change the row
+        # between the stamp and the snapshot: the returned token describes
+        # exactly the returned row. The active getter intentionally filters
+        # expired rows and therefore cannot serve as a lossless rollback
+        # snapshot. The token rides WITH the snapshot, so every caller that
+        # already forwards ``durable_cooldown_state`` forwards the ownership
+        # epoch it was captured under, without changing this function's arity.
         durable_state = raw_reader(session_db, session_id)
         if not isinstance(durable_state, dict):
             raise TypeError("raw compression cooldown snapshot must be a mapping")
+        if not durable_state.get("owner_token"):
+            raise TypeError(
+                "raw compression cooldown snapshot carries no ownership token"
+            )
         ContextCompressor.get_active_compression_failure_cooldown(
             compressor,
             refresh=True,
@@ -718,6 +1035,13 @@ class CompressionCommitFence:
         self._progress_observed = False
         self._deadline: float | None = None
         self._retain_cancelled_lock_until_worker_done = False
+        # #198 F1 (host window): the session cooldown ownership epoch the
+        # attempt running under this fence captured under its lease. Published
+        # by compress_context, read by the host's idle-timeout callback so its
+        # durable cooldown write can be authorized by the SAME fact. Plain
+        # attribute store/read -- atomic in CPython, like ``_admission_revoked``
+        # -- so the cancellation path takes no additional lock.
+        self._cooldown_owner_token: Optional[str] = None
         if total_ceiling_seconds is not None:
             self.set_total_ceiling_seconds(total_ceiling_seconds)
 
@@ -727,6 +1051,27 @@ class CompressionCommitFence:
         if seconds <= 0:
             raise ValueError("total compression ceiling must be positive")
         self._deadline = time.monotonic() + seconds
+
+    def begin_attempt(self, total_ceiling_seconds: float) -> float:
+        """Arm the ceiling AND the idle clock from one attempt epoch.
+
+        Returns the monotonic epoch the host must also use for its own
+        elapsed-time accounting. The fence is constructed before an attempt's
+        lazy setup runs (cold ``tools.thread_context`` import, first-use pool
+        construction), so a construction-time origin charged that setup to the
+        provider: the ceiling could expire before the worker was ever admitted
+        while the host's wait clock still read ~0 (#97488). No budget changes
+        here — only the instant both clocks are charged from.
+        """
+        epoch = time.monotonic()
+        seconds = float(total_ceiling_seconds)
+        if seconds <= 0:
+            raise ValueError("total compression ceiling must be positive")
+        self._deadline = epoch + seconds
+        # ``_progress_observed`` is deliberately left alone: it means "the
+        # PROVIDER reported progress", and no worker has run for this attempt.
+        self._last_progress = epoch
+        return epoch
 
     def touch_progress(self) -> None:
         """Record forward progress (e.g. a streamed summary token arriving).
@@ -940,6 +1285,22 @@ class CompressionCommitFence:
             if self._cancelled_lock_release is release:
                 self._cancelled_lock_release = None
 
+    def publish_cooldown_owner_token(self, token: Optional[str]) -> None:
+        """Publish this attempt's captured session cooldown ownership epoch.
+
+        #198 F1: the host records its own durable timeout cooldown AFTER
+        :meth:`release_cancelled_compression_lock` and after the one permitted
+        stall fallback, so a successor can own the session by then. The epoch
+        captured under this attempt's lease is the only fact that can authorize
+        that write, and this fence is the one per-attempt object the host and
+        the (possibly detached) worker share.
+        """
+        self._cooldown_owner_token = token or None
+
+    def cooldown_owner_token(self) -> Optional[str]:
+        """The captured ownership epoch, or None when nothing was captured."""
+        return self._cooldown_owner_token
+
     def release_cancelled_compression_lock(self) -> None:
         """Release the cancelled worker's lock without finalizing its clients.
 
@@ -1011,7 +1372,12 @@ def _join_cancelled_worker(future: Any, grace_seconds: float) -> bool:
         future.result(timeout=grace)
         return True
     except concurrent.futures.TimeoutError:
-        return False
+        # Ambiguous by class (#97488): the grace may have expired, or the
+        # WORKER may itself have settled by raising TimeoutError (the
+        # fence-gated pre-start refusal does exactly that). Quiescence is a
+        # property of future STATE — a settled future proves the worker thread
+        # left; only a still-running one is a live orphan.
+        return bool(future.done())
     except concurrent.futures.CancelledError:
         # Never started; nothing can be in flight.
         return True
@@ -1049,6 +1415,46 @@ class CompressionExecutorSaturatedError(RuntimeError):
     """All compression pool slots are occupied; submission was refused."""
 
 
+class _CompressionWorkerPreStartExpiry(concurrent.futures.TimeoutError):
+    """The fence-gated worker refused to START: the attempt was already over.
+
+    Subclasses ``concurrent.futures.TimeoutError`` so every existing handler
+    keeps its behaviour, while letting the host tell "the worker never
+    started" apart from "this host's bounded wait slice expired" and from a
+    genuine worker fault.
+    """
+
+
+def _settled_worker_outcome(future: Any) -> Optional[Tuple[str, Any]]:
+    """Classify a ``TimeoutError`` raised by ``future.result(timeout=...)``.
+
+    That call raises ``TimeoutError`` for two unrelated events (#97488): the
+    caller's bounded wait expired (future still running), or the worker
+    finished by RAISING ``TimeoutError`` (future settled). The class is
+    ambiguous, so classify from future state instead.
+
+    Returns ``None`` for a genuine host wait expiry, else ``(kind, payload)``
+    with kind ``"result"``, ``"exception"`` or ``"not_started"``.
+    """
+    if not future.done():
+        return None
+    try:
+        exc = future.exception(timeout=0)
+    except concurrent.futures.CancelledError as cancelled:
+        return "exception", cancelled
+    except concurrent.futures.TimeoutError:
+        # Lost the settle race after ``done()`` — treat as a host wait expiry.
+        return None
+    if isinstance(exc, _CompressionWorkerPreStartExpiry):
+        return "not_started", exc
+    if exc is not None:
+        return "exception", exc
+    try:
+        return "result", future.result(timeout=0)
+    except BaseException as settled_exc:  # pragma: no cover - settled above
+        return "exception", settled_exc
+
+
 def _try_admit_compression_job() -> bool:
     """Reserve one bounded compression-pool admission slot (F6)."""
     global _compress_admitted_count
@@ -1065,6 +1471,59 @@ def _release_compression_admission(_future=None) -> None:
     with _compress_admission_lock:
         if _compress_admitted_count > 0:
             _compress_admitted_count -= 1
+
+
+class _CompressionAdmissionTicket:
+    """Exactly-once handle on ONE admitted compression job's slot.
+
+    The slot is freed by whichever of the future's done-callback or the host's
+    settled-future reclamation runs first; the loser is a no-op. The flag test
+    and the decrement both happen under ``_compress_admission_lock``, so one
+    admitted future can never release two slots (and never fewer than one).
+    """
+
+    __slots__ = ("_released",)
+
+    def __init__(self) -> None:
+        self._released = False
+
+    def release(self, _future=None) -> None:
+        """Free this job's slot at most once (done-callback signature)."""
+        global _compress_admitted_count
+        with _compress_admission_lock:
+            if self._released:
+                return
+            self._released = True
+            if _compress_admitted_count > 0:
+                _compress_admitted_count -= 1
+
+
+def _admit_compression_job() -> Optional[_CompressionAdmissionTicket]:
+    """Reserve one bounded slot, returning its exactly-once ticket or None."""
+    if not _try_admit_compression_job():
+        return None
+    return _CompressionAdmissionTicket()
+
+
+def _reclaim_settled_admission(admission, future) -> bool:
+    """Return a SETTLED future's admission slot without awaiting its callback.
+
+    Deep F1: a standard ``Future`` becomes FINISHED and wakes its waiters
+    BEFORE ``_invoke_callbacks()`` runs, so a woken host can observe
+    ``done() is True`` while ``_CompressionAdmissionTicket.release`` has not
+    yet returned this attempt's slot. With the other three slots occupied that
+    stale count refused the one permitted fallback as ``pool_saturated``.
+
+    This is reclamation, not oversubscription: it fires ONLY for a future that
+    has already settled (result, raise or pre-start cancellation), i.e. whose
+    callable has returned, so at most ``_COMPRESS_EXECUTOR_MAX_WORKERS``
+    UNFINISHED jobs stay admitted. The cap, the fail-closed refusal and the
+    no-stale-queue contract are unchanged, and the pending callback no-ops.
+    """
+    if admission is None or not future.done():
+        return False
+    admission.release()
+    return True
 
 
 def _get_compress_timeout_executor():
@@ -1191,11 +1650,24 @@ def _record_stall_interrupted_backoff(
     started_at: float,
     messages: Any,
     approx_tokens: Optional[int],
+    durable_cooldown_authoritative: Optional[bool] = None,
+    durable_cooldown_state: Optional[dict[str, Any]] = None,
 ) -> bool:
     """Persist a stall-interrupted cooldown after snapshot restore.
 
     Must run *after* ``_restore_compressor_attempt_state`` so rollback cannot
     wipe the new row. Returns True when the stall backoff was recorded.
+
+    #198 F1: this is the SECOND durable cooldown mutation of the same
+    cancellation unwind. The owner-qualified restore before it only proves who
+    owned the session at ITS instant, so checking that restore's boolean result
+    would leave the interval open -- a successor can take the session BETWEEN a
+    successful restore and this write, and may already have released its lease
+    again. When the attempt captured an authoritative ownership epoch, this
+    write therefore carries the SAME token and is compared with the mutation
+    inside one SessionDB write transaction: a superseded attempt writes nothing,
+    while an attempt that still owns the epoch keeps the intended timeout/stall
+    ladder unchanged.
     """
     if not compression_attempt_stalled(
         commit_fence=commit_fence, started_at=started_at
@@ -1205,12 +1677,49 @@ def _record_stall_interrupted_backoff(
     record = getattr(compressor, "record_timeout_failure", None)
     if not callable(record):
         return False
+    owner_token = None
+    if durable_cooldown_authoritative is True and isinstance(
+        durable_cooldown_state, dict
+    ):
+        owner_token = durable_cooldown_state.get("owner_token") or None
+    if owner_token is not None:
+        # Only the built-in compressor implements the owner-qualified durable
+        # contract. If the engine was swapped after the capture, fail closed
+        # rather than fall back to an unqualified successor-visible write.
+        try:
+            from agent.context_compressor import ContextCompressor
+
+            native = isinstance(compressor, ContextCompressor)
+        except Exception:
+            native = False
+        if not native:
+            logger.warning(
+                "Skipping stall-interrupted compression backoff for "
+                "session=%s: the captured session cooldown ownership epoch "
+                "cannot be enforced by this context engine (#198 F1).",
+                getattr(agent, "session_id", None) or "none",
+            )
+            return False
     error = (
         f"{STALL_INTERRUPTED_FAILURE_CLASS}:"
         f"{_stall_source_fingerprint(agent, messages, approx_tokens)}"
     )
     try:
-        record(error, failure_kind="stall_interrupted")
+        if owner_token is not None:
+            if record(
+                error,
+                failure_kind="stall_interrupted",
+                owner_token=owner_token,
+            ) is False:
+                logger.warning(
+                    "Skipped stale stall-interrupted compression backoff for "
+                    "session=%s: a later compression owner holds the "
+                    "session's cooldown state (#198 F1).",
+                    getattr(agent, "session_id", None) or "none",
+                )
+                return False
+        else:
+            record(error, failure_kind="stall_interrupted")
     except Exception:
         logger.debug(
             "stall-interrupted compression cooldown persist failed",
@@ -1477,7 +1986,9 @@ def run_compress_context_with_progress_timeout(
     ceiling = max(float(total_ceiling_seconds), float(idle_timeout_seconds))
     idle = float(idle_timeout_seconds)
     fence = fence if fence is not None else CompressionCommitFence()
-    fence.set_total_ceiling_seconds(ceiling)
+    # The ceiling is armed AFTER the lazy setup below, from one shared attempt
+    # epoch (``fence.begin_attempt``), so a cold import or first-use pool build
+    # can no longer consume the whole budget before the worker can enter.
     # Sync mirror of gateway session-hygiene's run_in_executor(None, ...) +
     # wait_for loop (gateway/run.py): offload compress_context onto the shared
     # daemon pool, poll with an inactivity budget + total ceiling, then
@@ -1490,7 +2001,8 @@ def run_compress_context_with_progress_timeout(
     # slot is occupied. A queued job would silently wait out its whole budget
     # without starting and stay eligible to run as a stale cancelled job when
     # a worker recovers. Fail fast: continue without compression this cycle.
-    if not _try_admit_compression_job():
+    admission = _admit_compression_job()
+    if admission is None:
         logger.warning(
             "Context compression pool saturated (%d workers busy) — "
             "refusing new compression this cycle and continuing without "
@@ -1518,7 +2030,10 @@ def run_compress_context_with_progress_timeout(
         # summary work so a stale job never burns an LLM call; its return
         # value is discarded by the already-departed host.
         if worker_fence.deadline_exceeded:
-            raise concurrent.futures.TimeoutError(
+            # Distinct subclass (still a ``concurrent.futures.TimeoutError``
+            # for existing handlers) so a host that is somehow still waiting
+            # can tell a never-started worker apart from its own wait expiry.
+            raise _CompressionWorkerPreStartExpiry(
                 "compression deadline expired before worker start"
             )
         if worker_fence.is_cancelled:
@@ -1529,16 +2044,37 @@ def run_compress_context_with_progress_timeout(
         return worker(worker_fence)
 
     # Bare pool workers start with an empty ContextVar map; propagate the
-    # parent conversation/approval context into the worker.
+    # parent conversation/approval context into the worker. This capture runs
+    # on the HOST thread and is NOT a constant-time wrapper lookup: it copies
+    # the current Context and lazily imports the terminal approval/sudo
+    # callback API (tools/thread_context.py). Building it AFTER the epoch
+    # charged that cold local setup to the provider attempt, so a cold host
+    # could exhaust the ceiling before the supplied primary ever entered
+    # (_CompressionWorkerPreStartExpiry). It is therefore the LAST piece of
+    # host-side submission setup and completes BEFORE the epoch is armed.
     try:
-        future = executor.submit(
-            propagate_context_to_thread(_fence_gated_worker), fence
-        )
+        submit_target = propagate_context_to_thread(_fence_gated_worker)
     except BaseException:
-        _release_compression_admission()
+        # No future exists yet to carry the done-callback release, so this
+        # ticket is freed here — exactly once, as on every other exit.
+        admission.release()
         raise
-    future.add_done_callback(_release_compression_admission)
-    wait_started = time.monotonic()
+
+    # One monotonic attempt epoch (#97488): the fence ceiling, the fence idle
+    # clock and this host's elapsed-time accounting all start HERE, after ALL
+    # local host-side submission setup above — executor acquisition, bounded
+    # admission AND the context wrapper/callback capture. Budgets are
+    # unchanged; only their origin is.
+    attempt_epoch = fence.begin_attempt(ceiling)
+    try:
+        future = executor.submit(submit_target, fence)
+    except BaseException:
+        admission.release()
+        raise
+    # Exactly-once release: whichever of this callback or the host's settled
+    # future reclamation runs first frees the slot; the other becomes a no-op.
+    future.add_done_callback(admission.release)
+    wait_started = attempt_epoch
     # F2: EVERY host unwind (KeyboardInterrupt, task cancellation, unexpected
     # exception while waiting) must revoke future commit admission before the
     # host resumes, or a detached worker could later commit and mutate durable
@@ -1565,6 +2101,23 @@ def run_compress_context_with_progress_timeout(
                 handled_exit = True
                 return result
             except concurrent.futures.TimeoutError:
+                settled = _settled_worker_outcome(future)
+                if settled is not None:
+                    kind, payload = settled
+                    if kind == "result":
+                        # The worker finished inside the expiring slice.
+                        handled_exit = True
+                        return payload
+                    if kind == "exception":
+                        # A completed worker that RAISED (TimeoutError or not)
+                        # is never a host wait timeout and never an orphan:
+                        # honour the ordinary worker-exception contract and
+                        # let ``finally`` revoke commit admission.
+                        raise payload
+                    # "not_started": the fence-gated worker refused to start
+                    # because this attempt was already over — that is this
+                    # host's own timeout, so take the shared degrade path.
+                    break
                 waited = time.monotonic() - wait_started
                 since_progress = fence.seconds_since_progress()
                 if (
@@ -1677,6 +2230,19 @@ def run_compress_context_with_progress_timeout(
                     handled_exit = True
                     return result
                 except concurrent.futures.TimeoutError:
+                    settled = _settled_worker_outcome(future)
+                    if settled is not None:
+                        # The commit worker settled (its own TimeoutError
+                        # included). Re-waiting on a settled future would spin
+                        # forever, so adopt the outcome: a result returns, a
+                        # raise follows the ordinary worker contract. The
+                        # commit is still never abandoned mid-flight — this
+                        # branch is reachable only once it has finished.
+                        kind, payload = settled
+                        if kind == "result":
+                            handled_exit = True
+                            return payload
+                        raise payload
                     # Fence progress (commit-phase touch_progress) is
                     # informative only — the commit must complete regardless;
                     # loop and re-report with the updated overrun window.
@@ -1721,6 +2287,13 @@ def run_compress_context_with_progress_timeout(
         fence.release_cancelled_compression_lock()
         waited = time.monotonic() - wait_started
         since_progress = fence.seconds_since_progress()
+        # Deep F1: this future can be FINISHED (and this host already woken)
+        # BEFORE its admission done-callback runs, so the shared counter may
+        # still hold THIS attempt's slot. With the other three slots occupied
+        # that spuriously refuses the one permitted fallback as saturated.
+        # Reclaim our own slot here — exactly once, and only for an already
+        # settled future, so the four-job cap and fail-closed saturation hold.
+        _reclaim_settled_admission(admission, future)
         # The durable lease is free again (above), so a fallback attempt can
         # acquire it immediately. Run it BEFORE on_timeout: that callback
         # records the summary-failure cooldown, which would make the retry's
@@ -3561,6 +4134,16 @@ def compress_context(
                 _lock_sid, existing,
             )
             _lock_holder = None  # don't release a lock we don't own
+            # F1 (#198): this attempt claimed the compressor attempt
+            # generation BEFORE trying to own the durable lock, and it lost —
+            # another path is the real owner. It ran no summary and wrote no
+            # compressor-owned state, so retire the claim: a lock loser must
+            # not make the lock winner discard its candidate. The monotonic
+            # counter is NOT rolled back, so a genuinely admitted
+            # successor/fallback keeps its authority over a stale primary.
+            _retire_compressor_attempt(
+                agent.context_compressor, _attempt_generation
+            )
             # Signal to callers that this no-op is due to a concurrent lock,
             # not a genuine "nothing to compress" or aux-model failure.
             # Manual /compress callers can surface a clear status message
@@ -3641,6 +4224,27 @@ def compress_context(
 
     if _lock_holder is not None:
         agent._active_compression_lock_holder = _lock_holder
+        # #198 F1 residual (lease -> capture window): this attempt now OWNS a
+        # native durable session lease, so it is no longer the "never
+        # established native durable ownership" case the host's legacy
+        # UNQUALIFIED cooldown write is reserved for. From here until the
+        # fenced capture below publishes an exact epoch, a host idle
+        # cancellation can release THIS lease and admit a successor that
+        # stamps and owns the session's cooldown row, while the fence would
+        # still answer "no token" and send the host down that legacy branch --
+        # overwriting the successor its own release admitted. Publish the
+        # matchless stand-in now, inside the lock-setup barrier that already
+        # blocks cancellation, so any host write in that window is compared
+        # owner-qualified INSIDE the SessionDB transaction and is refused
+        # instead. The capture below replaces it with the exact epoch whenever
+        # one is established, and never republishes absence. Publication only:
+        # no durable write, no lock, no callback, no new budget. An attempt
+        # that never held a native lease never reaches this line, and a
+        # compressor that could never stamp publishes nothing here, so the
+        # true never-native-lease legacy path stays byte-unchanged.
+        _publish_captured_cooldown_ownership(
+            commit_fence, agent.context_compressor, None, None
+        )
         if (
             commit_fence is not None
             and commit_fence.register_cancelled_lock_release(
@@ -3719,12 +4323,73 @@ def compress_context(
     # Snapshot the authoritative durable cooldown only after this attempt owns
     # the session lease. This runs for force=True too, but does not apply the
     # automatic breaker gate: manual compression still retries immediately.
-    _durable_cooldown_authoritative, _durable_cooldown_state = (
-        _capture_authoritative_cooldown_under_lease(
-            agent.context_compressor,
-            _compressor_attempt_snapshot,
+    #
+    # #198 F1 (capture -> publication window): the capture below can COMMIT a
+    # durable session cooldown ownership stamp (SessionDB
+    # begin_compression_cooldown_ownership), while the fact that authorizes the
+    # host's own timeout record is what this attempt publishes on the fence.
+    # The lock-setup barrier was already left above, so between that stamp and
+    # the publication a host idle cancellation could release this attempt's
+    # lease, admit a successor, and then take the legacy no-owner branch --
+    # writing UNQUALIFIED over the successor's row. Re-enter the SAME existing
+    # fence setup barrier for exactly that window: no cancellation can be
+    # admitted (try_cancel_before_commit / cancel_before_commit / the release
+    # that revoke_commit_admission defers all need this fence lock) until the
+    # stamp's host-visible state is published. Bounded by construction: one
+    # native SessionDB ownership transaction plus one plain attribute
+    # publication. No provider, model, plugin, network or application callback
+    # runs inside it, no new lock is introduced, and no other session is
+    # serialized.
+    if commit_fence is not None and not _lock_setup_entered:
+        _lock_setup_entered = commit_fence.begin_lock_setup()
+        if not _lock_setup_entered:
+            # Cancellation won BEFORE any stamp could be attempted, so this
+            # attempt provably never established native durable cooldown
+            # ownership: the fence's absent token stays source-proven and the
+            # host's legacy path remains correct for it. Abort rather than
+            # stamp ownership on a session whose lease is being released.
+            logger.info(
+                "Compression commit cancelled before durable cooldown "
+                "ownership capture (session=%s).",
+                agent.session_id or "none",
+            )
+            agent._last_compaction_in_place = False
+            _emit_compression_attempt_telemetry(
+                agent,
+                started_at=_attempt_started_at,
+                commit_status="aborted",
+                split_status="aborted",
+                failure_class="commit_fence_cancelled",
+            )
+            _release_lock()
+            _existing_sp = getattr(agent, "_cached_system_prompt", None)
+            if not _existing_sp:
+                _existing_sp = agent._build_system_prompt(system_message)
+            return messages, _existing_sp
+    _durable_cooldown_authoritative = None
+    _durable_cooldown_state = None
+    try:
+        _durable_cooldown_authoritative, _durable_cooldown_state = (
+            _capture_authoritative_cooldown_under_lease(
+                agent.context_compressor,
+                _compressor_attempt_snapshot,
+            )
         )
-    )
+    finally:
+        # EVERY exit of the capture -- success, refusal, ambiguity and even an
+        # unexpected escape -- publishes this attempt's host-visible ownership
+        # state BEFORE the barrier opens, so a host that wins cancellation
+        # immediately afterwards can never read "no token" for an attempt that
+        # may already hold a durable stamp. Balanced on every path: this
+        # finally leaves the barrier, and the abort/return paths below reach
+        # _finish_lock_setup() again through _release_lock() as a no-op.
+        _publish_captured_cooldown_ownership(
+            commit_fence,
+            agent.context_compressor,
+            _durable_cooldown_authoritative,
+            _durable_cooldown_state,
+        )
+        _finish_lock_setup()
     if _durable_cooldown_authoritative is False:
         # A bound built-in compressor reached its durable getter and the read
         # failed. Proceeding with force=True could clear an unknown newer row
@@ -3735,6 +4400,15 @@ def compress_context(
         if not existing_prompt:
             existing_prompt = agent._build_system_prompt(system_message)
         return messages, existing_prompt
+
+    # #198 F1 (host window): the epoch captured above is published INSIDE the
+    # fenced capture (see _publish_captured_cooldown_ownership), before any
+    # cancellation/release can be admitted, so that the host's idle-timeout
+    # callback -- which records its own durable cooldown AFTER
+    # release_cancelled_compression_lock() and after the one permitted stall
+    # fallback -- authorizes its write with the SAME fact (see
+    # run_agent.AIAgent._compress_context._on_timeout). No later publication
+    # point exists, so no window re-exposes an absent token.
 
     # The agent may have been constructed before another path completed an
     # in-place compaction on the same session. Re-read durable breaker state
@@ -4094,13 +4768,17 @@ def compress_context(
         ):
             messages[:] = copy.deepcopy(messages_before_compression)
         # Record after restore so rollback cannot wipe a stall backoff, and
-        # while the lease is still held so the next turn cannot race it.
+        # while the lease is still held so the next turn cannot race it. The
+        # captured ownership epoch rides along so this second durable mutation
+        # is authorized by the same fact the restore was (#198 F1).
         _stall_backoff = _record_stall_interrupted_backoff(
             agent,
             commit_fence=commit_fence,
             started_at=_attempt_started_at,
             messages=messages,
             approx_tokens=approx_tokens,
+            durable_cooldown_authoritative=_durable_cooldown_authoritative,
+            durable_cooldown_state=_durable_cooldown_state,
         )
         if _activity_heartbeat is not None:
             _activity_heartbeat.stop("context compression cancelled")
@@ -4327,6 +5005,10 @@ def compress_context(
                     started_at=_attempt_started_at,
                     messages=messages,
                     approx_tokens=approx_tokens,
+                    durable_cooldown_authoritative=(
+                        _durable_cooldown_authoritative
+                    ),
+                    durable_cooldown_state=_durable_cooldown_state,
                 )
                 _existing_sp = getattr(agent, "_cached_system_prompt", None)
                 if not _existing_sp:

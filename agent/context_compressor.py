@@ -3005,7 +3005,24 @@ class ContextCompressor(ContextEngine):
         self,
         cooldown_seconds: float,
         error: Optional[str],
-    ) -> None:
+        *,
+        owner_token: Optional[str] = None,
+    ) -> bool:
+        """Apply the local cooldown clock and persist it.
+
+        ``owner_token`` (#198 F1) is the session cooldown ownership epoch the
+        attempt captured under its lease before it ran. When supplied, the
+        durable write is routed through the owner-qualified SessionDB API, which
+        compares that epoch INSIDE the same write transaction as the mutation,
+        so a successor that took the session after the capture -- including one
+        that has already released its lease -- is never overwritten.
+
+        Returns False only when the durable write was REFUSED (a later owner
+        holds the row, or the bound store cannot authorize the write at all);
+        True otherwise, including the historical best-effort persistence
+        failures, which keep surfacing solely through
+        ``_cooldown_persist_failed``.
+        """
         now_mono = time.monotonic()
         new_mono = now_mono + float(cooldown_seconds)
         # Never shorten a longer live deadline (#96775). A later stall or
@@ -3020,12 +3037,57 @@ class ContextCompressor(ContextEngine):
         session_db = getattr(self, "_session_db", None)
         session_id = getattr(self, "_session_id", "")
         if not session_db or not session_id:
-            return
+            return True
+
+        if owner_token:
+            # #198 F1: this write belongs to an attempt that already captured
+            # the session's cooldown ownership epoch, so it must be authorized
+            # by THAT epoch, compared with the mutation in one write
+            # transaction. An unlocked check followed by the ordinary
+            # unqualified recorder is exactly the window a successor slips
+            # through: it can take ownership between a SUCCESSFUL restore and
+            # this write, or between the host's lease release and the host's
+            # timeout record, and it may already have released its lease.
+            owner_recorder = getattr(
+                session_db,
+                "record_compression_failure_cooldown_for_owner",
+                None,
+            )
+            if owner_recorder is None:
+                # Fail closed, exactly like a missing unqualified recorder: a
+                # store that cannot authorize this write must not receive an
+                # unqualified one instead. No new partial-store mode.
+                self._cooldown_persist_failed = True
+                return False
+            try:
+                if not owner_recorder(
+                    session_id, cooldown_until, error, owner_token
+                ):
+                    # Superseded: the successor's row stands. Leave
+                    # ``_cooldown_persist_failed`` alone -- nothing was
+                    # persisted, and claiming the local timer is authoritative
+                    # would override the current owner's durable state on the
+                    # next refresh.
+                    logger.info(
+                        "Skipping stale compression failure cooldown record "
+                        "for session=%s: a later compression owner holds the "
+                        "session's cooldown state (#198 F1)",
+                        session_id,
+                    )
+                    return False
+                self._cooldown_persist_failed = False
+            except sqlite3.Error as exc:
+                self._cooldown_persist_failed = True
+                logger.debug("compression failure cooldown persist failed: %s", exc)
+            except Exception as exc:
+                self._cooldown_persist_failed = True
+                logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
+            return True
 
         recorder = getattr(session_db, "record_compression_failure_cooldown", None)
         if recorder is None:
             self._cooldown_persist_failed = True
-            return
+            return True
         try:
             recorder(session_id, cooldown_until, error)
             self._cooldown_persist_failed = False
@@ -3035,9 +3097,24 @@ class ContextCompressor(ContextEngine):
         except Exception as exc:
             self._cooldown_persist_failed = True
             logger.debug("compression failure cooldown persist failed (non-sqlite): %s", exc)
+        return True
 
-    def record_timeout_failure(self, error: str, failure_kind: str = "timeout") -> None:
+    def record_timeout_failure(
+        self,
+        error: str,
+        failure_kind: str = "timeout",
+        *,
+        owner_token: Optional[str] = None,
+    ) -> bool:
         """Record a consecutive timeout/stall failure using the shared ladder.
+
+        ``owner_token`` (#198 F1) is the session cooldown ownership epoch the
+        caller captured under this attempt's lease. When supplied, the durable
+        write is authorized by that epoch inside one SessionDB write
+        transaction and becomes a no-op once a successor owns the session; the
+        returned bool is False in exactly that refused case. Callers that are
+        still the live attempt (the summary exception handler) omit it and keep
+        the historical behaviour.
 
         Used by the summary-LLM exception handler, the host-level
         ``compress_context`` timeout wrapper, and stall-interrupted
@@ -3061,7 +3138,9 @@ class ContextCompressor(ContextEngine):
             min(self._consecutive_timeout_failures,
                 len(_TIMEOUT_COOLDOWN_LADDER)) - 1
         ]
-        self._record_compression_failure_cooldown(float(cooldown), stamped)
+        return self._record_compression_failure_cooldown(
+            float(cooldown), stamped, owner_token=owner_token
+        )
 
     def _clear_compression_failure_cooldown(self) -> None:
         # #76354 review F4: fence check BEFORE cooldown-clear. A late worker

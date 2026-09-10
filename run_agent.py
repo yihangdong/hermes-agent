@@ -8627,7 +8627,39 @@ class AIAgent:
             if direct_path:
                 result = _run(active_fence)
             else:
+                # #198 F1 (host window): the wrapper decides which fence this
+                # attempt actually runs under, and the worker is the only code
+                # that sees it. Record it here so the timeout callback below can
+                # read the session cooldown ownership epoch compress_context
+                # captured under this attempt's lease and authorize its durable
+                # write with that same fact.
+                attempt_fence: dict = {}
+
+                def _attempt_cooldown_owner_token():
+                    reader = getattr(
+                        attempt_fence.get("fence"), "cooldown_owner_token", None
+                    )
+                    if not callable(reader):
+                        return None
+                    try:
+                        return reader() or None
+                    except Exception:
+                        logger.debug(
+                            "compression cooldown ownership read failed",
+                            exc_info=True,
+                        )
+                        return None
+
+                def _native_context_compressor(compressor) -> bool:
+                    try:
+                        from agent.context_compressor import ContextCompressor
+
+                        return isinstance(compressor, ContextCompressor)
+                    except Exception:
+                        return False
+
                 def _snapshot_worker(fence=None):
+                    attempt_fence["fence"] = fence
                     # #76354 review F3: the pooled worker must NEVER share the
                     # caller's live transcript. Plugin/legacy context engines are
                     # allowed to mutate their input list in place; after a host
@@ -8714,6 +8746,18 @@ class AIAgent:
                             )
                     # Same timeout cooldown ladder as summary-LLM timeouts
                     # (#62452): avoid re-burning the full idle budget every turn.
+                    #
+                    # #198 F1 (host window): this runs AFTER the host released
+                    # this attempt's durable lease
+                    # (release_cancelled_compression_lock) and AFTER the one
+                    # permitted stall fallback, so a DIFFERENT compressor may
+                    # already own this session's cooldown state -- whether it
+                    # still holds its lease or has already released it. When the
+                    # attempt captured an ownership epoch under its lease,
+                    # forward it: ContextCompressor then compares that epoch
+                    # INSIDE the same SessionDB write transaction as the
+                    # mutation, so a superseded attempt writes nothing. Ordering
+                    # is unchanged -- nothing is recorded before the fallback.
                     compressor = getattr(self, "context_compressor", None)
                     if compressor is not None:
                         record = getattr(compressor, "record_timeout_failure", None)
@@ -8726,14 +8770,39 @@ class AIAgent:
                                     else "host compress_context timeout "
                                     "(no summary progress)"
                                 )
-                                record(
-                                    reason,
-                                    failure_kind=(
-                                        "ceiling_exhausted"
-                                        if total_exhausted
-                                        else "stalled"
-                                    ),
+                                failure_kind = (
+                                    "ceiling_exhausted"
+                                    if total_exhausted
+                                    else "stalled"
                                 )
+                                owner_token = _attempt_cooldown_owner_token()
+                                if owner_token is None:
+                                    record(reason, failure_kind=failure_kind)
+                                elif not _native_context_compressor(compressor):
+                                    # Fail closed: a swapped engine cannot
+                                    # enforce the captured epoch, and an
+                                    # unqualified write here is exactly the
+                                    # successor overwrite under repair.
+                                    logger.warning(
+                                        "Skipping host compression timeout "
+                                        "cooldown for session=%s: the captured "
+                                        "session cooldown ownership epoch "
+                                        "cannot be enforced by this context "
+                                        "engine (#198 F1)",
+                                        self.session_id or "none",
+                                    )
+                                elif record(
+                                    reason,
+                                    failure_kind=failure_kind,
+                                    owner_token=owner_token,
+                                ) is False:
+                                    logger.warning(
+                                        "Skipped stale host compression "
+                                        "timeout cooldown for session=%s: a "
+                                        "later compression owner holds the "
+                                        "session's cooldown state (#198 F1)",
+                                        self.session_id or "none",
+                                    )
                             except Exception:
                                 logger.debug(
                                     "failed to record compress_context timeout "
