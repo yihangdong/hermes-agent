@@ -11,12 +11,13 @@ model and context identity are activation truth read from that root.
 
 import hermes_bootstrap  # noqa: F401  bootstrap first, before anything else
 
+import ipaddress
 import json
 import os
 import stat
 import sys
 from pathlib import Path
-from urllib.parse import urlsplit
+from urllib.parse import urlparse, urlsplit
 
 CONFIG_ROOT_NAME = ".stagea-hermes-home"
 FRAMING_PREFIX = "DYHANO-STAGE-A-PROPOSAL-V1 "
@@ -282,6 +283,50 @@ def read_task_config(root):
     return document
 
 
+def _is_local_route(base_url):
+    """Classify the pinned URL without metadata/provider initialization.
+
+    Keep the existing local-context contract, including container hostnames,
+    private/link-local addresses and Tailscale CGNAT. This is a literal-only
+    classification: no DNS lookup, provider registry, config or endpoint probe.
+    """
+    normalized = (base_url or "").strip().rstrip("/")
+    if not normalized:
+        return False
+    url = normalized if "://" in normalized else "http://" + normalized
+    try:
+        host = urlparse(url).hostname or ""
+    except ValueError:
+        return False
+    if host in ("localhost", "127.0.0.1", "::1", "0.0.0.0"):
+        return True
+    if host.endswith((".docker.internal", ".containers.internal",
+                      ".lima.internal")):
+        return True
+    if host and "." not in host:
+        return True
+    try:
+        address = ipaddress.ip_address(host)
+        if address.is_private or address.is_loopback or address.is_link_local:
+            return True
+        if (isinstance(address, ipaddress.IPv4Address)
+                and address in ipaddress.IPv4Network("100.64.0.0/10")):
+            return True
+    except ValueError:
+        pass
+    # Preserve the existing private-range recognition for dotted host forms.
+    parts = host.split(".")
+    if len(parts) == 4:
+        try:
+            first, second = int(parts[0]), int(parts[1])
+            return (first == 10 or (first == 172 and 16 <= second <= 31)
+                    or (first == 192 and second == 168)
+                    or (first == 100 and 64 <= second <= 127))
+        except ValueError:
+            pass
+    return False
+
+
 def resolve_route(config):
     """Route/model/context identity: activation truth, read not invented."""
     section = config.get("model") if isinstance(config, dict) else None
@@ -294,12 +339,10 @@ def resolve_route(config):
     model, base_url, provider = values
     need(provider.lower() != "lmstudio", "route.provider_probes")
     need(_pos_int(section.get("context_length")), "route.context_pin")
-    from agent.model_metadata import is_local_endpoint
-
     # Retained route contract: a local/loopback route must pin its served
     # window.  build_client constructs no generic agent, so nothing probes the
     # endpoint either way; the pin stays a required, directly tested property.
-    need(not is_local_endpoint(base_url)
+    need(not _is_local_route(base_url)
          or _pos_int(section.get("ollama_num_ctx")), "route.local_probe_pin")
     return model, base_url, provider
 

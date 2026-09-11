@@ -57,16 +57,19 @@ CONTROLLER_ONESHOT_SECONDS = 900
 
 
 _COLD_CONFIG_CHECK = r'''
+import io
 import json
 import os
 from pathlib import Path
 import sys
+from types import SimpleNamespace
 
-repo, task, scenario = sys.argv[1:]
+repo, task, scenario, request_json, envelope_json = sys.argv[1:]
 sys.path.insert(0, repo)
 task = Path(task)
 root = task / '.stagea-hermes-home'
-forbidden = ('hermes_cli.config', 'providers', 'hermes_cli.plugins')
+forbidden = ('agent.model_metadata', 'hermes_cli.config', 'providers',
+             'hermes_cli.plugins', 'run_agent')
 def is_forbidden(name):
     return any(name == prefix or name.startswith(prefix + '.')
                for prefix in forbidden)
@@ -101,6 +104,7 @@ class LiteralEnvironment(dict):
 os.environ = LiteralEnvironment(os.environ)
 checking = [True]
 def refuse_managed_reads(event, args):
+    assert event not in ('socket.connect', 'socket.getaddrinfo'), 'network attempt'
     if event == 'open' and checking[0] and isinstance(args[0], (str, bytes)):
         path = os.fsdecode(args[0])
         assert not path.startswith(str(task / 'managed') + os.sep)
@@ -123,6 +127,43 @@ try:
             'base_url': 'http://127.0.0.1:8791/v1',
             'provider': 'stage-a-relay', 'context_length': 262144,
             'ollama_num_ctx': 262144}
+        assert sp.resolve_route(document) == (
+            'stage-a-proposal-fixture', 'http://127.0.0.1:8791/v1',
+            'stage-a-relay')
+
+        # Exercise the real entrypoint, client and request preparation cold.
+        # Only the single completion is inert; no registry is prewarmed.
+        calls = []
+        def inert_completion(client, **kwargs):
+            from hermes_constants import get_hermes_home
+            assert Path(get_hermes_home()) == root
+            assert not any(is_forbidden(name) for name in sys.modules)
+            assert snapshot() == before
+            assert client.max_retries == 0
+            assert client.api_key == sp.NO_CREDENTIAL_PLACEHOLDER
+            assert str(client.base_url).rstrip('/') == document['model']['base_url']
+            assert kwargs['model'] == document['model']['default']
+            assert kwargs['max_tokens'] == sp.MAX_COMPLETION_TOKENS
+            assert kwargs['messages'] == [
+                {'role': 'system', 'content': sp.INSTRUCTIONS},
+                {'role': 'user', 'content': request_json}]
+            assert not {'tools', 'tool_choice', 'functions', 'function_call',
+                        'stream'} & set(kwargs)
+            calls.append(client)
+            return SimpleNamespace(choices=[SimpleNamespace(message=SimpleNamespace(
+                content=sp.FRAMING_PREFIX + envelope_json, tool_calls=None))])
+        sp.create_completion = inert_completion
+        stdout = io.BytesIO()
+        original_stdin, original_stdout = sys.stdin, sys.stdout
+        try:
+            sys.stdin = SimpleNamespace(buffer=io.BytesIO(request_json.encode('ascii')))
+            sys.stdout = SimpleNamespace(buffer=stdout)
+            assert sp.main(sp.FROZEN_ARGV) == 0
+        finally:
+            sys.stdin, sys.stdout = original_stdin, original_stdout
+        assert len(calls) == 1 and calls[0].is_closed()
+        assert stdout.getvalue() == (
+            sp.FRAMING_PREFIX + envelope_json + '\n').encode('ascii')
 finally:
     reset_hermes_home_override(token)
     checking[0] = False
@@ -138,7 +179,7 @@ print(json.dumps({'cold_path': 'PASS', 'scenario': scenario}))
 
 @pytest.mark.parametrize("scenario", ["valid", "managed", "environment", "malformed"])
 def test_task_config_cold_import_boundary_in_fresh_interpreter(tmp_path, scenario):
-    """No pre-import can hide generic initialization before the snapshot."""
+    """Cold config, route and full attempt preserve the task-home snapshot."""
     document = {"model": dict(ROUTE)}
     if scenario == "environment":
         document["model"]["default"] = "${STAGEA_INERT}"
@@ -159,7 +200,8 @@ def test_task_config_cold_import_boundary_in_fresh_interpreter(tmp_path, scenari
         environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
     result = subprocess.run(
         [sys.executable, "-I", "-B", "-c", _COLD_CONFIG_CHECK,
-         str(pathlib.Path(__file__).resolve().parents[2]), str(tmp_path), scenario],
+         str(pathlib.Path(__file__).resolve().parents[2]), str(tmp_path), scenario,
+         REQUEST.decode("ascii"), ENVELOPE.decode("ascii")],
         cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30,
     )
     assert result.returncode == 0, result.stderr
@@ -337,6 +379,40 @@ def test_override_is_task_scoped_and_restored(tmp_path, monkeypatch):
     finally:
         reset_hermes_home_override(token)
     assert get_hermes_home() == process_home
+
+
+@pytest.mark.parametrize("base_url,is_local", [
+    ("http://localhost:8791/v1", True),
+    ("http://127.12.34.56/v1", True),
+    ("http://[::1]/v1", True),
+    ("http://host.docker.internal/v1", True),
+    ("http://host.containers.internal/v1", True),
+    ("http://host.lima.internal/v1", True),
+    ("http://relay/v1", True),
+    ("10.20.30.40:8791/v1", True),
+    ("http://172.16.1.2/v1", True),
+    ("http://172.31.1.2/v1", True),
+    ("http://192.168.1.2/v1", True),
+    ("http://169.254.1.2/v1", True),
+    ("http://100.64.1.2/v1", True),
+    ("http://100.127.1.2/v1", True),
+    ("http://[fd00::1]/v1", True),
+    ("http://172.32.1.2/v1", False),
+    ("http://100.128.1.2/v1", False),
+    ("https://relay.example.com/v1", False),
+    ("https://8.8.8.8/v1", False),
+])
+def test_route_local_context_pin_contract(base_url, is_local):
+    """Literal locality controls the extra pin; classification performs no I/O."""
+    route = dict(ROUTE, base_url=base_url)
+    assert sp.resolve_route({"model": route}) == (MODEL, base_url, PROVIDER)
+    route.pop("ollama_num_ctx")
+    if is_local:
+        with pytest.raises(sp.ProposalRefusal) as missing:
+            sp.resolve_route({"model": route})
+        assert missing.value.code == "route.local_probe_pin"
+    else:
+        assert sp.resolve_route({"model": route}) == (MODEL, base_url, PROVIDER)
 
 
 def test_task_config_must_be_non_secret_and_pinned(
