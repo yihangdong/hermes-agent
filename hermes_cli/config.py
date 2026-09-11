@@ -3632,6 +3632,25 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def parse_stagea_task_config_bytes(raw: bytes) -> Any:
+    """Own the single Stage-A literal-config parser boundary.
+
+    The Stage-A caller supplies already-bounded bytes after its confined
+    task-path, ownership and managed-scope checks, and retains responsibility
+    for mapping, credential, environment-syntax and explicit-route validation.
+    Parse once with the same safe YAML primitive; return the parsed object
+    unchanged and propagate malformed-YAML errors to that caller.
+
+    This function performs no file/home/profile/managed lookup, defaults merge,
+    environment expansion, normalization, migration, fallback, cache access or
+    persistence. It is not a general raw-file behavioral loader or a replacement
+    for ordinary load_config()/load_config_readonly() consumers.
+    """
+    if type(raw) is not bytes:
+        raise TypeError("Stage-A config parser requires bounded bytes")
+    return yaml.safe_load(raw)
+
+
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 

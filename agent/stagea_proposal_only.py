@@ -253,7 +253,7 @@ def assert_no_managed_overlay():
 
 
 def read_task_config(root):
-    """Read literal task config without general Hermes loader side effects.
+    """Read task-owned bytes through the pure config-owner parser.
 
     The general loader initializes the home, expands environment values and
     merges external managed configuration even on its readonly fast path.
@@ -261,6 +261,7 @@ def read_task_config(root):
     load-bearing route value must be explicitly pinned in this one file.
     """
     import yaml
+    from hermes_cli.config import parse_stagea_task_config_bytes
     from hermes_constants import get_hermes_home
 
     path = root / "config.yaml"
@@ -272,7 +273,7 @@ def read_task_config(root):
         with path.open("rb") as stream:
             raw = stream.read(MAX_ENVELOPE_BYTES + 1)
         need(len(raw) <= MAX_ENVELOPE_BYTES, "config.bytes_length")
-        document = yaml.safe_load(raw)
+        document = parse_stagea_task_config_bytes(raw)
     except (OSError, ValueError, yaml.YAMLError):
         raise ProposalRefusal("config.parse") from None
     need(isinstance(document, dict) and document, "config.not_mapping")
