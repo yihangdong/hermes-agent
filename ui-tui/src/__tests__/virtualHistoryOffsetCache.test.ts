@@ -66,7 +66,8 @@ function Harness({
   generation = 0,
   initialHeights,
   items,
-  maxMounted = 16
+  maxMounted = 16,
+  retainLeadingRows = false
 }: {
   columns?: number
   expose: React.MutableRefObject<Exposed | null>
@@ -75,6 +76,7 @@ function Harness({
   initialHeights?: ReadonlyMap<string, number>
   items: readonly Item[]
   maxMounted?: number
+  retainLeadingRows?: boolean
 }) {
   const scrollRef = useRef<ScrollBoxHandle | null>(null)
 
@@ -97,8 +99,10 @@ function Harness({
     React.createElement(
       Box,
       { flexDirection: 'column', width: '100%' },
-      virtualHistory.topSpacer > 0 ? React.createElement(Box, { height: virtualHistory.topSpacer }) : null,
-      ...items.slice(virtualHistory.start, virtualHistory.end).map(item =>
+      !retainLeadingRows && virtualHistory.topSpacer > 0
+        ? React.createElement(Box, { height: virtualHistory.topSpacer })
+        : null,
+      ...items.slice(retainLeadingRows ? 0 : virtualHistory.start, virtualHistory.end).map(item =>
         React.createElement(
           Box,
           {
@@ -520,12 +524,15 @@ describe('useVirtualHistory offset cache reuse', () => {
     const streams = makeStreams()
     const initialHeights = new Map(items.map(item => [item.key, item.height]))
 
-    const instance = renderSync(React.createElement(Harness, { expose, initialHeights, items }), {
-      patchConsole: false,
-      stderr: streams.stderr as NodeJS.WriteStream,
-      stdin: streams.stdin as NodeJS.ReadStream,
-      stdout: streams.stdout as NodeJS.WriteStream
-    })
+    const instance = renderSync(
+      React.createElement(Harness, { expose, initialHeights, items, retainLeadingRows: true }),
+      {
+        patchConsole: false,
+        stderr: streams.stderr as NodeJS.WriteStream,
+        stdin: streams.stdin as NodeJS.ReadStream,
+        stdout: streams.stdout as NodeJS.WriteStream
+      }
+    )
 
     try {
       await delay(20)
@@ -534,6 +541,16 @@ describe('useVirtualHistory offset cache reuse', () => {
       scroll.scrollTo(0)
       await delay(20)
       scroll.scrollTo(5)
+      // Commit the non-sticky viewport while the leading row is still mounted.
+      // Cache replacement and ref(null) then belong to a separate commit, not
+      // a race with the external-store notification from scrollTo().
+      instance.rerender(React.createElement(Harness, { expose, initialHeights, items, retainLeadingRows: true }))
+
+      expect(scroll.getScrollTop()).toBe(5)
+      expect(scroll.isSticky()).toBe(false)
+      expect(expose.current!.virtualHistory.start).toBeGreaterThan(0)
+      expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
+
       const adjustScrollTop = vi.spyOn(scroll, 'adjustScrollTop')
       const staleHeights = new Map(initialHeights)
 
@@ -547,6 +564,7 @@ describe('useVirtualHistory offset cache reuse', () => {
       expect(scroll.isSticky()).toBe(false)
       expect(expose.current!.virtualHistory.start).toBeGreaterThan(0)
       expect(expose.current!.virtualHistory.offsets[1]).toBe(2)
+      expect(expose.current!.virtualHistory.offsets[items.length]).toBe(40)
     } finally {
       instance.unmount()
       instance.cleanup()
