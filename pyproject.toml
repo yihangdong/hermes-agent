@@ -562,6 +562,7 @@ youtube-transcript-api = false
 # Top-level single-file modules (not packages). Without this, uv2nix's
 # sealed venv is missing hermes_constants, run_agent, etc.
 py-modules = [
+  "stagea_config_owner",
   "run_agent",
   "registration_lifecycle",
   "model_tools",

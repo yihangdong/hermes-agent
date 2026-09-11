@@ -11,6 +11,7 @@ import json
 import os
 import pathlib
 import socket
+import subprocess
 import sys
 
 import pytest
@@ -53,6 +54,129 @@ REQUEST_ADMITTED = sp.admitted_paths(json.loads(REQUEST))
 GRAMMAR_ADMITTED = REQUEST_ADMITTED | frozenset({("docs",), ("a",)})
 #: The controller's own bound on one child attempt (hermes_oneshot.py).
 CONTROLLER_ONESHOT_SECONDS = 900
+
+
+_COLD_CONFIG_CHECK = r'''
+import json
+import os
+from pathlib import Path
+import sys
+
+repo, task, scenario = sys.argv[1:]
+sys.path.insert(0, repo)
+task = Path(task)
+root = task / '.stagea-hermes-home'
+forbidden = ('hermes_cli.config', 'providers', 'hermes_cli.plugins')
+def is_forbidden(name):
+    return any(name == prefix or name.startswith(prefix + '.')
+               for prefix in forbidden)
+assert not any(is_forbidden(name) for name in sys.modules)
+assert 'stagea_config_owner' not in sys.modules
+class ColdImportFence:
+    def find_spec(self, fullname, path=None, target=None):
+        assert not is_forbidden(fullname), 'generic cold import: ' + fullname
+sys.meta_path.insert(0, ColdImportFence())
+
+def snapshot():
+    return {p.relative_to(task).as_posix():
+            (p.stat().st_mode, p.read_bytes() if p.is_file() else None)
+            for p in task.rglob('*')}
+before = snapshot()
+from agent import stagea_proposal_only as sp
+from hermes_constants import reset_hermes_home_override
+assert 'stagea_config_owner' not in sys.modules
+from hermes_cli import managed_scope
+def refuse_content(*args, **kwargs):
+    raise AssertionError('managed content must not be loaded')
+managed_scope.load_managed_config = refuse_content
+managed_scope.load_managed_env = refuse_content
+
+class LiteralEnvironment(dict):
+    def __getitem__(self, key):
+        assert key != 'STAGEA_INERT', 'literal field read inherited environment'
+        return super().__getitem__(key)
+    def get(self, key, default=None):
+        assert key != 'STAGEA_INERT', 'literal field read inherited environment'
+        return super().get(key, default)
+os.environ = LiteralEnvironment(os.environ)
+checking = [True]
+def refuse_managed_reads(event, args):
+    if event == 'open' and checking[0] and isinstance(args[0], (str, bytes)):
+        path = os.fsdecode(args[0])
+        assert not path.startswith(str(task / 'managed') + os.sep)
+        if scenario == 'managed':
+            assert path != str(root / 'config.yaml'), 'content read before managed refusal'
+sys.addaudithook(refuse_managed_reads)
+expected = {'managed': 'config.managed_dir',
+            'environment': 'config.environment_syntax',
+            'malformed': 'config.parse'}
+token = sp.activate_config_root(sp.resolve_config_root(task))
+try:
+    try:
+        document = sp.read_task_config(root)
+    except sp.ProposalRefusal as exc:
+        assert scenario in expected and exc.code == expected[scenario], exc.code
+    else:
+        assert scenario == 'valid'
+        assert document['model'] == {
+            'default': 'stage-a-proposal-fixture',
+            'base_url': 'http://127.0.0.1:8791/v1',
+            'provider': 'stage-a-relay', 'context_length': 262144,
+            'ollama_num_ctx': 262144}
+finally:
+    reset_hermes_home_override(token)
+    checking[0] = False
+assert not any(is_forbidden(name) for name in sys.modules)
+if scenario == 'managed':
+    assert 'stagea_config_owner' not in sys.modules
+else:
+    assert 'stagea_config_owner' in sys.modules
+assert snapshot() == before
+print(json.dumps({'cold_path': 'PASS', 'scenario': scenario}))
+'''
+
+
+@pytest.mark.parametrize("scenario", ["valid", "managed", "environment", "malformed"])
+def test_task_config_cold_import_boundary_in_fresh_interpreter(tmp_path, scenario):
+    """No pre-import can hide generic initialization before the snapshot."""
+    document = {"model": dict(ROUTE)}
+    if scenario == "environment":
+        document["model"]["default"] = "${STAGEA_INERT}"
+    root = make_root(tmp_path, document)
+    if scenario == "malformed":
+        (root / "config.yaml").write_bytes(b"model: [")
+    managed = tmp_path / "managed"
+    if scenario == "managed":
+        managed.mkdir()
+    environment = {
+        "PATH": os.defpath, "HOME": str(tmp_path), "USERPROFILE": str(tmp_path),
+        "HERMES_HOME": str(root), "HERMES_MANAGED_DIR": str(managed),
+        "PYTEST_CURRENT_TEST": "Stage-A synthetic cold import",
+        "PYTHONUTF8": "1", "PYTHONIOENCODING": "utf-8",
+        "STAGEA_INERT": "synthetic-unconsumed-value",
+    }
+    if "SYSTEMROOT" in os.environ:
+        environment["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+    result = subprocess.run(
+        [sys.executable, "-I", "-B", "-c", _COLD_CONFIG_CHECK,
+         str(pathlib.Path(__file__).resolve().parents[2]), str(tmp_path), scenario],
+        cwd=tmp_path, env=environment, capture_output=True, text=True, timeout=30,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == {"cold_path": "PASS", "scenario": scenario}
+
+
+def test_dedicated_owner_retains_exact_bytes_and_literal_object_contract():
+    from stagea_config_owner import parse_stagea_task_config_bytes
+
+    assert parse_stagea_task_config_bytes(b"value: ${INERT}\n") == {"value": "${INERT}"}
+    assert parse_stagea_task_config_bytes(b"") is None
+    assert parse_stagea_task_config_bytes(b"[1, 2]") == [1, 2]
+    for value in ("value: 1", bytearray(b"value: 1"), None):
+        with pytest.raises(TypeError):
+            parse_stagea_task_config_bytes(value)
+    with pytest.raises(yaml.YAMLError):
+        parse_stagea_task_config_bytes(b"value: [")
 
 
 class _ForbiddenModule:

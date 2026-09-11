@@ -43,7 +43,7 @@ jobs:
     - name: Validate exact object and record sanitized identity
       run: |
         python3 - <<'PY'
-        import hashlib, json, os, subprocess
+        import hashlib, json, os, subprocess, tomllib
         from pathlib import Path
         def git(*args):
             return subprocess.check_output(['git', *args], text=True).strip()
@@ -75,13 +75,23 @@ jobs:
             'agent/stagea_proposal_only.py': '15578dec37b5a8e41218768c377b4348abcbf04d',
             'hermes_cli/config.py': '8b71a3f67b5b8670bee2c3b309940d4884065b51',
         }
-        assert git('show', '-s', '--format=%P', head).split() == [current_predecessor]
+        v4_predecessor = '511137b6e70c786d9d363ccf78d373931c3a4d4f'
+        v4_tree = 'b2abd41eae90b1106ac9a626495a47f81de2e87d'
+        v4_blobs = {
+            '.github/workflows/stagea-recovery-ci.yml': 'fe05ddc5f77428d122fccb725603c00e78a2d094',
+            'agent/stagea_proposal_only.py': '15578dec37b5a8e41218768c377b4348abcbf04d',
+            'hermes_cli/config.py': '8b71a3f67b5b8670bee2c3b309940d4884065b51',
+            'contributors/emails/dgih1128@outlook.com': 'bcf97e26093e70b45c3a8fb2b70cbd98c47d5f8f',
+        }
+        assert git('show', '-s', '--format=%P', head).split() == [v4_predecessor]
+        assert git('show', '-s', '--format=%P', v4_predecessor).split() == [current_predecessor]
+        assert git('rev-parse', v4_predecessor + '^{tree}') == v4_tree
+        for path, blob in v4_blobs.items():
+            assert git('rev-parse', v4_predecessor + ':' + path) == blob
         assert git('show', '-s', '--format=%P', current_predecessor).split() == [predecessor]
         assert git('rev-parse', current_predecessor + '^{tree}') == current_predecessor_tree
         for path, blob in current_predecessor_blobs.items():
             assert git('rev-parse', current_predecessor + ':' + path) == blob
-            if path != '.github/workflows/stagea-recovery-ci.yml':
-                assert git('rev-parse', head + ':' + path) == blob
         assert git('show', '-s', '--format=%P', predecessor).split() == [original_head]
         assert git('rev-parse', predecessor + '^{tree}') == predecessor_tree
         for path, blob in predecessor_blobs.items():
@@ -95,21 +105,50 @@ jobs:
             'M	hermes_cli/config.py',
         ]
         mapping_path = 'contributors/emails/dgih1128@outlook.com'
-        correction_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', current_predecessor, head)
-        assert sorted(correction_delta.splitlines()) == [
+        v4_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', current_predecessor, v4_predecessor)
+        assert sorted(v4_delta.splitlines()) == [
             'A\t' + mapping_path,
             'M\t.github/workflows/stagea-recovery-ci.yml',
         ]
+        correction_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', v4_predecessor, head)
+        assert sorted(correction_delta.splitlines()) == [
+            'A\tstagea_config_owner.py',
+            'M\t.github/workflows/stagea-recovery-ci.yml',
+            'M\tagent/stagea_proposal_only.py',
+            'M\thermes_cli/config.py',
+            'M\tpyproject.toml',
+            'M\ttests/agent/test_stagea_proposal_only.py',
+            'M\ttests/hermes_cli/test_config_read_guard.py',
+        ]
+        assert git('rev-parse', head + ':' + mapping_path) == v4_blobs[mapping_path]
+        final_blobs = {
+            'stagea_config_owner.py': '190cc09b297f0bf431160f4b21e46b86989fc514',
+            'agent/stagea_proposal_only.py': '59bed466852beaaeb70a9e51a1c267626bb3be73',
+            'hermes_cli/config.py': '571ee7b1f59e8884806692663c5703d19921f331',
+            'tests/agent/test_stagea_proposal_only.py': 'ec8d33b76ccd770c001b1814dbd1ba001ba76250',
+            'tests/hermes_cli/test_config_read_guard.py': '654bf6ff801a8d76ca40ebe9f3d1686846995eab',
+            'pyproject.toml': '1991051da7501c5666990dee2b379bdc79444f85',
+            mapping_path: 'bcf97e26093e70b45c3a8fb2b70cbd98c47d5f8f',
+        }
+        for path, blob in final_blobs.items():
+            assert git('rev-parse', head + ':' + path) == blob
+        pyproject = tomllib.loads(git('show', head + ':pyproject.toml'))
+        assert pyproject['tool']['setuptools']['py-modules'].count('stagea_config_owner') == 1
         assert subprocess.check_output(['git', 'show', head + ':' + mapping_path]) == b'yihangdong\n'
-        assert sorted(git('diff', '--name-only', base, head).splitlines()) == ['.github/workflows/stagea-recovery-ci.yml', 'agent/stagea_proposal_only.py', mapping_path, 'hermes_cli/config.py', 'pyproject.toml', 'tests/agent/test_stagea_proposal_only.py']
+        assert sorted(git('diff', '--name-only', base, head).splitlines()) == ['.github/workflows/stagea-recovery-ci.yml', 'agent/stagea_proposal_only.py', mapping_path, 'hermes_cli/config.py', 'pyproject.toml', 'stagea_config_owner.py', 'tests/agent/test_stagea_proposal_only.py', 'tests/hermes_cli/test_config_read_guard.py']
         assert git('rev-parse', merge + '^{tree}') == git('rev-parse', head + '^{tree}')
         receipt = {'repository': event['repository']['full_name'], 'pr': pr['number'], 'head': head, 'base': base, 'merge': merge, 'merge_parents': [base, head], 'merge_tree': git('rev-parse', merge + '^{tree}'), 'head_tree': git('rev-parse', head + '^{tree}'), 'workflow_blob': git('rev-parse', head + ':.github/workflows/stagea-recovery-ci.yml'), 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'event': os.environ['GITHUB_EVENT_NAME'], 'action': event['action'], 'label': event['label']['name'], 'ref': os.environ['GITHUB_REF'], 'runner_os': os.environ['RUNNER_OS'], 'runner_arch': os.environ['RUNNER_ARCH'], 'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion')}
         receipt['predecessor'] = {'head': predecessor, 'parent': original_head, 'tree': predecessor_tree, 'blobs': predecessor_blobs, 'original_delta': original_delta}
         receipt['current_predecessor'] = {'head': current_predecessor, 'parent': predecessor, 'tree': current_predecessor_tree, 'blobs': current_predecessor_blobs, 'parser_delta': parser_delta.splitlines()}
+        receipt['v4_predecessor'] = {'head': v4_predecessor, 'parent': current_predecessor, 'tree': v4_tree, 'blobs': v4_blobs, 'delta': v4_delta.splitlines()}
         receipt['mapping'] = {'path': mapping_path, 'login': 'yihangdong', 'blob': git('rev-parse', head + ':' + mapping_path)}
         receipt['correction_delta'] = correction_delta.splitlines()
         receipt['agent_blob'] = git('rev-parse', head + ':agent/stagea_proposal_only.py')
         receipt['config_owner_blob'] = git('rev-parse', head + ':hermes_cli/config.py')
+        receipt['cold_owner_blob'] = git('rev-parse', head + ':stagea_config_owner.py')
+        receipt['stagea_tests_blob'] = git('rev-parse', head + ':tests/agent/test_stagea_proposal_only.py')
+        receipt['config_guard_blob'] = git('rev-parse', head + ':tests/hermes_cli/test_config_read_guard.py')
+        receipt['final_blobs'] = final_blobs
         Path('stagea-exact-object.json').write_text(json.dumps(receipt, indent=2) + '\n')
         print(json.dumps(receipt, sort_keys=True))
         PY

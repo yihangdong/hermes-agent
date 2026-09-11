@@ -15,6 +15,8 @@ Canonical owners:
   * ``gateway/config.py`` — the gateway's ``load_gateway_config`` owner.
   * ``gateway/run.py`` — ``_load_gateway_config()``'s monkeypatched-home
     fallback path (delegates to ``read_raw_config`` when paths agree).
+  * ``stagea_config_owner.py`` — cold-safe Stage-A bounded literal bytes only;
+    structurally policed below, never a generic configuration loader.
 
 Everything else must import one of those. If this test fails on your new
 code, use ``load_config()``/``load_config_readonly()`` for behavioral reads,
@@ -26,7 +28,10 @@ from __future__ import annotations
 
 import os
 import re
+import ast
 from pathlib import Path
+
+import pytest
 
 REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 
@@ -36,6 +41,8 @@ ALLOWLIST = {
     # Canonical loader owners.
     "hermes_cli/config.py",
     "gateway/config.py",
+    # Dedicated cold-safe bounded-bytes Stage-A owner, structurally policed.
+    "stagea_config_owner.py",
     # _load_gateway_config()'s fallback path for tests that monkeypatch
     # gateway.run._hermes_home (delegates to read_raw_config otherwise).
     "gateway/run.py",
@@ -127,3 +134,74 @@ def test_read_user_config_raw_exists_and_documented():
     doc = read_user_config_raw.__doc__ or ""
     assert "ONLY legal for write-back round-trips and raw-file diagnostics" in doc
     assert "load_config()" in doc
+
+
+def _assert_stagea_owner_structure(source):
+    """Closed AST capability surface: YAML and exact-bytes parsing only."""
+    tree = ast.parse(source)
+    declarations = [n for n in tree.body if not (
+        isinstance(n, ast.Expr) and isinstance(n.value, ast.Constant)
+        and isinstance(n.value.value, str))]
+    assert len(declarations) == 2
+    imports, parser = declarations
+    assert isinstance(imports, ast.Import)
+    assert [(a.name, a.asname) for a in imports.names] == [("yaml", None)]
+    assert isinstance(parser, ast.FunctionDef)
+    assert parser.name == "parse_stagea_task_config_bytes"
+    assert not parser.decorator_list and parser.returns is None
+    assert len(parser.args.args) == 1 and parser.args.args[0].arg == "raw"
+    assert ast.dump(parser.args.args[0].annotation) == "Name(id='bytes', ctx=Load())"
+    assert not (parser.args.posonlyargs or parser.args.kwonlyargs
+                or parser.args.defaults or parser.args.kw_defaults
+                or parser.args.vararg or parser.args.kwarg)
+    allowed = (ast.Module, ast.Expr, ast.Constant, ast.Import, ast.alias,
+               ast.FunctionDef, ast.arguments, ast.arg, ast.If, ast.Compare,
+               ast.Call, ast.Name, ast.Load, ast.IsNot, ast.Raise, ast.Return,
+               ast.Attribute)
+    assert all(isinstance(n, allowed) for n in ast.walk(tree))
+    calls = [n for n in ast.walk(parser) if isinstance(n, ast.Call)]
+    assert len(calls) == 3
+    names = []
+    for call in calls:
+        assert not call.keywords and len(call.args) == 1
+        if isinstance(call.func, ast.Name):
+            assert call.func.id in {"type", "TypeError"}
+            names.append(call.func.id)
+        else:
+            assert isinstance(call.func, ast.Attribute)
+            assert isinstance(call.func.value, ast.Name)
+            assert (call.func.value.id, call.func.attr) == ("yaml", "safe_load")
+            assert isinstance(call.args[0], ast.Name) and call.args[0].id == "raw"
+            names.append("yaml.safe_load")
+    assert sorted(names) == ["TypeError", "type", "yaml.safe_load"]
+    assert {n.id for n in ast.walk(parser) if isinstance(n, ast.Name)} <= {
+        "raw", "bytes", "type", "TypeError", "yaml"}
+
+
+def test_stagea_owner_has_only_cold_safe_parser_capabilities():
+    _assert_stagea_owner_structure(
+        (REPO_ROOT / "stagea_config_owner.py").read_text(encoding="utf-8"))
+
+
+@pytest.mark.parametrize("addition", [
+    "import os", "from hermes_cli import config", "import providers",
+    "import hermes_cli.plugins", "open('unexpected', 'w')",
+    "__import__('os')", "import os\nos.environ.get('HOME')",
+])
+def test_stagea_owner_structural_guard_rejects_new_capabilities(addition):
+    source = (REPO_ROOT / "stagea_config_owner.py").read_text(encoding="utf-8")
+    with pytest.raises(AssertionError):
+        _assert_stagea_owner_structure(source + "\n" + addition + "\n")
+
+
+def test_stagea_owner_is_consumed_only_by_its_two_admitted_surfaces():
+    consumers = set()
+    for rel, path in _iter_source_files():
+        tree = ast.parse(path.read_text(encoding="utf-8", errors="replace"))
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.ImportFrom)
+                    and node.module == "stagea_config_owner") or (
+                    isinstance(node, ast.Import)
+                    and any(a.name == "stagea_config_owner" for a in node.names)):
+                consumers.add(rel.as_posix())
+    assert consumers == {"agent/stagea_proposal_only.py", "hermes_cli/config.py"}

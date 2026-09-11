@@ -261,7 +261,6 @@ def read_task_config(root):
     load-bearing route value must be explicitly pinned in this one file.
     """
     import yaml
-    from hermes_cli.config import parse_stagea_task_config_bytes
     from hermes_constants import get_hermes_home
 
     path = root / "config.yaml"
@@ -273,6 +272,8 @@ def read_task_config(root):
         with path.open("rb") as stream:
             raw = stream.read(MAX_ENVELOPE_BYTES + 1)
         need(len(raw) <= MAX_ENVELOPE_BYTES, "config.bytes_length")
+        from stagea_config_owner import parse_stagea_task_config_bytes
+
         document = parse_stagea_task_config_bytes(raw)
     except (OSError, ValueError, yaml.YAMLError):
         raise ProposalRefusal("config.parse") from None
