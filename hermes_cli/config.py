@@ -3632,6 +3632,17 @@ def read_raw_config() -> Dict[str, Any]:
         return data
 
 
+def parse_stagea_task_config_bytes(raw: bytes) -> Any:
+    """Compatibility delegate; cold Stage-A callers import the root owner.
+
+    Importing this generic module retains its ordinary initialization behavior.
+    It is not the Stage-A cold path or a generic loader bypass mode.
+    """
+    from stagea_config_owner import parse_stagea_task_config_bytes as parse
+
+    return parse(raw)
+
+
 def read_user_config_raw(config_path: Optional[Path] = None) -> Dict[str, Any]:
     """Read a user ``config.yaml`` EXACTLY as written on disk.
 
