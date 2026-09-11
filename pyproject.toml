@@ -392,6 +392,7 @@ build-backend = "setuptools.build_meta"
 hermes = "hermes_cli.main:main"
 hermes-agent = "run_agent:main"
 hermes-acp = "acp_adapter.entry:main"
+hermes-stagea-proposal = "agent.stagea_proposal_only:main"
 
 [tool.uv]
 override-dependencies = [
@@ -561,6 +562,7 @@ youtube-transcript-api = false
 # Top-level single-file modules (not packages). Without this, uv2nix's
 # sealed venv is missing hermes_constants, run_agent, etc.
 py-modules = [
+  "stagea_config_owner",
   "run_agent",
   "registration_lifecycle",
   "model_tools",
