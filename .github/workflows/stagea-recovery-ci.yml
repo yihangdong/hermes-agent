@@ -50,6 +50,7 @@ jobs:
         event = json.loads(Path(os.environ['GITHUB_EVENT_PATH']).read_text())
         pr = event['pull_request']
         head, base = pr['head']['sha'], pr['base']['sha']
+        assert os.environ['GITHUB_EVENT_NAME'] == 'pull_request'
         assert event['action'] == 'labeled' and event['label']['name'] == 'ci-reviewed'
         assert event['repository']['full_name'] == 'yihangdong/hermes-agent'
         assert pr['head']['repo']['full_name'] == 'yihangdong/hermes-agent'
@@ -67,23 +68,45 @@ jobs:
             'agent/stagea_proposal_only.py': 'f196b3d0baaf77478ea1c59d3fe4dfb95b6086c4',
             'hermes_cli/config.py': 'af532c1199a2fabfac4615c61c5905ae3652c853',
         }
-        assert git('show', '-s', '--format=%P', head).split() == [predecessor]
+        current_predecessor = '1d44991a430160b9e3ccea247327f4399a234087'
+        current_predecessor_tree = '31aebb3e99e32649ac5d67e6c38f46580bc8ffbd'
+        current_predecessor_blobs = {
+            '.github/workflows/stagea-recovery-ci.yml': '83fcf158da5fd68cb294c7b8060c0b34f85ef19c',
+            'agent/stagea_proposal_only.py': '15578dec37b5a8e41218768c377b4348abcbf04d',
+            'hermes_cli/config.py': '8b71a3f67b5b8670bee2c3b309940d4884065b51',
+        }
+        assert git('show', '-s', '--format=%P', head).split() == [current_predecessor]
+        assert git('show', '-s', '--format=%P', current_predecessor).split() == [predecessor]
+        assert git('rev-parse', current_predecessor + '^{tree}') == current_predecessor_tree
+        for path, blob in current_predecessor_blobs.items():
+            assert git('rev-parse', current_predecessor + ':' + path) == blob
+            if path != '.github/workflows/stagea-recovery-ci.yml':
+                assert git('rev-parse', head + ':' + path) == blob
         assert git('show', '-s', '--format=%P', predecessor).split() == [original_head]
         assert git('rev-parse', predecessor + '^{tree}') == predecessor_tree
         for path, blob in predecessor_blobs.items():
             assert git('rev-parse', predecessor + ':' + path) == blob
         original_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', original_head, predecessor)
         assert original_delta == 'A	.github/workflows/stagea-recovery-ci.yml'
-        correction_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', predecessor, head)
-        assert sorted(correction_delta.splitlines()) == [
+        parser_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', predecessor, current_predecessor)
+        assert sorted(parser_delta.splitlines()) == [
             'M	.github/workflows/stagea-recovery-ci.yml',
             'M	agent/stagea_proposal_only.py',
             'M	hermes_cli/config.py',
         ]
-        assert sorted(git('diff', '--name-only', base, head).splitlines()) == ['.github/workflows/stagea-recovery-ci.yml', 'agent/stagea_proposal_only.py', 'hermes_cli/config.py', 'pyproject.toml', 'tests/agent/test_stagea_proposal_only.py']
+        mapping_path = 'contributors/emails/dgih1128@outlook.com'
+        correction_delta = git('diff-tree', '--no-commit-id', '--name-status', '-r', current_predecessor, head)
+        assert sorted(correction_delta.splitlines()) == [
+            'A\t' + mapping_path,
+            'M\t.github/workflows/stagea-recovery-ci.yml',
+        ]
+        assert subprocess.check_output(['git', 'show', head + ':' + mapping_path]) == b'yihangdong\n'
+        assert sorted(git('diff', '--name-only', base, head).splitlines()) == ['.github/workflows/stagea-recovery-ci.yml', 'agent/stagea_proposal_only.py', mapping_path, 'hermes_cli/config.py', 'pyproject.toml', 'tests/agent/test_stagea_proposal_only.py']
         assert git('rev-parse', merge + '^{tree}') == git('rev-parse', head + '^{tree}')
         receipt = {'repository': event['repository']['full_name'], 'pr': pr['number'], 'head': head, 'base': base, 'merge': merge, 'merge_parents': [base, head], 'merge_tree': git('rev-parse', merge + '^{tree}'), 'head_tree': git('rev-parse', head + '^{tree}'), 'workflow_blob': git('rev-parse', head + ':.github/workflows/stagea-recovery-ci.yml'), 'run_id': os.environ['GITHUB_RUN_ID'], 'attempt': int(os.environ['GITHUB_RUN_ATTEMPT']), 'event': os.environ['GITHUB_EVENT_NAME'], 'action': event['action'], 'label': event['label']['name'], 'ref': os.environ['GITHUB_REF'], 'runner_os': os.environ['RUNNER_OS'], 'runner_arch': os.environ['RUNNER_ARCH'], 'image_os': os.environ.get('ImageOS'), 'image_version': os.environ.get('ImageVersion')}
         receipt['predecessor'] = {'head': predecessor, 'parent': original_head, 'tree': predecessor_tree, 'blobs': predecessor_blobs, 'original_delta': original_delta}
+        receipt['current_predecessor'] = {'head': current_predecessor, 'parent': predecessor, 'tree': current_predecessor_tree, 'blobs': current_predecessor_blobs, 'parser_delta': parser_delta.splitlines()}
+        receipt['mapping'] = {'path': mapping_path, 'login': 'yihangdong', 'blob': git('rev-parse', head + ':' + mapping_path)}
         receipt['correction_delta'] = correction_delta.splitlines()
         receipt['agent_blob'] = git('rev-parse', head + ':agent/stagea_proposal_only.py')
         receipt['config_owner_blob'] = git('rev-parse', head + ':hermes_cli/config.py')
