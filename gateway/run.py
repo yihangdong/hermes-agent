@@ -18718,6 +18718,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("reaped-session staleness check failed", exc_info=True)
 
         if self._is_session_running(_quick_key):
+            # A replacement adapter can have empty local guards while this
+            # runner still owns the turn. Preserve native identity here too,
+            # after stale-state cleanup and before any ordinary busy routing.
+            from gateway.stagea_native_orchestration import turn_for
+            if turn_for(source) is not None:
+                await self._handle_active_session_busy_message(event, _quick_key)
+                return None
+
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single

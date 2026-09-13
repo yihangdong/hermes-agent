@@ -15,6 +15,7 @@ import socket
 import struct
 import tempfile
 import threading
+import time
 from datetime import datetime, timezone
 from types import SimpleNamespace
 from typing import Any, cast
@@ -1256,3 +1257,174 @@ async def test_real_legacy_backstop_control(ordinary, monkeypatch, tmp_path):
             assert not adapter._pending_text_batches and not adapter._background_tasks
             runner._handle_restart_command.assert_not_called()
             constructor.assert_not_called()
+
+
+def inert_running_agent():
+    """An existing ordinary turn, with recording-only consequential leaves."""
+    return SimpleNamespace(
+        get_activity_summary=lambda: {"seconds_since_activity": 0},
+        _active_children=[],
+        _active_children_lock=threading.Lock(),
+        _supports_active_turn_redirect=True,
+        steer=Mock(return_value=True),
+        redirect=Mock(return_value=True),
+        interrupt=Mock(),
+        is_compressing=lambda: False,
+    )
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["queue", "steer", "interrupt"])
+@pytest.mark.parametrize("state_kind", ["running", "pending", "drain", "control"])
+async def test_replacement_native_busy(
+    ordinary, monkeypatch, tmp_path, mode, state_kind
+):
+    from gateway.run import _AGENT_PENDING_SENTINEL
+
+    _, wire = ordinary
+    adapter = make_adapter()
+    async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+        runner,
+        key,
+        constructor,
+    ):
+        running = inert_running_agent()
+        state = runner._session_state(key)
+        owned_agent = _AGENT_PENDING_SENTINEL if state_kind == "pending" else running
+        state.turn.agent = owned_agent
+        state.turn.started_ts = time.time()
+        runner._busy_input_mode = mode
+        runner._busy_text_mode = mode
+        adapter._busy_text_mode = mode
+        runner._draining = state_kind == "drain"
+        state.persistent.update_prompt_pending = state_kind == "control"
+        monkeypatch.setattr(
+            "tools.approval.has_blocking_approval", lambda _: state_kind == "control"
+        )
+        monkeypatch.setattr(
+            "tools.slash_confirm.get_pending",
+            lambda _: {"confirm_id": "inert"} if state_kind == "control" else None,
+        )
+        resolve = AsyncMock()
+        clear = Mock()
+        monkeypatch.setattr("tools.slash_confirm.resolve", resolve)
+        monkeypatch.setattr("tools.slash_confirm.clear_if_stale", clear)
+        try:
+            for message_id, text in [
+                ("replacement-first", "restart gateway"),
+                ("replacement-second", "approve"),
+            ]:
+                # Reconnect installs a fresh adapter while the same runner
+                # still owns an ordinary turn; its local maps are empty.
+                assert not adapter._active_sessions and not adapter._session_tasks
+                await adapter._process_message(inbound(text, message_id=message_id))
+                await drain_actual_ingress(adapter)
+            replies = [
+                call.kwargs["chunk"] for call in adapter._send_text_chunk.call_args_list
+            ]
+            assert len(replies) == 2
+            conversation = B.conversation_ref("weixin|synthetic-account|owner|owner")
+            for reply, message_id in zip(
+                replies, ["replacement-first", "replacement-second"]
+            ):
+                assert "NATIVE_BUSY" in reply
+                assert B.derive_request_id(conversation, message_id) in reply
+            assert state.turn.agent is owned_agent and runner._is_session_running(key)
+            assert not adapter._pending_messages and not adapter._text_debounce
+            assert runner._queue_depth(key, adapter=adapter) == 0
+            for method in (
+                running.steer,
+                running.redirect,
+                running.interrupt,
+                constructor,
+                resolve,
+                clear,
+            ):
+                method.assert_not_called()
+            runner._handle_restart_command.assert_not_called()
+            runner._handle_approve_command.assert_not_called()
+            assert state.persistent.update_prompt_pending == (state_kind == "control")
+            assert not wire.calls
+        finally:
+            runner._draining = False
+            state.turn.agent = None
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["steer", "interrupt"])
+async def test_replacement_non_native_busy_control(
+    ordinary, monkeypatch, tmp_path, mode
+):
+    _, wire = ordinary
+    adapter = make_adapter(**{N.CONFIG_MODE: "off"})
+    async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+        runner,
+        key,
+        constructor,
+    ):
+        running = inert_running_agent()
+        state = runner._session_state(key)
+        state.turn.agent = running
+        state.turn.started_ts = time.time()
+        runner._busy_input_mode = mode
+        try:
+            for index, text in enumerate([
+                "First ordinary follow-up.",
+                "Second ordinary follow-up.",
+            ]):
+                assert not adapter._active_sessions
+                await adapter._process_message(
+                    inbound(text, message_id=f"ordinary-{index}")
+                )
+                await drain_actual_ingress(adapter)
+            effect = running.steer if mode == "steer" else running.redirect
+            assert [call.args[0] for call in effect.call_args_list] == [
+                "First ordinary follow-up.",
+                "Second ordinary follow-up.",
+            ]
+            running.interrupt.assert_not_called()
+            assert state.turn.agent is running
+            adapter._send_text_chunk.assert_not_called()
+            constructor.assert_not_called()
+            assert not wire.calls
+        finally:
+            state.turn.agent = None
+
+
+@pytest.mark.asyncio
+async def test_outer_stale_cleanup_precedes_native_busy_guard(
+    ordinary, monkeypatch, tmp_path
+):
+    _, wire = ordinary
+    requests = []
+
+    async def controller(reader, writer):
+        request = await B.read_frame(reader, strict=True)
+        requests.append(request)
+        writer.write(N.encode_native_frame(correlated("challenge", request)))
+        await writer.drain()
+        await B.read_frame(reader, strict=True)
+        writer.write(N.encode_native_frame(correlated("reply", request)))
+        await writer.drain()
+
+    async with peer(controller) as (path, _):
+        adapter = make_adapter(path)
+        async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+            runner,
+            key,
+            constructor,
+        ):
+            stale = inert_running_agent()
+            stale.get_activity_summary = lambda: {"seconds_since_activity": 3600}
+            state = runner._session_state(key)
+            state.turn.agent = stale
+            state.turn.started_ts = time.time() - 3600
+            monkeypatch.setenv("HERMES_AGENT_TIMEOUT", "10")
+            await adapter._process_message(inbound())
+            await drain_actual_ingress(adapter)
+            assert len(requests) == len(wire.calls) == 1
+            assert (
+                "NATIVE_BUSY" not in adapter._send_text_chunk.call_args.kwargs["chunk"]
+            )
+            for method in (stale.steer, stale.redirect, stale.interrupt, constructor):
+                method.assert_not_called()
