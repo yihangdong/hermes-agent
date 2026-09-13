@@ -1691,10 +1691,11 @@ class WeixinAdapter(BasePlatformAdapter):
         async def on_admitted() -> None:
             nonlocal feedback_started
             # Mark before awaiting: a partial start or cancellation still
-            # needs a stop. Neither feedback call may hold up this request
-            # indefinitely; wait_for also joins its cancelled child.
+            # needs a stop. Run feedback in this task: wait_for can orphan
+            # its child under repeated cancellation on Python 3.11.
             feedback_started = True
-            await asyncio.wait_for(self.send_typing(source.chat_id), timeout=5.0)
+            async with asyncio.timeout(5.0):
+                await self.send_typing(source.chat_id)
 
         try:
             reply = await self._stagea_bridge.process(
@@ -1713,7 +1714,8 @@ class WeixinAdapter(BasePlatformAdapter):
         finally:
             if feedback_started:
                 try:
-                    await asyncio.wait_for(self.stop_typing(source.chat_id), timeout=5.0)
+                    async with asyncio.timeout(5.0):
+                        await self.stop_typing(source.chat_id)
                 except Exception:
                     # Never replace a governed reply with a feedback error.
                     logger.debug("[%s] stage-a feedback cleanup unavailable", self.name)

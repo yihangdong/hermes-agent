@@ -257,6 +257,57 @@ class TestStageALiveness:
         assert not (asyncio.all_tasks() - before)
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["start", "stop"])
+    async def test_repeated_cancellation_leaves_no_feedback_task(self, phase):
+        adapter = _adapter(**_enabled())
+        entered = asyncio.Event()
+        cleaning = asyncio.Event()
+        release = asyncio.Event()
+        feedback_tasks = set()
+
+        async def feedback(*args):
+            feedback_tasks.add(asyncio.current_task())
+            entered.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                cleaning.set()
+                await release.wait()
+
+        primitive = adapter.send_typing if phase == "start" else adapter.stop_typing
+        primitive.side_effect = feedback
+        exchange = AsyncMock(return_value=("ACCEPTED_TERMINAL", "done"))
+        before = asyncio.all_tasks()
+        assert bridge._cleanup_charged == 0
+        with patch.object(adapter._stagea_bridge, "_exchange", exchange):
+            task = asyncio.create_task(adapter._process_message(_message("/stagea go")))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                task.cancel()
+                # The second cancellation must land inside asynchronous
+                # feedback cleanup, not merely alongside the first cancel.
+                await asyncio.wait_for(cleaning.wait(), 2)
+                assert not task.done()
+                task.cancel()
+                with pytest.raises(asyncio.CancelledError):
+                    await task
+                assert adapter._stagea_bridge._inflight == 0
+                assert bridge._cleanup_charged == 0
+                assert exchange.await_count == (0 if phase == "start" else 1)
+                assert adapter._send_text_chunk.await_count == (0 if phase == "start" else 1)
+                adapter.send_typing.assert_awaited_once_with(OWNER)
+                adapter.stop_typing.assert_awaited_once_with(OWNER)
+                assert all(child.done() for child in feedback_tasks)
+                assert not (asyncio.all_tasks() - before)
+            finally:
+                # Also tear down the exact-prehead failing control completely.
+                release.set()
+                if not task.done():
+                    task.cancel()
+                await asyncio.gather(task, *feedback_tasks, return_exceptions=True)
+                assert not (asyncio.all_tasks() - before)
+
+    @pytest.mark.asyncio
     @pytest.mark.parametrize("failed_primitive", ["send_typing", "stop_typing"])
     async def test_feedback_failure_preserves_governed_reply(self, failed_primitive):
         adapter = _adapter(**_enabled())
