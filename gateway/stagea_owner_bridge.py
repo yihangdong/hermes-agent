@@ -78,7 +78,7 @@ import threading
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any, Callable, Dict, Optional, Tuple
+from typing import Any, Awaitable, Callable, Dict, Optional, Tuple
 
 logger = logging.getLogger(__name__)
 
@@ -1332,6 +1332,7 @@ class StageAOwnerBridge:
         has_media: bool,
         conversation_key: str,
         message_id: Optional[str],
+        on_admitted: Optional[Callable[[], Awaitable[None]]] = None,
     ) -> Optional[str]:
         """Handle one inbound message.
 
@@ -1393,6 +1394,13 @@ class StageAOwnerBridge:
 
         self._inflight += 1
         try:
+            # Notify the initiating adapter only after every admission gate.
+            # Feedback has no input to the exchange or its governed outcome.
+            if on_admitted is not None:
+                try:
+                    await on_admitted()
+                except Exception:
+                    logger.debug("[stagea] admission feedback unavailable")
             outcome, reply = await self._exchange(
                 config, request_id, ref, decision.request_text, cleanup
             )

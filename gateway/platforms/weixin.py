@@ -1686,18 +1686,39 @@ class WeixinAdapter(BasePlatformAdapter):
         weaker than either source alone.
         """
         source = event.source
-        reply = await self._stagea_bridge.process(
-            chat_type=source.chat_type,
-            sender_id=source.user_id,
-            text=event.text or "",
-            has_media=not text_only or bool(event.media_urls),
-            conversation_key=f"{source.platform.value}|{self._account_id}|{source.chat_id}|{source.user_id}",
-            message_id=event.message_id,
-        )
-        if reply is None:
-            return False
-        await self._send_stagea_reply(source.chat_id, reply)
-        return True
+        feedback_started = False
+
+        async def on_admitted() -> None:
+            nonlocal feedback_started
+            # Mark before awaiting: a partial start or cancellation still
+            # needs a stop. Run feedback in this task: wait_for can orphan
+            # its child under repeated cancellation on Python 3.11.
+            feedback_started = True
+            async with asyncio.timeout(5.0):
+                await self.send_typing(source.chat_id)
+
+        try:
+            reply = await self._stagea_bridge.process(
+                chat_type=source.chat_type,
+                sender_id=source.user_id,
+                text=event.text or "",
+                has_media=not text_only or bool(event.media_urls),
+                conversation_key=f"{source.platform.value}|{self._account_id}|{source.chat_id}|{source.user_id}",
+                message_id=event.message_id,
+                on_admitted=on_admitted,
+            )
+            if reply is None:
+                return False
+            await self._send_stagea_reply(source.chat_id, reply)
+            return True
+        finally:
+            if feedback_started:
+                try:
+                    async with asyncio.timeout(5.0):
+                        await self.stop_typing(source.chat_id)
+                except Exception:
+                    # Never replace a governed reply with a feedback error.
+                    logger.debug("[%s] stage-a feedback cleanup unavailable", self.name)
 
     async def _send_stagea_reply(self, chat_id: str, text: str) -> None:
         """Deliver a Stage-A reply into the initiating conversation only.

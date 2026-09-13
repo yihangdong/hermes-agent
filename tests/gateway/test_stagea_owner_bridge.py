@@ -60,6 +60,43 @@ ENABLED_CONFIG = {
 }
 
 
+class TestAdmissionFeedbackHook:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("gate", ["media", "config", "inflight", "cleanup"])
+    async def test_refusals_do_not_signal_admitted(self, gate):
+        config = ENABLED_CONFIG if gate != "config" else {bridge.CONFIG_OWNER_USER_ID: OWNER}
+        instance = StageAOwnerBridge(config_getter=_getter(config), channel="weixin")
+        if gate == "inflight":
+            instance._inflight = bridge.MAX_INFLIGHT_REQUESTS
+        hook = AsyncMock()
+        with contextlib.ExitStack() as stack:
+            exchange = stack.enter_context(patch.object(instance, "_exchange", AsyncMock()))
+            if gate == "cleanup":
+                stack.enter_context(patch.object(bridge._CleanupBudget, "reserve", return_value=None))
+            reply = await instance.process(
+                chat_type="dm", sender_id=OWNER, text="/stagea go",
+                has_media=gate == "media", conversation_key="synthetic", message_id="one",
+                on_admitted=hook,
+            )
+        assert reply is not None and "request not accepted" in reply
+        hook.assert_not_awaited()
+        exchange.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_hook_failure_cannot_change_exchange_result(self):
+        instance = StageAOwnerBridge(config_getter=_getter(ENABLED_CONFIG), channel="weixin")
+        hook = AsyncMock(side_effect=RuntimeError("synthetic feedback failure"))
+        with patch.object(instance, "_exchange", AsyncMock(return_value=("FAILED", "unchanged"))) as exchange:
+            reply = await instance.process(
+                chat_type="dm", sender_id=OWNER, text="/stagea go", has_media=False,
+                conversation_key="synthetic", message_id="one", on_admitted=hook,
+            )
+        hook.assert_awaited_once_with()
+        exchange.assert_awaited_once()
+        assert reply == "[Stage-A] FAILED\nunchanged"
+        assert instance._inflight == 0
+
+
 def _getter(values):
     def get(name, default=None):
         return values.get(name, default)
