@@ -987,7 +987,7 @@ def encode_frame(payload: Dict[str, Any]) -> bytes:
     return struct.pack(">I", len(body)) + body
 
 
-async def read_frame(reader: asyncio.StreamReader) -> Dict[str, Any]:
+async def read_frame(reader: asyncio.StreamReader, *, strict: bool = False) -> Dict[str, Any]:
     """Read exactly one bounded frame.
 
     The declared length is validated *before* any body byte is read, so an
@@ -998,15 +998,29 @@ async def read_frame(reader: asyncio.StreamReader) -> Dict[str, Any]:
     except (asyncio.IncompleteReadError, ConnectionError) as exc:
         raise BridgeError("reply_truncated") from exc
     (length,) = struct.unpack(">I", header)
-    if length == 0 or length > MAX_FRAME_BYTES:
+    if length == 0 or length > MAX_FRAME_BYTES - (4 if strict else 0):
         raise BridgeError("reply_oversized")
     try:
         body = await reader.readexactly(length)
     except (asyncio.IncompleteReadError, ConnectionError) as exc:
         raise BridgeError("reply_truncated") from exc
     try:
-        payload = json.loads(body.decode("utf-8"))
-    except (UnicodeDecodeError, ValueError) as exc:
+        def unique(pairs):
+            result = {}
+            for key, value in pairs:
+                if key in result:
+                    raise ValueError
+                result[key] = value
+            return result
+
+        def invalid_constant(_value):
+            raise ValueError
+
+        payload = json.loads(body.decode("utf-8"), **(
+            {"object_pairs_hook": unique, "parse_constant": invalid_constant}
+            if strict else {}
+        ))
+    except (UnicodeDecodeError, ValueError, RecursionError) as exc:
         raise BridgeError("reply_malformed") from exc
     if not isinstance(payload, dict):
         raise BridgeError("reply_malformed")
@@ -1332,6 +1346,8 @@ class StageAOwnerBridge:
         has_media: bool,
         conversation_key: str,
         message_id: Optional[str],
+        _native_turn: Any = None,
+        _native_agent: Any = None,
     ) -> Optional[str]:
         """Handle one inbound message.
 
@@ -1345,7 +1361,13 @@ class StageAOwnerBridge:
         # secondary configuration — valid, invalid or absent — may change
         # what happens to it.
         owner_user_id = self._resolve_owner_user_id()
-        decision = classify(
+        classifier = classify
+        if _native_turn is not None:
+            from gateway.stagea_native_orchestration import NativeTurn, classify_native
+            if type(_native_turn) is not NativeTurn or _native_turn.ingress.bridge is not self:
+                return refusal_text("config_invalid")
+            classifier = classify_native
+        decision = classifier(
             owner_user_id,
             chat_type=chat_type,
             sender_id=sender_id,
@@ -1394,15 +1416,21 @@ class StageAOwnerBridge:
         self._inflight += 1
         try:
             outcome, reply = await self._exchange(
-                config, request_id, ref, decision.request_text, cleanup
+                config, request_id, ref, decision.request_text, cleanup,
+                **({"native_turn": _native_turn, "native_agent": _native_agent}
+                   if _native_turn is not None else {}),
             )
         except BridgeError as exc:
             logger.warning("[stagea] request %s failed closed: %s", request_id, exc.code)
+            if _native_turn is not None:
+                return outcome_text("UNKNOWN", exc.code)
             return refusal_text(exc.code)
         except asyncio.CancelledError:
             raise
         except Exception:
             logger.exception("[stagea] request %s failed closed: unexpected error", request_id)
+            if _native_turn is not None:
+                return outcome_text("UNKNOWN", "NATIVE_EXCHANGE_FAILURE")
             return refusal_text("socket_unavailable")
         finally:
             self._inflight -= 1
@@ -1420,6 +1448,9 @@ class StageAOwnerBridge:
         ref: str,
         request_text: str,
         cleanup: _CleanupBudget,
+        *,
+        native_turn: Any = None,
+        native_agent: Any = None,
     ) -> Tuple[str, str]:
         """One connection: send the request, read one reply, close.
 
@@ -1456,14 +1487,18 @@ class StageAOwnerBridge:
         except asyncio.TimeoutError as exc:
             raise BridgeError("socket_unavailable") from exc
 
-        frame = encode_frame(
-            build_request(
+        request = build_request(
                 request_id=request_id,
                 ref=ref,
                 channel=self._channel,
                 text=request_text,
             )
-        )
+        if native_turn is not None:
+            from gateway.stagea_native_orchestration import native_request, encode_native_frame
+            request = native_request(request)
+            frame = encode_native_frame(request)
+        else:
+            frame = encode_frame(request)
 
         try:
             reader, writer = await deadline.bounded(
@@ -1491,6 +1526,10 @@ class StageAOwnerBridge:
                 raise BridgeError("send_failed") from exc
 
             try:
+                if native_turn is not None:
+                    return await native_turn.exchange_frames(
+                        reader, writer, deadline, request, native_agent
+                    )
                 payload = await deadline.bounded(
                     read_frame(reader), cap=REPLY_DEADLINE_SECONDS
                 )

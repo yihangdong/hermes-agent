@@ -1341,6 +1341,8 @@ class WeixinAdapter(BasePlatformAdapter):
         self._stagea_bridge = StageAOwnerBridge(
             config_getter=self._stagea_config, channel=Platform.WEIXIN.value
         )
+        from gateway.stagea_native_orchestration import NativeIngress
+        self._stagea_native = NativeIngress(self._stagea_bridge)
 
         if self._account_id and not self._token:
             persisted = load_weixin_account(hermes_home, self._account_id)
@@ -1609,6 +1611,8 @@ class WeixinAdapter(BasePlatformAdapter):
         # it can never reach the ordinary path this fingerprint protects.
         if text and not self._stagea_bridge.is_owner_candidate(
             chat_type=chat_type, sender_id=sender_id, text=text
+        ) and not self._stagea_native.candidate(
+            chat_type=chat_type, sender_id=sender_id, text=text
         ):
             content_key = f"content:{sender_id}:{hashlib.md5(text.encode()).hexdigest()}"
             if self._dedup.is_duplicate(content_key):
@@ -1629,6 +1633,25 @@ class WeixinAdapter(BasePlatformAdapter):
         if context_token:
             self._token_store.set(self._account_id, sender_id, context_token)
         asyncio.create_task(self._maybe_fetch_typing_ticket(sender_id, context_token or None))
+
+        # Native candidates are text-only before any media download. The
+        # authenticated normal message path still owns turn serialization.
+        if self._stagea_native.candidate(chat_type=chat_type, sender_id=sender_id, text=text):
+            source = self.build_source(chat_id=effective_chat_id, chat_type=chat_type,
+                                       user_id=sender_id, user_name=sender_id)
+            prepared = self._stagea_native.prepare(source=source, text=text,
+                has_media=not _is_text_only_message(item_list), message_id=message_id,
+                conversation_key=self._stagea_conversation_key(source))
+            if isinstance(prepared, str):
+                await self._send_stagea_reply(source.chat_id, prepared)
+                return
+            setattr(source, "_stagea_native_turn", prepared)
+            event = MessageEvent(text=text, message_type=MessageType.TEXT,
+                source=source, raw_message=message, message_id=message_id or None,
+                timestamp=datetime.now(), allow_gateway_control=False)
+            # Keep each stable platform identity intact; no debounce merging.
+            await self.handle_message(event)
+            return
 
         media_paths: List[str] = []
         media_types: List[str] = []
@@ -1686,6 +1709,11 @@ class WeixinAdapter(BasePlatformAdapter):
         weaker than either source alone.
         """
         source = event.source
+        if self._stagea_native.blocked(self._stagea_conversation_key(source)):
+            from gateway.stagea_native_orchestration import UNRESOLVED
+            from gateway.stagea_owner_bridge import outcome_text
+            await self._send_stagea_reply(source.chat_id, outcome_text("UNKNOWN", UNRESOLVED))
+            return True
         reply = await self._stagea_bridge.process(
             chat_type=source.chat_type,
             sender_id=source.user_id,
@@ -1698,6 +1726,9 @@ class WeixinAdapter(BasePlatformAdapter):
             return False
         await self._send_stagea_reply(source.chat_id, reply)
         return True
+
+    def _stagea_conversation_key(self, source):
+        return f"{source.platform.value}|{self._account_id}|{source.chat_id}|{source.user_id}"
 
     async def _send_stagea_reply(self, chat_id: str, text: str) -> None:
         """Deliver a Stage-A reply into the initiating conversation only.

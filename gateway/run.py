@@ -5780,6 +5780,10 @@ class TurnRunner:
 
     def run_sync(self):
         ctx = self._ctx
+        from gateway.stagea_native_orchestration import execution_blocked, turn_for, reply_result, UNRESOLVED
+        native_turn = turn_for(ctx.source)
+        if execution_blocked(self._runner, ctx.source, ctx.session_id):
+            return reply_result("[Stage-A] UNKNOWN\n" + UNRESOLVED)
         # Historical note: as a nested closure this body declared
         # `nonlocal message` because the conditional re-assignments below
         # (prepending model-switch / resume-recovery notes) would otherwise
@@ -5882,7 +5886,7 @@ class TurnRunner:
         _want_stream_deltas = _streaming_enabled
         _want_interim_messages = ctx.interim_assistant_messages_enabled
         _want_interim_consumer = _want_interim_messages
-        if _want_stream_deltas or _want_interim_consumer:
+        if native_turn is None and (_want_stream_deltas or _want_interim_consumer):
             try:
                 from gateway.stream_consumer import GatewayStreamConsumer
                 _adapter = self._runner._adapter_for_source(ctx.source)
@@ -6141,10 +6145,12 @@ class TurnRunner:
                                 _cache.move_to_end(ctx.session_key)
                             except KeyError:
                                 pass
-                        self._runner._init_cached_agent_for_turn(agent, ctx._interrupt_depth)
+                        if native_turn is None:
+                            self._runner._init_cached_agent_for_turn(agent, ctx._interrupt_depth)
                         # Refresh agent max_iterations from current config
                         # (cached agent may have been created with old config)
-                        agent.max_iterations = max_iterations
+                        if native_turn is None:
+                            agent.max_iterations = max_iterations
                         logger.debug("Reusing cached agent for session %s", ctx.session_key)
                         reused_cached_agent = True
 
@@ -6155,7 +6161,7 @@ class TurnRunner:
         # configured after this agent was cached (or after gateway start)
         # must reach the next turn (#60955).  Per-session turn
         # serialization (_running_agents) keeps this safe post-lock.
-        if reused_cached_agent and agent is not None:
+        if reused_cached_agent and agent is not None and native_turn is None:
             self._runner._apply_fallback_chain_to_agent(
                 agent, self._runner._refresh_fallback_model(),
             )
@@ -6232,6 +6238,12 @@ class TurnRunner:
                     )
                     self._runner._enforce_agent_cache_cap()
             logger.debug("Created new agent for session %s (sig=%s)", ctx.session_key, _sig)
+
+        if native_turn is not None:
+            # Same ordinary cache/constructor and provider resolution above.
+            # Branch before ordinary per-turn state/prompt/callback mutation.
+            ctx.agent_holder[0] = agent
+            return native_turn.run_sync(agent, ctx._loop_for_step, ctx.session_id)
 
         # Per-message state — callbacks and reasoning config change every
         # turn and must not be baked into the cached agent constructor.
@@ -10912,6 +10924,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 session_key,
             )
             return True  # handled (silently dropped); do not fall through
+
+        from gateway.stagea_native_orchestration import turn_for
+        native_turn = turn_for(event.source)
+        if native_turn is not None:
+            # Each prepared native message keeps its own refusal identity.
+            # Never enter ordinary drain/approval/steer/debounce handling.
+            reply = native_turn.busy_reply()
+            adapter = self._adapter_for_source(event.source)
+            if adapter is not None:
+                await adapter._send_stagea_reply(event.source.chat_id, reply)
+            return True
 
         effective_mode = self._effective_busy_input_mode(event.source)
 
@@ -18695,6 +18718,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 logger.debug("reaped-session staleness check failed", exc_info=True)
 
         if self._is_session_running(_quick_key):
+            # A replacement adapter can have empty local guards while this
+            # runner still owns the turn. Preserve native identity here too,
+            # after stale-state cleanup and before any ordinary busy routing.
+            from gateway.stagea_native_orchestration import turn_for
+            if turn_for(source) is not None:
+                await self._handle_active_session_busy_message(event, _quick_key)
+                return None
+
             # Resolve the command once; every command's mid-run behavior is
             # declared on its CommandDef (busy_policy / busy_handler in
             # hermes_cli/commands.py) and dispatched through the single
@@ -19668,6 +19699,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     "protect the transcript, this message was not processed. "
                     "Wait for the active turn to finish, then resend it."
                 )
+            from gateway.stagea_native_orchestration import turn_for
+            if turn_for(source) is not None or getattr(event, "_stagea_native_terminal", False) is True:
+                return _agent_result
             try:
                 await self._run_post_turn_hooks(
                     agent_result=_agent_result,
@@ -20464,6 +20498,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
     async def _handle_message_with_agent(self, event, source, _quick_key: str, run_generation: int):
         """Inner handler that runs under the _running_agents sentinel guard."""
+        from gateway.stagea_native_orchestration import turn_for
+        native_turn = turn_for(source)
         _msg_start_time = time.time()
         _platform_name = source.platform.value if hasattr(source.platform, "value") else str(source.platform)
         _msg_preview = (event.text or "")[:80].replace("\n", " ")
@@ -20543,6 +20579,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 return
             session_entry = resolved_entry
         self._cache_session_source(session_key, source)
+        from gateway.stagea_native_orchestration import NativeIngress, execution_blocked, UNRESOLVED
+        native_adapter = self._adapter_for_source(source)
+        if execution_blocked(self, source, session_entry.session_id):
+            # Also fence alias/internal turns before session hooks or hygiene
+            # can start ancillary cognition on this unresolved session.
+            event._stagea_native_terminal = True
+            if type(getattr(native_adapter, "_stagea_native", None)) is NativeIngress:
+                await native_adapter._send_stagea_reply(source.chat_id, "[Stage-A] UNKNOWN\n" + UNRESOLVED)
+                return None
+            return "[Stage-A] UNKNOWN\n" + UNRESOLVED
         if await asyncio.to_thread(self._is_telegram_topic_lane, source):
             try:
                 binding = (await self._session_db.get_telegram_topic_binding(
@@ -20631,7 +20677,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # onto subsequent messages in the same session (issue #6508).
         if getattr(session_entry, "is_fresh_reset", False):
             session_entry.is_fresh_reset = False
-        if _is_new_session:
+        if _is_new_session and native_turn is None:
             await self.hooks.emit("session:start", {
                 "platform": source.platform.value if source.platform else "",
                 "user_id": source.user_id,
@@ -20772,7 +20818,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Only inject on NEW sessions — ongoing conversations already have the
         # skill content in their conversation history from the first message.
         _auto = getattr(event, "auto_skill", None)
-        if _is_new_session and _auto:
+        if _is_new_session and _auto and native_turn is None:
             _skill_names = [_auto] if isinstance(_auto, str) else list(_auto)
             try:
                 from agent.skill_commands import _load_skill_payload, _build_skill_message
@@ -20839,6 +20885,40 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _lease_state = self._session_state(_quick_key).turn
                 _lease_state.lease_token = _lease_token
                 _lease_state.lease_generation = run_generation
+
+        # A different route may have waited for the same session while the
+        # prior native SDK attempt became unresolved. Recheck after the await.
+        if execution_blocked(self, source, session_entry.session_id):
+            event._stagea_native_terminal = True
+            self._clear_session_env(_session_env_tokens)
+            if type(getattr(native_adapter, "_stagea_native", None)) is NativeIngress:
+                await native_adapter._send_stagea_reply(source.chat_id, "[Stage-A] UNKNOWN\n" + UNRESOLVED)
+                return None
+            return "[Stage-A] UNKNOWN\n" + UNRESOLVED
+        if native_turn is not None:
+            # The existing per-session lease above is the serialization
+            # boundary. Native turns bypass transcript hygiene (which can
+            # construct a separate compression agent), hooks and auto-resume.
+            try:
+                if _lease_registry is None or _lease_token is None:
+                    await self._adapter_for_source(source)._send_stagea_reply(
+                        source.chat_id, "[Stage-A] UNKNOWN\nNATIVE_SESSION_LEASE_UNAVAILABLE"
+                    )
+                    return None
+                result = await self._run_agent(
+                    message=native_turn.text, context_prompt=context_prompt,
+                    history=[], source=source, session_id=session_entry.session_id,
+                    session_key=session_key, run_generation=run_generation,
+                    event_message_id=event.message_id, inbound_message_id=event.message_id,
+                    channel_prompt=event.channel_prompt, message_type=event.message_type,
+                )
+                if self._is_session_run_current(_quick_key, run_generation):
+                    await self._adapter_for_source(source)._send_stagea_reply(
+                        source.chat_id, result.get("final_response") or "[Stage-A] UNKNOWN"
+                    )
+                return None
+            finally:
+                self._clear_session_env(_session_env_tokens)
 
         # A turn only becomes durable recovery work after it owns (or has
         # explicitly degraded past) the per-session lease.  Marking before the
@@ -22267,6 +22347,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _stale_adapter._post_delivery_callbacks.pop(_quick_key, None)
                 return None
 
+            if agent_result.get("_stagea_native_reply") is True:
+                # Controller text never passes through media extraction, tool
+                # response transforms, auto-continuation or transcript repair.
+                from gateway.stagea_native_orchestration import NativeIngress
+                event._stagea_native_terminal = True
+                native_adapter = self._adapter_for_source(source)
+                if type(getattr(native_adapter, "_stagea_native", None)) is NativeIngress:
+                    await native_adapter._send_stagea_reply(
+                        source.chat_id, agent_result["final_response"]
+                    )
+                    return None
+                return agent_result["final_response"]
             response = agent_result.get("final_response") or ""
             # Hidden-reasoning-only retry exhaustion: the loop's sentinel text
             # ("Codex response remained incomplete after 3 continuation
@@ -30249,6 +30341,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         This is run in a thread pool to not block the event loop.
         Supports interruption via new messages.
         """
+        from gateway.stagea_native_orchestration import execution_blocked, turn_for, reply_result, UNRESOLVED
+        native_turn = turn_for(source)
+        if execution_blocked(self, source, session_id):
+            return reply_result("[Stage-A] UNKNOWN\n" + UNRESOLVED)
+        if native_turn is not None and (
+            inbound_message_id != native_turn.message_id or self._get_proxy_url()
+        ):
+            return reply_result("[Stage-A] UNKNOWN\nUNSUPPORTED_NATIVE_CONFIGURATION")
+
         # ---- Proxy mode: delegate to remote API server ----
         if self._get_proxy_url():
             return await self._run_agent_via_proxy(
@@ -30849,6 +30950,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # executor call below is unchanged).  Its closed-over locals travel
         # on turn_ctx; `nonlocal message` rebinds became ctx.message writes.
         run_sync = turn_runner.run_sync
+
+        from gateway.stagea_native_orchestration import turn_for
+        native_turn = turn_for(source)
+        if native_turn is not None:
+            # Existing session/turn lease remains held by the caller. The
+            # bridge supplies the finite deadline; native cancellation never
+            # enters ordinary interrupt/retry/fallback/queued cognition.
+            try:
+                return await self._run_in_executor_with_context(run_sync)
+            except BaseException:
+                native_turn.cancel()
+                raise
         
         # Start progress message sender if enabled. Gate on needs_progress_queue
         # (tool_progress OR thinking_progress), not tool_progress alone: the
