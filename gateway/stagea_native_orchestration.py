@@ -155,6 +155,19 @@ class NativeTurn:
         self._future = None
         self._keys = {self.key}
 
+    def busy_reply(self):
+        # Refuse this exact platform message before any ordinary busy-input
+        # coalescer can discard its identity or steer the active agent.
+        with self.ingress._lock:
+            self._used = True
+            reason = (
+                UNRESOLVED if self.key in self.ingress._unresolved else "NATIVE_BUSY"
+            )
+        request_id = B.derive_request_id(
+            B.conversation_ref(self.key), self.message_id.strip()
+        )
+        return B.outcome_text("UNKNOWN", f"{reason} request_id={request_id}")
+
     def cancel(self):
         with self.ingress._lock:
             self._cancelled = True

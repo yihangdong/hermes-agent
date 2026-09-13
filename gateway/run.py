@@ -10925,6 +10925,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
             return True  # handled (silently dropped); do not fall through
 
+        from gateway.stagea_native_orchestration import turn_for
+        native_turn = turn_for(event.source)
+        if native_turn is not None:
+            # Each prepared native message keeps its own refusal identity.
+            # Never enter ordinary drain/approval/steer/debounce handling.
+            reply = native_turn.busy_reply()
+            adapter = self._adapter_for_source(event.source)
+            if adapter is not None:
+                await adapter._send_stagea_reply(event.source.chat_id, reply)
+            return True
+
         effective_mode = self._effective_busy_input_mode(event.source)
 
         # --- Draining case (gateway restarting/stopping) ---

@@ -930,3 +930,329 @@ async def test_normal_cache_miss_constructs_once_and_new_ids_stay_distinct(ordin
     assert len(wire.calls) == 2
     assert received[0]["request_id"] != received[1]["request_id"]
     assert received[0]["conversation_ref"] == received[1]["conversation_ref"]
+
+
+@asynccontextmanager
+async def actual_gateway(adapter, ordinary, monkeypatch, tmp_path):
+    """Use inherited base ingress, outer dispatch, session lease and TurnRunner.
+
+    Only synthetic configuration, transport and consequential control/hooks
+    are supplied. None of the production message/turn handlers is replaced.
+    """
+    from gateway.config import GatewayConfig
+    from gateway.platforms.base import BasePlatformAdapter, SendResult
+    from gateway.run import GatewayRunner
+
+    agent, _ = ordinary
+    del adapter.handle_message
+    del adapter._enqueue_text_event
+    assert adapter.handle_message.__func__ is BasePlatformAdapter.handle_message
+    adapter.config.typing_indicator = False
+    adapter._text_batch_delay_seconds = 0
+    adapter._text_batch_split_delay_seconds = 0
+    adapter._send_with_retry = AsyncMock(return_value=SendResult(True, "inert-reply"))
+    monkeypatch.setattr("hermes_cli.lifecycle.invoke_hook", lambda *a, **k: [])
+    monkeypatch.setattr("agent.estop.paused_reply", lambda: None)
+    monkeypatch.setattr("gateway.run._hermes_home", tmp_path / "hermes")
+    monkeypatch.setattr(
+        "gateway.run._load_gateway_config",
+        lambda: {"display": {"tool_progress": "off", "streaming": False}},
+    )
+    runner = cast(
+        Any,
+        GatewayRunner(
+            GatewayConfig(
+                platforms={Platform.WEIXIN: adapter.config},
+                sessions_dir=tmp_path / "gateway-sessions",
+            )
+        ),
+    )
+    runner.adapters = {Platform.WEIXIN: adapter}
+    runner._gateway_loop = asyncio.get_running_loop()
+    runner._is_user_authorized = lambda source: source.user_id in {"owner", "other"}
+    runner._handle_restart_command = AsyncMock(return_value="INERT_CONTROL_SENTINEL")
+    runner._handle_approve_command = AsyncMock(return_value="INERT_APPROVAL_SENTINEL")
+    runner.hooks = SimpleNamespace(
+        loaded_hooks=False, emit=AsyncMock(), emit_collect=AsyncMock(return_value=[])
+    )
+    runner._resolve_session_agent_runtime = lambda *a, **k: (
+        agent.model,
+        {"provider": agent.provider},
+    )
+    runner._resolve_turn_agent_config = lambda *a, **k: {
+        "model": agent.model,
+        "runtime": {},
+    }
+    runner._agent_config_signature = lambda *a, **k: ("signature",)
+    runner._extract_cache_busting_config = lambda *a, **k: {}
+    runner._get_system_prompt_for_channel = lambda *a, **k: None
+    runner._get_proxy_url = lambda: None
+    runner._refresh_fallback_model = lambda: None
+    runner._resolve_session_reasoning_config = lambda *a, **k: None
+    runner._resolve_session_service_tier = lambda *a, **k: None
+    source = adapter.build_source(
+        chat_id="owner", chat_type="dm", user_id="owner", user_name="owner"
+    )
+    entry = runner.session_store.get_or_create_session(source)
+    key = runner._session_key_for_source(source)
+    runner._agent_cache[key] = (agent, ("signature",), None, entry.session_id)
+    constructor = Mock(side_effect=AssertionError("No second AIAgent"))
+    monkeypatch.setattr("run_agent.AIAgent", constructor)
+    adapter.set_message_handler(runner._primary_message_handler())
+    adapter.set_busy_session_handler(runner._handle_active_session_busy_message)
+    try:
+        yield runner, key, constructor
+    finally:
+        for task in tuple(adapter._background_tasks):
+            if not task.done():
+                task.cancel()
+        if adapter._background_tasks:
+            await asyncio.gather(
+                *tuple(adapter._background_tasks), return_exceptions=True
+            )
+        if runner._executor is not None:
+            runner._executor.shutdown(wait=True)
+        runner.session_store.close_all_db_handles()
+
+
+async def drain_actual_ingress(adapter):
+    batches = tuple(adapter._pending_text_batch_tasks.values())
+    if batches:
+        await asyncio.wait_for(asyncio.gather(*batches), 5)
+    tasks = tuple(adapter._background_tasks)
+    if tasks:
+        await asyncio.wait_for(asyncio.gather(*tasks), 5)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "intent", ["restart gateway", "Please restart the Hermes gateway!", "approve"]
+)
+async def test_real_native_command_path(ordinary, monkeypatch, tmp_path, intent):
+    _, wire = ordinary
+    seen = []
+
+    async def controller(reader, writer):
+        request = await B.read_frame(reader, strict=True)
+        seen.append(request)
+        challenge = correlated("challenge", request)
+        challenge["request"]["intent"] = request["text"]
+        writer.write(N.encode_native_frame(challenge))
+        await writer.drain()
+        await B.read_frame(reader, strict=True)
+        writer.write(N.encode_native_frame(correlated("reply", request)))
+        await writer.drain()
+
+    async with peer(controller) as (path, _):
+        adapter = make_adapter(path)
+        async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+            runner,
+            _,
+            constructor,
+        ):
+            monkeypatch.setattr("tools.approval.has_blocking_approval", lambda _: True)
+            await adapter._process_message(
+                inbound(intent, message_id="native-command-like")
+            )
+            await drain_actual_ingress(adapter)
+            runner._handle_restart_command.assert_not_called()
+            runner._handle_approve_command.assert_not_called()
+            constructor.assert_not_called()
+            assert len(wire.calls) == len(seen) == 1
+            assert seen[0]["text"] == intent
+            assert (
+                json.loads(wire.calls[0]["messages"][1]["content"])["intent"] == intent
+            )
+            assert adapter._send_text_chunk.await_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mode", ["queue", "steer", "interrupt", "drain", "approval"])
+async def test_real_native_busy_is_per_message(ordinary, monkeypatch, tmp_path, mode):
+    _, wire = ordinary
+    entered, release = asyncio.Event(), asyncio.Event()
+    received = []
+
+    async def controller(reader, writer):
+        request = await B.read_frame(reader, strict=True)
+        received.append(request)
+        entered.set()
+        await asyncio.wait_for(release.wait(), 4)
+        writer.write(N.encode_native_frame(correlated("challenge", request)))
+        await writer.drain()
+        await B.read_frame(reader, strict=True)
+        writer.write(N.encode_native_frame(correlated("reply", request)))
+        await writer.drain()
+
+    async with peer(controller) as (path, _):
+        adapter = make_adapter(path)
+        adapter._busy_text_mode = "queue"
+        async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+            runner,
+            key,
+            constructor,
+        ):
+            runner._busy_input_mode = (
+                mode if mode in {"queue", "steer", "interrupt"} else "queue"
+            )
+            runner._busy_text_mode = "queue"
+            await adapter._process_message(inbound(message_id="active-native"))
+            await asyncio.wait_for(entered.wait(), 3)
+            try:
+                runner._draining = mode == "drain"
+                monkeypatch.setattr(
+                    "tools.approval.has_blocking_approval", lambda _: mode == "approval"
+                )
+                for message_id, intent in [
+                    ("busy-1", "restart gateway"),
+                    ("busy-2", "approve"),
+                ]:
+                    await adapter._process_message(
+                        inbound(intent, message_id=message_id)
+                    )
+                replies = [
+                    call.kwargs["chunk"]
+                    for call in adapter._send_text_chunk.call_args_list
+                ]
+                assert len(replies) == 2
+                for reply, message_id in zip(replies, ["busy-1", "busy-2"]):
+                    expected_id = B.derive_request_id(
+                        received[0]["conversation_ref"], message_id
+                    )
+                    assert "NATIVE_BUSY" in reply and expected_id in reply
+                assert not adapter._pending_messages and not adapter._text_debounce
+                assert runner._queue_depth(key, adapter=adapter) == 0
+                assert len(received) == 1 and not wire.calls
+                runner._handle_approve_command.assert_not_called()
+                if mode == "queue":
+                    # Another principal retains ordinary command dispatch
+                    # while the native Owner conversation remains active.
+                    await adapter._process_message(
+                        inbound("restart gateway", sender="other")
+                    )
+                    await asyncio.wait_for(
+                        asyncio.gather(
+                            *tuple(adapter._pending_text_batch_tasks.values())
+                        ),
+                        2,
+                    )
+                    other_key = next(k for k in adapter._session_tasks if k != key)
+                    await asyncio.wait_for(adapter._session_tasks[other_key], 2)
+                    runner._handle_restart_command.assert_awaited_once()
+                    runner._handle_restart_command.reset_mock()
+            finally:
+                runner._draining = False
+                release.set()
+                await drain_actual_ingress(adapter)
+            assert len(wire.calls) == 1
+            assert len(received) == 1
+            constructor.assert_not_called()
+            runner._handle_restart_command.assert_not_called()
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("sender,mode", [("owner", ""), ("other", N.MODE)])
+async def test_real_non_native_command_control(
+    ordinary, monkeypatch, tmp_path, sender, mode
+):
+    _, wire = ordinary
+    adapter = make_adapter(**{N.CONFIG_MODE: mode})
+    if not mode:
+        adapter.config.extra.pop(N.CONFIG_MODE)  # default off, not a special mode
+    async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+        runner,
+        _,
+        constructor,
+    ):
+        await adapter._process_message(inbound("restart gateway", sender=sender))
+        await drain_actual_ingress(adapter)
+        runner._handle_restart_command.assert_awaited_once()
+        event = runner._handle_restart_command.call_args.args[0]
+        assert event.allow_gateway_control and event.text == "/restart"
+        assert N.turn_for(event.source) is None
+        assert not wire.calls
+        constructor.assert_not_called()
+        adapter._send_text_chunk.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_real_non_native_busy_retains_existing_coalescer(
+    ordinary, monkeypatch, tmp_path
+):
+    _, wire = ordinary
+    adapter = make_adapter(**{N.CONFIG_MODE: "off"})
+    adapter._busy_text_mode = "queue"
+    adapter._busy_text_debounce_seconds = 30
+    async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+        runner,
+        key,
+        constructor,
+    ):
+        runner._busy_input_mode = "queue"
+        runner._busy_text_mode = "queue"
+        # Existing active-session state, with a live owner task. Native tests
+        # above additionally hold a real TurnRunner/socket exchange open.
+        adapter._active_sessions[key] = asyncio.Event()
+        adapter._session_tasks[key] = asyncio.current_task()
+        try:
+            for message_id, text in [
+                ("ordinary-1", "First ordinary text."),
+                ("ordinary-2", "Second ordinary text."),
+            ]:
+                await adapter._process_message(inbound(text, message_id=message_id))
+                await asyncio.wait_for(
+                    asyncio.gather(*tuple(adapter._pending_text_batch_tasks.values())),
+                    2,
+                )
+            event = adapter._text_debounce[key].event
+            assert event.text == "First ordinary text.\nSecond ordinary text."
+            assert event.message_id == "ordinary-2" and N.turn_for(event.source) is None
+            assert event.allow_gateway_control
+            await adapter._flush_text_debounce_now(key)
+            assert adapter._pending_messages[key] is event
+            assert not wire.calls
+            constructor.assert_not_called()
+        finally:
+            adapter._discard_text_debounce(key)
+            adapter._pending_messages.pop(key, None)
+            adapter._active_sessions.pop(key, None)
+            adapter._session_tasks.pop(key, None)
+
+
+@pytest.mark.asyncio
+async def test_real_legacy_backstop_control(ordinary, monkeypatch, tmp_path):
+    _, wire = ordinary
+    requests = []
+
+    async def controller(reader, writer):
+        request = await B.read_frame(reader, strict=True)
+        requests.append(request)
+        assert request["schema"] == B.SCHEMA and request["type"] == B.REQUEST_TYPE
+        assert request["text"] == "explicit backstop"
+        writer.write(
+            B.encode_frame({
+                "schema": B.SCHEMA,
+                "protocol": B.PROTOCOL,
+                "type": B.REPLY_TYPE,
+                "request_id": request["request_id"],
+                "conversation_ref": request["conversation_ref"],
+                "outcome": "UNKNOWN",
+                "text": "Inert legacy backstop.",
+            })
+        )
+        await writer.drain()
+
+    async with peer(controller) as (path, done):
+        adapter = make_adapter(path)
+        async with actual_gateway(adapter, ordinary, monkeypatch, tmp_path) as (
+            runner,
+            _,
+            constructor,
+        ):
+            await adapter._process_message(inbound("/stagea explicit backstop"))
+            await asyncio.wait_for(done.wait(), 2)
+            assert len(requests) == 1 and not wire.calls
+            adapter._send_text_chunk.assert_awaited_once()
+            assert not adapter._pending_text_batches and not adapter._background_tasks
+            runner._handle_restart_command.assert_not_called()
+            constructor.assert_not_called()

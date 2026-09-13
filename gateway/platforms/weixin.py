@@ -1648,7 +1648,7 @@ class WeixinAdapter(BasePlatformAdapter):
             setattr(source, "_stagea_native_turn", prepared)
             event = MessageEvent(text=text, message_type=MessageType.TEXT,
                 source=source, raw_message=message, message_id=message_id or None,
-                timestamp=datetime.now())
+                timestamp=datetime.now(), allow_gateway_control=False)
             # Keep each stable platform identity intact; no debounce merging.
             await self.handle_message(event)
             return
