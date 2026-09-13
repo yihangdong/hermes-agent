@@ -79,6 +79,8 @@ def _adapter(**stagea) -> Any:
     adapter.handle_message = AsyncMock()
     adapter._enqueue_text_event = Mock()
     adapter._send_text_chunk = AsyncMock()
+    adapter.send_typing = AsyncMock()
+    adapter.stop_typing = AsyncMock()
     return adapter
 
 
@@ -148,6 +150,142 @@ def _terminal(request, *, outcome="ACCEPTED_TERMINAL", text="lane advanced"):
         "outcome": outcome,
         "text": text,
     }
+
+
+class TestStageALiveness:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["ACCEPTED_TERMINAL", "FAILED", "UNKNOWN"])
+    async def test_feedback_precedes_one_request_and_ends_with_one_reply(self, outcome):
+        adapter = _adapter(**_enabled())
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        open_connection, captured = _fake_peer(
+            lambda request: _terminal(request, outcome=outcome)
+        )
+
+        async def blocked_peer(path):
+            adapter.send_typing.assert_awaited_once_with(OWNER)
+            adapter.stop_typing.assert_not_awaited()
+            entered.set()
+            await release.wait()
+            return await open_connection(path)
+
+        before = asyncio.all_tasks()
+        with _socket_layer(blocked_peer):
+            task = asyncio.create_task(adapter._process_message(_message("/stagea go")))
+            try:
+                await asyncio.wait_for(entered.wait(), 2)
+                adapter._send_text_chunk.assert_not_awaited()
+                release.set()
+                await task
+            finally:
+                release.set()
+                if not task.done():
+                    task.cancel()
+                    with contextlib.suppress(asyncio.CancelledError):
+                        await task
+        assert len(captured) == 1
+        adapter._send_text_chunk.assert_awaited_once()
+        assert adapter._send_text_chunk.await_args.kwargs["chunk"] == (
+            f"[Stage-A] {outcome}\nlane advanced"
+        )
+        adapter.stop_typing.assert_awaited_once_with(OWNER)
+        assert _dispatched(adapter) == 0
+        assert not (asyncio.all_tasks() - before)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("text,sender,enabled,expected_routing", [
+        ("ordinary Owner text", OWNER, True, 1),
+        ("/stagea go", OTHER, True, 1),
+        ("/stagea go", "unauthorized", True, 0),
+        ("/stagea go", OWNER, False, 1),
+        ("/stagea", OWNER, True, 0),
+    ])
+    async def test_nonadmitted_messages_have_no_feedback(
+        self, text, sender, enabled, expected_routing
+    ):
+        adapter = _adapter(**(_enabled() if enabled else {}))
+        with patch.object(adapter._stagea_bridge, "_exchange", AsyncMock()) as exchange:
+            await adapter._process_message(_message(text, sender=sender))
+        exchange.assert_not_awaited()
+        adapter.send_typing.assert_not_awaited()
+        adapter.stop_typing.assert_not_awaited()
+        assert _dispatched(adapter) == expected_routing
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("error", [RuntimeError("synthetic"), asyncio.TimeoutError(),
+                                           bridge.BridgeError("reply_timeout")])
+    async def test_bridge_error_or_timeout_clears_feedback(self, error):
+        adapter = _adapter(**_enabled())
+        with patch.object(adapter._stagea_bridge, "_exchange", AsyncMock(side_effect=error)) as exchange:
+            await adapter._process_message(_message("/stagea go"))
+        exchange.assert_awaited_once()
+        adapter.send_typing.assert_awaited_once_with(OWNER)
+        adapter.stop_typing.assert_awaited_once_with(OWNER)
+        adapter._send_text_chunk.assert_awaited_once()
+        assert "request not accepted" in adapter._send_text_chunk.await_args.kwargs["chunk"]
+        assert adapter._stagea_bridge._inflight == 0
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["start", "exchange", "reply"])
+    async def test_cancellation_stops_feedback_and_propagates(self, phase):
+        adapter = _adapter(**_enabled())
+        entered = asyncio.Event()
+
+        async def block(*args, **kwargs):
+            entered.set()
+            await asyncio.Event().wait()
+
+        exchange = AsyncMock(return_value=("ACCEPTED_TERMINAL", "done"))
+        if phase == "start":
+            adapter.send_typing.side_effect = block
+        elif phase == "exchange":
+            exchange.side_effect = block
+        else:
+            adapter._send_text_chunk.side_effect = block
+        before = asyncio.all_tasks()
+        with patch.object(adapter._stagea_bridge, "_exchange", exchange):
+            task = asyncio.create_task(adapter._process_message(_message("/stagea go")))
+            await asyncio.wait_for(entered.wait(), 2)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await task
+        adapter.stop_typing.assert_awaited_once_with(OWNER)
+        assert exchange.await_count == (0 if phase == "start" else 1)
+        assert adapter._send_text_chunk.await_count == (1 if phase == "reply" else 0)
+        assert adapter._stagea_bridge._inflight == 0
+        assert not (asyncio.all_tasks() - before)
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("failed_primitive", ["send_typing", "stop_typing"])
+    async def test_feedback_failure_preserves_governed_reply(self, failed_primitive):
+        adapter = _adapter(**_enabled())
+        getattr(adapter, failed_primitive).side_effect = RuntimeError("synthetic")
+        open_connection, captured = _fake_peer(_terminal)
+        before = asyncio.all_tasks()
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea go"))
+        assert len(captured) == 1
+        adapter._send_text_chunk.assert_awaited_once()
+        assert adapter._send_text_chunk.await_args.kwargs["chunk"] == (
+            "[Stage-A] ACCEPTED_TERMINAL\nlane advanced"
+        )
+        adapter.stop_typing.assert_awaited_once_with(OWNER)
+        assert not (asyncio.all_tasks() - before)
+
+    @pytest.mark.asyncio
+    async def test_duplicate_delivery_does_not_start_another_feedback_lifecycle(self):
+        adapter = _adapter(**_enabled())
+        open_connection, captured = _fake_peer(_terminal)
+        with _socket_layer(open_connection):
+            await adapter._process_message(_message("/stagea go"))
+            await adapter._process_message(_message("/stagea go"))
+        assert len(captured) == 1
+        adapter.send_typing.assert_awaited_once_with(OWNER)
+        adapter.stop_typing.assert_awaited_once_with(OWNER)
+        # The adapter's existing ingress dedupe drops the repeated delivery
+        # before the bridge, so it must not duplicate even the final reply.
+        adapter._send_text_chunk.assert_awaited_once()
 
 
 class TestOrdinaryRoutingUnchanged:
@@ -1042,6 +1180,8 @@ class TestNativeConfiguration:
         adapter.handle_message = AsyncMock()
         adapter._enqueue_text_event = Mock()
         adapter._send_text_chunk = AsyncMock()
+        adapter.send_typing = AsyncMock()
+        adapter.stop_typing = AsyncMock()
         return adapter
 
     def test_the_owner_binding_comes_from_the_platform_config(self):
