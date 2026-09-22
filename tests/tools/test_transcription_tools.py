@@ -1222,28 +1222,54 @@ class TestRunCommandSttIdleTimeout:
         assert "tick 3" in result.stderr
         assert "done" in result.stdout
 
-    def test_silent_stall_still_times_out(self, tmp_path):
+    def test_silent_stall_still_times_out(self):
         """A silently stalled command is killed once the idle window elapses,
         and pre-stall output is preserved on the TimeoutExpired."""
-        from tools.transcription_tools import _run_command_stt
+        import queue
+        from tools import transcription_tools as stt
 
-        script = tmp_path / "progress_then_hang.py"
-        script.write_text(
-            "\n".join([
-                "import sys, time",
-                "print('starting pass 1', file=sys.stderr, flush=True)",
-                "time.sleep(30)",
-            ]),
-            encoding="utf-8",
-        )
+        clock = types.SimpleNamespace(now=1.0)
+        progress = "starting pass 1\n"
+        reads = []
 
-        with pytest.raises(subprocess.TimeoutExpired) as excinfo:
-            _run_command_stt(
-                self._shell_command(sys.executable, "-u", str(script)),
-                timeout=0.1,
-            )
+        def read_output(timeout):
+            reads.append(timeout)
+            # Bound a broken no-timeout loop without a wall-clock watchdog.
+            assert len(reads) <= 8, "command did not time out during silence"
+            if len(reads) == 1:
+                clock.now += 0.04
+                return "stderr", progress
+            # No EOF: the process stays alive but produces no more bytes.
+            clock.now += timeout
+            raise queue.Empty
 
-        assert "starting pass 1" in (excinfo.value.stderr or "")
+        output_queue = MagicMock()
+        output_queue.get.side_effect = read_output
+        output_queue.get_nowait.side_effect = queue.Empty
+        proc = MagicMock()
+        proc.wait.side_effect = AssertionError("silent process has not exited")
+        # Model the reader-to-consumer handoff, not shell startup scheduling.
+        # Only queue waits advance time; the real consumer must append the
+        # first chunk and reset its idle deadline before observing silence.
+        with (
+            patch.object(stt.subprocess, "Popen", return_value=proc),
+            patch.object(stt, "threading", types.SimpleNamespace(Thread=MagicMock())),
+            patch.object(stt, "queue", types.SimpleNamespace(
+                Queue=lambda: output_queue, Empty=queue.Empty,
+            )),
+            patch.object(stt, "time", types.SimpleNamespace(monotonic=lambda: clock.now)),
+            patch.object(stt, "_terminate_command_stt_process_tree") as terminate,
+            pytest.raises(subprocess.TimeoutExpired) as excinfo,
+        ):
+            stt._run_command_stt("controlled-stt-command", timeout=0.1)
+
+        assert len(reads) > 1
+        assert clock.now == pytest.approx(1.04 + 0.1)
+        terminate.assert_called_once_with(proc)
+        proc.wait.assert_not_called()
+        assert excinfo.value.cmd == "controlled-stt-command"
+        assert excinfo.value.timeout == 0.1
+        assert excinfo.value.stderr == progress
 
 
 # ============================================================================
